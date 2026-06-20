@@ -28,4 +28,4 @@ RUN uv sync --frozen --no-dev
 # Run DB migrations, then serve.
 # Single worker on purpose: the app runs an in-process campaign worker + holds
 # realtime WebSocket call state, so multiple workers would duplicate/break it.
-CMD ["sh", "-c", "uv run alembic upgrade head && exec uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["sh", "-c", "uv run python railway_bootstrap.py && exec uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
