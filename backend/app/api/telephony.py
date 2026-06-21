@@ -10,7 +10,7 @@ This module provides:
 
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
@@ -82,6 +82,9 @@ class InitiateCallRequest(BaseModel):
     to_number: str
     from_number: str
     agent_id: str
+    # Per-call lead/offer data (leadName, company, offer_name, leadEmail, tzName, ...)
+    # forwarded to the agent via the answer-webhook Url (?cv=) to personalize the call.
+    variables: dict[str, Any] | None = None
 
 
 class CallResponse(BaseModel):
@@ -139,14 +142,23 @@ async def get_telnyx_service(
     """
     user_uuid = user_id_to_uuid(user_id)
     user_settings = await get_user_api_keys(user_uuid, db, workspace_id=workspace_id)
+    api_key = user_settings.telnyx_api_key if user_settings else None
+    public_key = user_settings.telnyx_public_key if user_settings else None
 
-    if not user_settings or not user_settings.telnyx_api_key:
+    # Fall back to the user-level key, then the platform env key (single-tenant own-tool;
+    # keys live at account level, and there may be no workspace).
+    if not api_key and workspace_id:
+        ul = await get_user_api_keys(user_uuid, db, workspace_id=None)
+        if ul and ul.telnyx_api_key:
+            api_key, public_key = ul.telnyx_api_key, ul.telnyx_public_key
+    if not api_key:
+        api_key = settings.TELNYX_API_KEY
+        public_key = public_key or settings.TELNYX_PUBLIC_KEY
+
+    if not api_key:
         return None
 
-    return TelnyxService(
-        api_key=user_settings.telnyx_api_key,
-        public_key=user_settings.telnyx_public_key,
-    )
+    return TelnyxService(api_key=api_key, public_key=public_key)
 
 
 async def get_agent_by_phone_number(phone_number: str, db: AsyncSession) -> Agent | None:
@@ -585,7 +597,9 @@ async def initiate_call(
     request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
-    workspace_id: str = Query(..., description="Workspace ID for API key isolation"),
+    workspace_id: str | None = Query(
+        None, description="Workspace ID (optional; falls back to account-level keys)"
+    ),
 ) -> CallResponse:
     """Initiate an outbound call.
 
@@ -604,11 +618,13 @@ async def initiate_call(
     )
     log.info("initiating_call", to=call_request.to_number, from_=call_request.from_number)
 
-    # Parse workspace_id
-    try:
-        workspace_uuid = uuid.UUID(workspace_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="Invalid workspace_id format") from e
+    # Parse workspace_id (optional - single-tenant falls back to account-level keys)
+    workspace_uuid: uuid.UUID | None = None
+    if workspace_id:
+        try:
+            workspace_uuid = uuid.UUID(workspace_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail="Invalid workspace_id format") from e
 
     # Load agent to get provider preference (verify user owns agent)
     user_uuid = user_id_to_uuid(current_user.id)
@@ -637,9 +653,16 @@ async def initiate_call(
             detail="No telephony provider configured. Please add Twilio or Telnyx credentials in Settings.",
         )
 
-    # Build webhook URL
+    # Build webhook URL (forward per-call variables as base64-JSON in ?cv= so the
+    # answer webhook -> media WS can personalize the prompt + fill the booking attendee)
     base_url = str(request.base_url).rstrip("/")
     webhook_url = f"{base_url}/webhooks/{'telnyx' if telnyx_service else 'twilio'}/answer?agent_id={call_request.agent_id}"
+    if call_request.variables:
+        import base64
+        import json as _json
+
+        cv = base64.urlsafe_b64encode(_json.dumps(call_request.variables).encode()).decode()
+        webhook_url = f"{webhook_url}&cv={cv}"
 
     if telnyx_service:
         provider = "telnyx"
