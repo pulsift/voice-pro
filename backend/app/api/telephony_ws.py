@@ -254,8 +254,8 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     if triggered:
                         log.info("initial_greeting_triggered_after_session_update")
 
-                # Handle audio output
-                elif event_type == "response.audio.delta":
+                # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
+                elif event_type in ("response.audio.delta", "response.output_audio.delta"):
                     # Get audio delta and send to Twilio
                     # Check various possible attribute names for the audio data
                     delta_data = getattr(event, "delta", None)
@@ -312,12 +312,12 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         realtime_session.add_user_transcript(event.transcript)
                         log.debug("user_transcript_captured", length=len(event.transcript))
 
-                elif enable_transcript and event_type == "response.audio_transcript.delta":
+                elif enable_transcript and event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
                     # Assistant speech transcript delta
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type == "response.audio_transcript.done":
+                elif enable_transcript and event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
                     # Assistant speech transcript complete
                     realtime_session.flush_assistant_text()
 
@@ -346,6 +346,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 # Log other events
                 elif event_type in [
                     "response.audio.done",
+                    "response.output_audio.done",
                     "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                 ]:
@@ -548,17 +549,16 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     if triggered:
                         log.info("initial_greeting_triggered_after_session_update")
 
-                # Handle audio output
-                elif event_type == "response.audio.delta":
+                # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
+                elif event_type in ("response.audio.delta", "response.output_audio.delta"):
                     if hasattr(event, "delta") and event.delta:
-                        audio_bytes = base64.b64decode(event.delta)
-                        payload = base64.b64encode(audio_bytes).decode("utf-8")
+                        # event.delta is already base64 G.711 mu-law; forward as a
+                        # Telnyx client media frame ({event, media:{payload}} — no stream_id).
                         await websocket.send_text(
                             json.dumps(
                                 {
                                     "event": "media",
-                                    "stream_id": stream_id,
-                                    "media": {"payload": payload},
+                                    "media": {"payload": event.delta},
                                 }
                             )
                         )
@@ -586,12 +586,12 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                         realtime_session.add_user_transcript(event.transcript)
                         log.debug("user_transcript_captured", length=len(event.transcript))
 
-                elif enable_transcript and event_type == "response.audio_transcript.delta":
+                elif enable_transcript and event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
                     # Assistant speech transcript delta
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type == "response.audio_transcript.done":
+                elif enable_transcript and event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
                     # Assistant speech transcript complete
                     realtime_session.flush_assistant_text()
 
@@ -605,6 +605,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
                 elif event_type in [
                     "response.audio.done",
+                    "response.output_audio.done",
                     "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                 ]:

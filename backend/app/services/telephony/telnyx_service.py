@@ -72,21 +72,43 @@ class TelnyxService(TelephonyProvider):
 
         client = await self._get_http_client()
 
-        # Use Telnyx TeXML API for call initiation
-        payload = {
-            "to": to_number,
-            "from": from_number,
-            "connection_id": await self._get_connection_id(),
-            "texml_url": webhook_url,
+        # Telnyx outbound TeXML: POST /v2/texml/calls/{connection_id} where
+        # {connection_id} MUST be a TeXML *Application* ID (not a credential/SIP
+        # connection), with TwiML-style form params (To/From/Url). `Url` is the
+        # TeXML-instructions webhook (our /webhooks/telnyx/answer) that returns
+        # <Connect><Stream> to bridge media. Call-progress events go to the
+        # application's configured status_callback.
+        connection_id = await self._get_connection_id()
+        if not connection_id:
+            raise ValueError(
+                "No Telnyx TeXML Application found for outbound calls. "
+                "Create one (voice_url -> /webhooks/telnyx/voice) and assign the number to it."
+            )
+
+        form = {
+            "To": to_number,
+            "From": from_number,
+            "Url": webhook_url,
         }
 
-        response = await client.post("/texml/calls", json=payload)
+        response = await client.post(
+            f"/texml/calls/{connection_id}",
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         response.raise_for_status()
         data = response.json()
 
-        call_data = data.get("data", {})
-        call_control_id = call_data.get("call_control_id", "")
-        call_sid = call_data.get("sid", call_control_id)
+        # Response may be nested ({"data": {...}}) or flat ({...}) depending on which
+        # TeXML call API variant served it — tolerate both so call_id is never empty.
+        call_data = data.get("data", data)
+        call_control_id = call_data.get("call_control_id") or call_data.get("CallControlId") or ""
+        call_sid = (
+            call_data.get("call_sid")
+            or call_data.get("sid")
+            or call_data.get("CallSid")
+            or call_control_id
+        )
 
         self.logger.info("call_initiated", call_control_id=call_control_id)
 
@@ -528,32 +550,33 @@ class TelnyxService(TelephonyProvider):
             return None
 
     async def _get_connection_id(self) -> str:
-        """Get or create a Telnyx connection for outbound calls.
+        """Get the TeXML Application ID used as the connection_id for outbound TeXML calls.
+
+        Telnyx's POST /v2/texml/calls/{connection_id} requires a TeXML *Application*
+        ID (NOT a credential/SIP connection). We reuse the "voice-noob-inbound"
+        application that the inbound webhook setup creates, so one application serves
+        both inbound and outbound. Falls back to the first TeXML application if the
+        named one isn't present.
 
         Returns:
-            Connection ID string
+            TeXML Application ID string ("" if none exists yet)
         """
-        # List existing connections
         client = await self._get_http_client()
-        response = await client.get("/credential_connections")
-        response.raise_for_status()
-        data = response.json()
+        app_name = "voice-noob-inbound"
 
-        connections = data.get("data", [])
-        if connections:
-            return str(connections[0].get("id", ""))
-
-        # Create a new connection if none exists
-        response = await client.post(
-            "/credential_connections",
-            json={
-                "connection_name": "voice-agent-connection",
-                "active": True,
-            },
-        )
+        response = await client.get("/texml_applications")
         response.raise_for_status()
-        new_data = response.json()
-        return str(new_data.get("data", {}).get("id", ""))
+        apps = response.json().get("data", [])
+
+        for app in apps:
+            if app.get("friendly_name") == app_name:
+                return str(app.get("id", ""))
+
+        # No named app — fall back to any existing TeXML application
+        if apps:
+            return str(apps[0].get("id", ""))
+
+        return ""
 
     def generate_answer_response(self, websocket_url: str, agent_id: str | None = None) -> str:  # noqa: ARG002
         """Generate TeXML response to answer a call and stream to WebSocket.
@@ -568,10 +591,17 @@ class TelnyxService(TelephonyProvider):
         # Build TeXML with proper XML escaping for & in URLs
         escaped_ws_url = websocket_url.replace("&", "&amp;")
 
+        # Telnyx <Stream> defaults bidirectional audio to MP3. For a realtime voice
+        # agent we send raw G.711 mu-law (PCMU 8kHz) audio back to Telnyx, so we must
+        # declare the bidirectional transport/codec explicitly — otherwise Telnyx
+        # treats our return audio as MP3 and the caller hears silence/garbage.
+        #   codec="PCMU"                  -> inbound (caller -> us) media as mu-law 8kHz
+        #   bidirectionalMode="rtp"       -> accept media frames back from us
+        #   bidirectionalCodec="PCMU"     -> our return audio is mu-law 8kHz
         texml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="{escaped_ws_url}" />
+        <Stream url="{escaped_ws_url}" codec="PCMU" bidirectionalMode="rtp" bidirectionalCodec="PCMU" bidirectionalSamplingRate="8000" />
     </Connect>
 </Response>"""
 

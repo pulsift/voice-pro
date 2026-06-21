@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.integrations import get_workspace_integrations
 from app.api.settings import get_user_api_keys
 from app.core.auth import user_id_to_uuid
+from app.core.config import settings
 from app.services.tools.registry import ToolRegistry
 
 logger = structlog.get_logger()
@@ -174,15 +175,27 @@ class GPTRealtimeSession:
         user_settings = await get_user_api_keys(
             self.user_id_uuid, self.db, workspace_id=self.workspace_id
         )
+        api_key = user_settings.openai_api_key if user_settings else None
+        key_source = "workspace"
 
-        # Strictly use workspace API key - no fallback to global key for billing isolation
-        if not user_settings or not user_settings.openai_api_key:
-            self.logger.warning("workspace_missing_openai_key", workspace_id=str(self.workspace_id))
+        # Fall back to the user-level key, then the platform env key. Single-tenant
+        # own-tool: the browser path already does this; strict per-workspace isolation
+        # is a multi-tenant feature we don't need, and it would 400 the call if the
+        # agent's workspace happens not to carry the key.
+        if not api_key and self.workspace_id:
+            user_level = await get_user_api_keys(self.user_id_uuid, self.db, workspace_id=None)
+            api_key = user_level.openai_api_key if user_level else None
+            key_source = "user"
+        if not api_key:
+            api_key = settings.OPENAI_API_KEY
+            key_source = "platform_env"
+
+        if not api_key:
+            self.logger.warning("openai_key_not_configured", workspace_id=str(self.workspace_id))
             raise ValueError(
-                "OpenAI API key not configured for this workspace. Please add it in Settings > Workspace API Keys."
+                "OpenAI API key not configured. Add it in Settings (workspace or account level)."
             )
-        api_key = user_settings.openai_api_key
-        self.logger.info("using_workspace_openai_key")
+        self.logger.info("using_openai_key", source=key_source)
 
         # Initialize OpenAI client with user's or global API key
         self.client = AsyncOpenAI(api_key=api_key)
@@ -214,8 +227,9 @@ class GPTRealtimeSession:
         self.logger.info("connecting_to_openai_realtime", model=model)
 
         try:
-            # Use official SDK's realtime.connect() method
-            self.connection = await self.client.beta.realtime.connect(model=model).__aenter__()
+            # Use the GA realtime.connect() (the beta namespace + flat session shape
+            # was disabled by OpenAI -> "beta_api_shape_disabled"; SDK 2.8.1 has GA).
+            self.connection = await self.client.realtime.connect(model=model).__aenter__()
 
             self.logger.info("realtime_connection_established")
 
@@ -261,26 +275,32 @@ class GPTRealtimeSession:
         language = self.agent_config.get("language", "en-US")
         # Default to marin for natural conversational tone
         voice = self.agent_config.get("voice", "marin")
-        temperature = self.agent_config.get("temperature", 0.6)
         instructions = build_instructions_with_language(
             system_prompt, language, timezone=workspace_timezone
         )
 
+        # GA Realtime session shape (nested audio config). Audio is G.711 mu-law 8kHz
+        # both ways to match Telnyx PCMU media with no transcoding. (speed/temperature
+        # dropped — not part of the GA session shape; were beta-only here.)
         session_config = {
-            "modalities": ["text", "audio"],
+            "type": "realtime",
+            "output_modalities": ["audio"],
             "instructions": instructions,
-            "voice": voice,
-            "speed": 1.1,  # Slightly faster speech (1.0 = normal, range: 0.25-1.5)
-            "temperature": temperature,  # Lower for consistent, natural delivery
-            # Use g711_ulaw for Twilio/Telnyx compatibility (mulaw at 8kHz)
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "input_audio_transcription": {"model": "whisper-1"},
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 200,
-                "silence_duration_ms": 200,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 200,
+                        "silence_duration_ms": 200,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": voice,
+                },
             },
             "tools": tools,
             "tool_choice": "auto",
