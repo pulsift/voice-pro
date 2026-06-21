@@ -643,7 +643,15 @@ export default function TestAgentPage() {
       console.log("[WebRTC] Got ephemeral token:", ephemeralKey.substring(0, 10) + "...");
 
       // Manual WebRTC connection since SDK doesn't include required OpenAI-Beta header
-      const pc = new RTCPeerConnection();
+      // STUN servers are required so the connection can advertise a publicly
+      // reachable address; without them, WebRTC ICE consent-freshness fails and
+      // the call drops at the ~30s keepalive timeout.
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+        ],
+      });
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const audioTrack = micStream.getAudioTracks()[0];
       if (audioTrack) {
