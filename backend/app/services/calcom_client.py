@@ -53,6 +53,16 @@ async def get_business_slots(
     start = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     end = (now + timedelta(days=days)).strftime("%Y-%m-%d")
 
+    # Validate the lead timezone up front; fall back to the team tz so an invalid
+    # tzName can't 400 the slots request.
+    team_tz = ZoneInfo(settings.BOOKING_TEAM_TIMEZONE)
+    try:
+        lead_zone = ZoneInfo(lead_tz)
+    except Exception:
+        log.warning("invalid_lead_tz_falling_back", lead_tz=lead_tz)
+        lead_tz = settings.BOOKING_TEAM_TIMEZONE
+        lead_zone = team_tz
+
     headers = {
         "Authorization": f"Bearer {settings.CALCOM_API_KEY}",
         "cal-api-version": SLOTS_API_VERSION,
@@ -68,12 +78,6 @@ async def get_business_slots(
         resp = await client.get(f"{CALCOM_BASE}/slots", headers=headers, params=params)
         resp.raise_for_status()
         data = resp.json().get("data", {})
-
-    team_tz = ZoneInfo(settings.BOOKING_TEAM_TIMEZONE)
-    try:
-        lead_zone = ZoneInfo(lead_tz)
-    except Exception:
-        lead_zone = team_tz  # fall back to team tz if the lead tz is unrecognised
 
     picked: list[dict[str, str]] = []
     seen_days: set[Any] = set()

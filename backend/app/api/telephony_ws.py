@@ -445,13 +445,18 @@ async def telnyx_media_stream(
         cv = websocket.query_params.get("cv")
         if cv:
             try:
-                call_variables = json.loads(base64.urlsafe_b64decode(cv.encode()).decode("utf-8"))
-                log.info("call_variables_loaded", keys=list(call_variables.keys()))
+                padded = cv + "=" * (-len(cv) % 4)  # tolerate unpadded base64url
+                decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode("utf-8"))
+                if isinstance(decoded, dict):
+                    call_variables = decoded
+                    log.info("call_variables_loaded", keys=list(call_variables.keys()))
+                else:
+                    log.warning("call_variables_not_dict", got=type(decoded).__name__)
             except Exception as e:
                 log.warning("call_variables_decode_failed", error=str(e))
 
-        # Personalize the greeting too (it can contain {{leadName}} etc.)
-        if agent_config.get("initial_greeting") and call_variables:
+        # Always render the greeting (defaults fill any {{placeholders}} so none leak raw).
+        if agent_config.get("initial_greeting"):
             from app.services.gpt_realtime import render_template
 
             agent_config["initial_greeting"] = render_template(
