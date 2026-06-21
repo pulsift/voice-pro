@@ -289,6 +289,9 @@ export default function TestAgentPage() {
     audioElement: null,
   });
 
+  // Diagnostic poller for ICE/transport health (logs consent-freshness counters)
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Batch transcript updates to reduce re-renders
   const pendingTranscriptsRef = useRef<TranscriptItem[]>([]);
   const flushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -427,6 +430,12 @@ export default function TestAgentPage() {
     if (callTimerRef.current) {
       clearInterval(callTimerRef.current);
       callTimerRef.current = null;
+    }
+
+    // Stop the diagnostic stats poller
+    if (statsIntervalRef.current) {
+      clearInterval(statsIntervalRef.current);
+      statsIntervalRef.current = null;
     }
 
     // Clear any pending flush timeout
@@ -642,16 +651,50 @@ export default function TestAgentPage() {
 
       console.log("[WebRTC] Got ephemeral token:", ephemeralKey.substring(0, 10) + "...");
 
-      // Manual WebRTC connection since SDK doesn't include required OpenAI-Beta header
-      // STUN servers are required so the connection can advertise a publicly
-      // reachable address; without them, WebRTC ICE consent-freshness fails and
-      // the call drops at the ~30s keepalive timeout.
+      // Manual WebRTC connection (the SDK path doesn't fit our GA mint flow).
+      // STUN is included as a standard default so the browser can also gather
+      // server-reflexive candidates; OpenAI's endpoint is ICE-lite and learns our
+      // address from connectivity checks, so STUN is not strictly required (and on
+      // its own it did NOT fix the ~30s drop — see the ICE-STATS diagnostics below).
       const pc = new RTCPeerConnection({
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
         ],
       });
+
+      // --- ICE / transport diagnostics (to pinpoint the ~30s drop) ---
+      const connectStartTs = Date.now();
+      const elapsed = () => `t+${Math.round((Date.now() - connectStartTs) / 1000)}s`;
+      pc.oniceconnectionstatechange = () => {
+        console.log(`[ICE ${elapsed()}] iceConnectionState:`, pc.iceConnectionState);
+      };
+      pc.onicegatheringstatechange = () => {
+        console.log(`[ICE ${elapsed()}] iceGatheringState:`, pc.iceGatheringState);
+      };
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          console.log(
+            `[ICE ${elapsed()}] local candidate:`,
+            e.candidate.type,
+            e.candidate.protocol,
+            e.candidate.address ?? "(no addr)",
+            `port=${e.candidate.port ?? "?"}`
+          );
+        } else {
+          console.log(`[ICE ${elapsed()}] candidate gathering finished (null)`);
+        }
+      };
+      pc.onicecandidateerror = (e) => {
+        const ev = e as RTCPeerConnectionIceErrorEvent;
+        console.warn(
+          `[ICE ${elapsed()}] candidate error:`,
+          ev.errorCode,
+          ev.errorText,
+          ev.url
+        );
+      };
+
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const audioTrack = micStream.getAudioTracks()[0];
       if (audioTrack) {
@@ -678,39 +721,19 @@ export default function TestAgentPage() {
         audioElement,
       };
 
-      // Create offer and wait for (non-trickle) ICE gathering to complete, so the
-      // STUN-derived candidates are included in the SDP we send to OpenAI.
-      // Without this, the gathered candidates never reach OpenAI and the call
-      // drops at the ~30s ICE consent-freshness timeout (RFC 7675).
+      // Create offer and POST it immediately — matching OpenAI's documented WebRTC
+      // flow (developers.openai.com/api/docs/guides/realtime-webrtc). OpenAI's endpoint
+      // is ICE-lite and learns our address from the connectivity checks we send to its
+      // server candidate, so we do NOT need to wait for ICE gathering or include our
+      // candidates in the offer SDP. (The earlier gather-wait deviated from the docs and
+      // did not fix the 30s drop, so it's removed to match the canonical, known-good path.)
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-
-      await new Promise<void>((resolve) => {
-        if (pc.iceGatheringState === "complete") {
-          resolve();
-          return;
-        }
-        const done = () => {
-          window.clearTimeout(timeoutId);
-          pc.removeEventListener("icegatheringstatechange", onStateChange);
-          resolve();
-        };
-        const onStateChange = () => {
-          if (pc.iceGatheringState === "complete") done();
-        };
-        const timeoutId = window.setTimeout(done, 5000);
-        pc.addEventListener("icegatheringstatechange", onStateChange);
-      });
-
-      const localSdp = pc.localDescription?.sdp;
-      if (!localSdp) {
-        throw new Error("Failed to create local SDP offer");
-      }
 
       // Connect to OpenAI Realtime API
       const response = await fetch("https://api.openai.com/v1/realtime/calls", {
         method: "POST",
-        body: localSdp,
+        body: offer.sdp,
         headers: {
           "Content-Type": "application/sdp",
           Authorization: `Bearer ${ephemeralKey}`,
@@ -723,10 +746,69 @@ export default function TestAgentPage() {
       }
 
       const answerSdp = await response.text();
-      console.log("[WebRTC] Got SDP answer, setting remote description...");
+      // Inspect OpenAI's ICE profile — if a=ice-lite is present, OpenAI is the passive
+      // side and the browser must keep consent alive toward OpenAI's server candidate.
+      console.log("[WebRTC] Got SDP answer. Remote ICE profile:", {
+        iceLite: /^a=ice-lite/m.test(answerSdp),
+        remoteCandidates: (answerSdp.match(/^a=candidate:.*$/gm) ?? []).length,
+        endOfCandidates: /^a=end-of-candidates/m.test(answerSdp),
+      });
 
       await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
       console.log("[WebRTC] Remote description set!");
+
+      // Poll the selected candidate pair every 3s. If requestsSent climbs while
+      // responsesReceived stalls, that's RFC-7675 consent-freshness failing (the
+      // ~30s drop). bytesReceived flat-lining = inbound media stopped. This makes
+      // the 30s console log conclusive about WHERE the connection dies.
+      statsIntervalRef.current = setInterval(() => {
+        // Loose local shapes: some WebRTC-stats fields (e.g. consentRequestsSent) lag
+        // in the TS DOM lib, so we cast to optional shapes rather than depend on them.
+        type PairStats = {
+          state?: string;
+          nominated?: boolean;
+          bytesSent?: number;
+          bytesReceived?: number;
+          requestsSent?: number;
+          responsesReceived?: number;
+          consentRequestsSent?: number;
+          currentRoundTripTime?: number;
+        };
+        type CandStats = { address?: string; candidateType?: string; protocol?: string };
+        void pc.getStats().then((stats) => {
+          let pair: Record<string, unknown> | null = null;
+          let remote: Record<string, unknown> | null = null;
+          let inboundBytes: number | undefined;
+          stats.forEach((report) => {
+            if (report.type === "candidate-pair") {
+              const p = report as RTCStats & PairStats;
+              if (p.nominated || p.state === "succeeded") {
+                pair = {
+                  state: p.state,
+                  bytesSent: p.bytesSent,
+                  bytesReceived: p.bytesReceived,
+                  requestsSent: p.requestsSent,
+                  responsesReceived: p.responsesReceived,
+                  consentRequestsSent: p.consentRequestsSent,
+                  rtt: p.currentRoundTripTime,
+                };
+              }
+            } else if (report.type === "remote-candidate") {
+              const c = report as RTCStats & CandStats;
+              remote = { address: c.address, candidateType: c.candidateType, protocol: c.protocol };
+            } else if (report.type === "inbound-rtp") {
+              inboundBytes = (report as RTCStats & { bytesReceived?: number }).bytesReceived;
+            }
+          });
+          console.log(
+            `[ICE-STATS ${elapsed()}] conn=${pc.connectionState} ice=${pc.iceConnectionState} inboundBytes=${inboundBytes ?? "?"}`,
+            "pair=",
+            pair,
+            "remote=",
+            remote
+          );
+        });
+      }, 3000);
 
       // Handle data channel events
       dataChannel.onopen = () => {
@@ -746,6 +828,21 @@ export default function TestAgentPage() {
 
         // Send session update with agent config and tools
         const instructions = editedSystemPrompt || "You are a helpful voice assistant.";
+        // GA turn_detection schema differs by type:
+        //  - server_vad accepts threshold / prefix_padding_ms / silence_duration_ms
+        //  - semantic_vad accepts ONLY type (+ optional eagerness). Sending threshold to
+        //    semantic_vad throws "unknown parameter: session.audio.input.turn_detection.threshold".
+        const turnDetectionConfig =
+          turnDetection === "disabled"
+            ? null
+            : turnDetection === "semantic"
+              ? { type: "semantic_vad" }
+              : {
+                  type: "server_vad",
+                  threshold: threshold,
+                  prefix_padding_ms: prefixPadding,
+                  silence_duration_ms: silenceDuration,
+                };
         const sessionUpdate = {
           type: "session.update",
           session: {
@@ -757,15 +854,7 @@ export default function TestAgentPage() {
                   model: "whisper-1",
                   language: getWhisperCode(language) ?? undefined,
                 },
-                turn_detection:
-                  turnDetection === "disabled"
-                    ? null
-                    : {
-                        type: turnDetection === "semantic" ? "semantic_vad" : "server_vad",
-                        threshold: threshold,
-                        prefix_padding_ms: prefixPadding,
-                        silence_duration_ms: silenceDuration,
-                      },
+                turn_detection: turnDetectionConfig,
               },
               output: {
                 voice: voice,
