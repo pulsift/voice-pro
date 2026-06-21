@@ -720,8 +720,9 @@ export default function TestAgentPage() {
             instructions: instructions,
             audio: {
               input: {
+                noise_reduction: { type: "near_field" },
                 transcription: {
-                  model: "whisper-1",
+                  model: "gpt-4o-mini-transcribe",
                   language: getWhisperCode(language) ?? undefined,
                 },
                 turn_detection:
