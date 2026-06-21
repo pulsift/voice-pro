@@ -1,7 +1,7 @@
 """CRM tools for voice agents - bookings, contacts, appointments."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import structlog
@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.cache import cache_invalidate
+from app.core.config import settings
 from app.models.appointment import Appointment
 from app.models.contact import Contact
 
@@ -33,6 +34,7 @@ class CRMTools:
         db: AsyncSession,
         user_id: int,
         workspace_id: uuid.UUID | None = None,
+        variables: dict[str, Any] | None = None,
     ) -> None:
         """Initialize CRM tools.
 
@@ -40,13 +42,20 @@ class CRMTools:
             db: Database session
             user_id: User ID (agent owner) - integer matching Contact.user_id
             workspace_id: Workspace UUID for scoping contacts
+            variables: Per-call lead data (leadName, leadEmail, tzName, company, ...) used
+                       to fill the Cal.com attendee so the agent never has to ask for it.
         """
         self.db = db
         self.user_id = user_id
         self.workspace_id = workspace_id
+        self.variables = variables or {}
         self.logger = logger.bind(
             component="crm_tools", user_id=user_id, workspace_id=str(workspace_id)
         )
+
+    def _calcom_enabled(self) -> bool:
+        """True when Cal.com is configured to back booking (else internal calendar)."""
+        return bool(settings.CALCOM_API_KEY and settings.CALCOM_EVENT_TYPE_ID)
 
     @staticmethod
     def get_tool_definitions() -> list[dict[str, Any]]:
@@ -105,36 +114,48 @@ class CRMTools:
             {
                 "type": "function",
                 "name": "check_availability",
-                "description": "Check available appointment time slots for a specific date",
+                "description": "Get the next available appointment slots (already within business hours, on upcoming weekdays). Returns ready-to-offer openings - just offer two of them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "time_zone": {
+                            "type": "string",
+                            "description": "The lead's IANA timezone as they stated it (e.g. Europe/Stockholm, America/New_York). Slots are returned in this timezone.",
+                        },
                         "date": {
                             "type": "string",
-                            "description": "Date to check in YYYY-MM-DD format",
+                            "description": "Optional preferred date (YYYY-MM-DD) if the lead asked for one.",
                         },
                         "duration_minutes": {
                             "type": "integer",
                             "description": "Desired appointment duration in minutes (default 30)",
                         },
                     },
-                    "required": ["date"],
+                    "required": [],
                 },
             },
             {
                 "type": "function",
                 "name": "book_appointment",
-                "description": "Book an appointment for a customer",
+                "description": "Book the appointment. The attendee's name and email are filled automatically from the call - never ask for them. Pass the chosen start time (the exact 'start' value from check_availability).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "contact_phone": {
-                            "type": "string",
-                            "description": "Customer's phone number",
-                        },
                         "scheduled_at": {
                             "type": "string",
-                            "description": "Appointment date and time in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)",
+                            "description": "Chosen appointment start time in ISO 8601 format - use the exact 'start' value returned by check_availability.",
+                        },
+                        "time_zone": {
+                            "type": "string",
+                            "description": "The lead's IANA timezone (e.g. Europe/Stockholm). Optional.",
+                        },
+                        "notes": {
+                            "type": "string",
+                            "description": "Notes for the team: write 'AUDIT: yes' or 'AUDIT: no' plus any context about their business.",
+                        },
+                        "contact_phone": {
+                            "type": "string",
+                            "description": "Optional - only used by the internal calendar fallback.",
                         },
                         "duration_minutes": {
                             "type": "integer",
@@ -144,9 +165,8 @@ class CRMTools:
                             "type": "string",
                             "description": "Type of service/appointment",
                         },
-                        "notes": {"type": "string", "description": "Additional notes"},
                     },
-                    "required": ["contact_phone", "scheduled_at"],
+                    "required": ["scheduled_at"],
                 },
             },
             {
@@ -339,21 +359,53 @@ class CRMTools:
 
     async def check_availability(
         self,
-        date: str,
+        date: str | None = None,
         duration_minutes: int = 30,  # noqa: ARG002
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
-        """Check available time slots for a date.
+        """Check available time slots.
+
+        When Cal.com is configured, returns the next business-hours openings on
+        upcoming weekdays in the lead's timezone (single source of truth, no
+        double-book). Otherwise falls back to the internal calendar for `date`.
 
         Args:
-            date: Date in YYYY-MM-DD format
+            date: Optional preferred date (YYYY-MM-DD) - internal fallback only
             duration_minutes: Desired duration (reserved for future use)
+            time_zone: The lead's IANA timezone for returned slots
 
         Returns:
             Available time slots
         """
+        # --- Cal.com path (preferred) ---
+        if self._calcom_enabled():
+            lead_tz = time_zone or self.variables.get("tzName") or settings.BOOKING_TEAM_TIMEZONE
+            try:
+                from app.services.calcom_client import get_business_slots
+
+                slots = await get_business_slots(lead_tz=lead_tz)
+                if not slots:
+                    return {
+                        "success": True,
+                        "slots": [],
+                        "message": "No open business-hours slots in the next two weeks - ask the lead for a preferred day.",
+                    }
+                return {
+                    "success": True,
+                    "slots": [{"when": s["label"], "start": s["start"]} for s in slots],
+                    "message": "Offer these two. Speak the 'when' naturally; pass the matching 'start' to book_appointment.",
+                }
+            except Exception as e:
+                self.logger.exception("calcom_check_availability_failed", error=str(e))
+                return {"success": False, "error": "calendar_unavailable"}
+
+        # --- Internal calendar fallback ---
         try:
-            # Parse date
-            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+            # Default to tomorrow if no date given
+            if date:
+                target_date = datetime.strptime(date, "%Y-%m-%d").date()
+            else:
+                target_date = (datetime.now() + timedelta(days=1)).date()
 
             # Get existing appointments for that day - filtered by workspace or user
             base_stmt = (
@@ -402,24 +454,65 @@ class CRMTools:
 
     async def book_appointment(
         self,
-        contact_phone: str,
         scheduled_at: str,
+        contact_phone: str | None = None,
         duration_minutes: int = 30,
         service_type: str | None = None,
         notes: str | None = None,
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
         """Book an appointment.
 
+        When Cal.com is configured, books on Cal.com (the host's real calendar) with
+        the attendee filled from per-call variables (leadName/leadEmail/tzName) so the
+        agent never asks. Otherwise falls back to the internal calendar (phone-based).
+
         Args:
-            contact_phone: Customer phone number
-            scheduled_at: ISO 8601 datetime
+            scheduled_at: ISO 8601 datetime (use the 'start' from check_availability)
+            contact_phone: Customer phone (internal fallback only)
             duration_minutes: Duration
             service_type: Service type
-            notes: Notes
+            notes: Notes for the team (e.g. "AUDIT: yes" + context)
+            time_zone: Lead's IANA timezone
 
         Returns:
             Booking confirmation
         """
+        # --- Cal.com path (preferred) ---
+        if self._calcom_enabled():
+            name = (self.variables.get("leadName") or "").strip() or "Guest"
+            email = (self.variables.get("leadEmail") or "").strip()
+            lead_tz = time_zone or self.variables.get("tzName") or settings.BOOKING_TEAM_TIMEZONE
+            if not email:
+                self.logger.warning("calcom_book_no_email")
+                return {"success": False, "error": "no_attendee_email"}
+            full_notes = notes or ""
+            if service_type:
+                full_notes = f"{service_type}. {full_notes}".strip()
+            try:
+                from app.services.calcom_client import create_booking
+
+                result = await create_booking(
+                    start_iso=scheduled_at,
+                    name=name,
+                    email=email,
+                    lead_tz=lead_tz,
+                    notes=full_notes or None,
+                )
+            except Exception as e:
+                self.logger.exception("calcom_book_failed", error=str(e))
+                return {"success": False, "error": "booking_failed"}
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "message": "Booked. The invite is on its way to the lead.",
+                    "uid": result.get("uid"),
+                }
+            return {"success": False, "error": "booking_failed"}
+
+        # --- Internal calendar fallback (phone-based) ---
+        if not contact_phone:
+            return {"success": False, "error": "contact_phone required for internal booking"}
         try:
             # Find contact - filtered by workspace or user for security
             if self.workspace_id:

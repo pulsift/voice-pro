@@ -27,6 +27,7 @@ class ToolRegistry:
         user_id: int,
         integrations: dict[str, dict[str, Any]] | None = None,
         workspace_id: Any | None = None,
+        variables: dict[str, Any] | None = None,
     ) -> None:
         """Initialize tool registry.
 
@@ -41,7 +42,8 @@ class ToolRegistry:
         self.user_id = user_id
         self.integrations = integrations or {}
         self.workspace_id = workspace_id
-        self.crm_tools = CRMTools(db, user_id, workspace_id=workspace_id)
+        self.variables = variables or {}
+        self.crm_tools = CRMTools(db, user_id, workspace_id=workspace_id, variables=self.variables)
         self._ghl_tools: GoHighLevelTools | None = None
         self._calendly_tools: CalendlyTools | None = None
         self._shopify_tools: ShopifyTools | None = None

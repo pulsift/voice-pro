@@ -108,6 +108,16 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: str | None = None
     TWILIO_AUTH_TOKEN: str | None = None
 
+    # Cal.com booking (used by the voice agent's check_availability / book_appointment
+    # when configured; otherwise the agent falls back to the internal calendar).
+    CALCOM_API_KEY: str | None = None
+    CALCOM_EVENT_TYPE_ID: int | None = None
+    # Business-hours guardrail for offered slots (team-local), applied in-tool so we
+    # never offer out-of-hours times even if the Cal.com schedule is permissive.
+    BOOKING_TEAM_TIMEZONE: str = "Europe/Stockholm"
+    BOOKING_HOUR_START: int = 8
+    BOOKING_HOUR_END: int = 20
+
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls
     OPENAI_TIMEOUT: float = 30.0  # LLM inference can be slow

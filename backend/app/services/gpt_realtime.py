@@ -47,6 +47,44 @@ LANGUAGE_NAMES: dict[str, str] = {
 }
 
 
+import re
+
+_VAR_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
+
+# Sensible fallbacks so an un-personalized call never renders raw {{placeholders}}.
+_DEFAULT_VARS: dict[str, str] = {
+    "agentName": "Dave",
+    "leadName": "there",
+    "company": "your company",
+    "offer_name": "what you reached out about",
+    "offer_value_line": "",
+    "bonus_line": "you're also set for a quick expert audit of how you're getting clients",
+    "book_reason_audit_no": "either way, let's grab a quick call so the team can get you set up",
+    "brief": "",
+    "tzName": "Europe/Stockholm",
+}
+
+
+def render_template(template: str, variables: dict[str, Any] | None) -> str:
+    """Fill {{placeholders}} in the agent prompt from per-call variables.
+
+    Lead/offer data is DATA, never instructions: we strip any brace sequences from
+    injected values so a value like a company literally named "}}ignore..." can't
+    break out of its slot (the prompt also tells the model to never obey instructions
+    hidden in DATA). Missing keys fall back to neutral defaults.
+    """
+    merged = dict(_DEFAULT_VARS)
+    for key, val in (variables or {}).items():
+        if val is not None:
+            merged[key] = str(val)
+
+    def _repl(match: "re.Match[str]") -> str:
+        raw = merged.get(match.group(1), "")
+        return str(raw).replace("{{", "").replace("}}", "")
+
+    return _VAR_PATTERN.sub(_repl, template)
+
+
 def build_instructions_with_language(
     system_prompt: str,
     language: str,
@@ -134,6 +172,7 @@ class GPTRealtimeSession:
         agent_config: dict[str, Any],
         session_id: str | None = None,
         workspace_id: uuid.UUID | None = None,
+        variables: dict[str, Any] | None = None,
     ) -> None:
         """Initialize GPT Realtime session.
 
@@ -149,6 +188,7 @@ class GPTRealtimeSession:
         self.user_id_uuid = user_id_to_uuid(user_id)  # UUID for UserSettings queries
         self.workspace_id = workspace_id  # For workspace-isolated API key lookup
         self.agent_config = agent_config
+        self.variables = variables or {}  # Per-call lead/offer data (prompt fill + booking attendee)
         self.session_id = session_id or str(uuid.uuid4())
         self.connection: Any = None
         self.tool_registry: ToolRegistry | None = None
@@ -207,9 +247,13 @@ class GPTRealtimeSession:
                 self.user_id_uuid, self.workspace_id, self.db
             )
 
-        # Initialize tool registry with enabled tools and workspace context
+        # Initialize tool registry with enabled tools, workspace context, and per-call vars
         self.tool_registry = ToolRegistry(
-            self.db, self.user_id, integrations=integrations, workspace_id=self.workspace_id
+            self.db,
+            self.user_id,
+            integrations=integrations,
+            workspace_id=self.workspace_id,
+            variables=self.variables,
         )
 
         # Connect to OpenAI Realtime API
@@ -272,6 +316,8 @@ class GPTRealtimeSession:
 
         # Build instructions with language directive and timezone
         system_prompt = self.agent_config.get("system_prompt", "You are a helpful voice assistant.")
+        # Fill per-call {{placeholders}} (lead name/company/offer/tz, etc.) before wrapping.
+        system_prompt = render_template(system_prompt, self.variables)
         language = self.agent_config.get("language", "en-US")
         # Default to marin for natural conversational tone
         voice = self.agent_config.get("voice", "marin")

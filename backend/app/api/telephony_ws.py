@@ -439,6 +439,25 @@ async def telnyx_media_stream(
             "initial_greeting": agent.initial_greeting,
         }
 
+        # Per-call lead/offer variables, passed through the stream URL as base64 JSON in ?cv=
+        # (used to personalize the prompt + fill the Cal.com booking attendee).
+        call_variables: dict[str, Any] = {}
+        cv = websocket.query_params.get("cv")
+        if cv:
+            try:
+                call_variables = json.loads(base64.urlsafe_b64decode(cv.encode()).decode("utf-8"))
+                log.info("call_variables_loaded", keys=list(call_variables.keys()))
+            except Exception as e:
+                log.warning("call_variables_decode_failed", error=str(e))
+
+        # Personalize the greeting too (it can contain {{leadName}} etc.)
+        if agent_config.get("initial_greeting") and call_variables:
+            from app.services.gpt_realtime import render_template
+
+            agent_config["initial_greeting"] = render_template(
+                agent_config["initial_greeting"], call_variables
+            )
+
         # Initialize GPT Realtime session
         async with GPTRealtimeSession(
             db=db,
@@ -446,6 +465,7 @@ async def telnyx_media_stream(
             agent_config=agent_config,
             session_id=session_id,
             workspace_id=workspace_id,
+            variables=call_variables,
         ) as realtime_session:
             # Handle Telnyx media stream and capture call_control_id
             call_control_id = await _handle_telnyx_stream(

@@ -1001,22 +1001,29 @@ async def telnyx_voice_webhook(
 async def telnyx_answer_webhook(
     request: Request,
     agent_id: str = Query(default=""),
+    cv: str = Query(default=""),
 ) -> Response:
     """Handle Telnyx outbound call connection.
 
     Called when an outbound call is answered by the recipient.
-    Returns TeXML to connect to our WebSocket.
+    Returns TeXML to connect to our WebSocket. Per-call variables (base64 JSON in `cv`,
+    set on the outbound call's Url) are forwarded to the media WS so the session can
+    personalize the prompt + fill the booking attendee.
     """
     # Validate Telnyx signature
     await verify_telnyx_webhook(request)
 
-    log = logger.bind(webhook="telnyx_answer", agent_id=agent_id)
+    log = logger.bind(webhook="telnyx_answer", agent_id=agent_id, has_cv=bool(cv))
     log.info("telnyx_outbound_answered")
 
-    # Build WebSocket URL
+    # Build WebSocket URL (forward the per-call variables blob if present)
     base_url = str(request.base_url).rstrip("/")
     ws_url = base_url.replace("http://", "wss://").replace("https://", "wss://")
     stream_url = f"{ws_url}/ws/telephony/telnyx/{agent_id}"
+    if cv:
+        from urllib.parse import quote
+
+        stream_url = f"{stream_url}?cv={quote(cv, safe='')}"
 
     telnyx_service = TelnyxService("")
     texml = telnyx_service.generate_answer_response(stream_url, agent_id)
@@ -1036,7 +1043,14 @@ async def telnyx_status_callback(
     # Validate Telnyx signature
     await verify_telnyx_webhook(request)
 
-    body = await request.json()
+    # TeXML status callbacks are form-encoded (TwiML-style), not the Call Control JSON
+    # this handler expects — don't 500 on them. Call status is tracked via the media-WS
+    # lifecycle for now. (TODO: map TeXML status fields CallSid/CallStatus.)
+    try:
+        body = await request.json()
+    except Exception:
+        logger.info("telnyx_status_non_json_ignored")
+        return {"status": "received"}
     data = body.get("data", {})
     event_type = data.get("event_type", "")
     payload = data.get("payload", {})
