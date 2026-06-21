@@ -574,13 +574,18 @@ async def get_ephemeral_token(
     workspace_uuid = uuid.UUID(workspace_id) if workspace_id else None
     api_key = await get_openai_api_key_for_workspace(user_uuid, workspace_uuid, db, token_logger)
 
-    # Build minimal session configuration for ephemeral token request
-    # The SDK will configure instructions, voice, tools etc. after connection via data channel
-    agent_voice = agent.voice or "shimmer"
+    # Build session configuration for the ephemeral client secret.
+    # Current Realtime API (client_secrets): nested session object with model,
+    # instructions and audio.output.voice. Instructions are baked in at mint time
+    # so the session is fully configured regardless of the client's data-channel setup.
+    agent_voice = agent.voice or "marin"
+    system_prompt = agent.system_prompt or "You are a helpful voice assistant."
+    instructions_with_language = build_instructions_with_language(system_prompt, agent.language)
     session_config: dict[str, Any] = {
+        "type": "realtime",
         "model": realtime_model,
-        "modalities": ["audio", "text"],
-        "voice": agent_voice,
+        "instructions": instructions_with_language,
+        "audio": {"output": {"voice": agent_voice}},
     }
 
     token_logger.info(
@@ -588,17 +593,17 @@ async def get_ephemeral_token(
         model=session_config["model"],
     )
 
-    # Request ephemeral token from OpenAI Realtime sessions endpoint
-    # The session_config is sent directly as the request body (not wrapped)
+    # Request ephemeral client secret from OpenAI Realtime API (current endpoint;
+    # /v1/realtime/sessions was retired -> returns "Invalid URL").
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                "https://api.openai.com/v1/realtime/sessions",
+                "https://api.openai.com/v1/realtime/client_secrets",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json=session_config,
+                json={"session": session_config},
                 timeout=30.0,
             )
 
@@ -637,15 +642,16 @@ async def get_ephemeral_token(
                 tool_names=[t.get("name") for t in tools],
             )
 
-            # Build instructions with language for the frontend to use
-            system_prompt = agent.system_prompt or "You are a helpful voice assistant."
-            instructions_with_language = build_instructions_with_language(
-                system_prompt, agent.language
-            )
+            # The /client_secrets response returns the ephemeral key at top-level "value".
+            # Map it into the {client_secret: {value}} shape the frontend already reads.
+            ephemeral_value = token_data.get("value")
 
             # Return token data with agent info and tools
             return {
-                "client_secret": token_data.get("client_secret", {}),
+                "client_secret": {
+                    "value": ephemeral_value,
+                    "expires_at": token_data.get("expires_at"),
+                },
                 "agent": {
                     "id": str(agent.id),
                     "name": agent.name,
