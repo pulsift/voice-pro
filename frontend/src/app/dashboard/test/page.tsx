@@ -678,14 +678,39 @@ export default function TestAgentPage() {
         audioElement,
       };
 
-      // Create offer
+      // Create offer and wait for (non-trickle) ICE gathering to complete, so the
+      // STUN-derived candidates are included in the SDP we send to OpenAI.
+      // Without this, the gathered candidates never reach OpenAI and the call
+      // drops at the ~30s ICE consent-freshness timeout (RFC 7675).
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Connect to OpenAI Realtime API with required header
+      await new Promise<void>((resolve) => {
+        if (pc.iceGatheringState === "complete") {
+          resolve();
+          return;
+        }
+        const done = () => {
+          window.clearTimeout(timeoutId);
+          pc.removeEventListener("icegatheringstatechange", onStateChange);
+          resolve();
+        };
+        const onStateChange = () => {
+          if (pc.iceGatheringState === "complete") done();
+        };
+        const timeoutId = window.setTimeout(done, 5000);
+        pc.addEventListener("icegatheringstatechange", onStateChange);
+      });
+
+      const localSdp = pc.localDescription?.sdp;
+      if (!localSdp) {
+        throw new Error("Failed to create local SDP offer");
+      }
+
+      // Connect to OpenAI Realtime API
       const response = await fetch("https://api.openai.com/v1/realtime/calls", {
         method: "POST",
-        body: offer.sdp,
+        body: localSdp,
         headers: {
           "Content-Type": "application/sdp",
           Authorization: `Bearer ${ephemeralKey}`,
@@ -891,7 +916,14 @@ export default function TestAgentPage() {
 
       pc.onconnectionstatechange = () => {
         console.log("[WebRTC] Connection state:", pc.connectionState);
-        if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        // "disconnected" is transient/recoverable per the WebRTC spec — do NOT
+        // tear down on it (that was killing healthy calls at ~30s). Only end on
+        // a truly terminal state.
+        if (pc.connectionState === "disconnected") {
+          console.warn("[WebRTC] Temporarily disconnected; waiting for recovery or failure");
+          return;
+        }
+        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           void saveTranscript();
           cleanup();
           setConnectionStatus("idle");
