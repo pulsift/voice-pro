@@ -681,7 +681,6 @@ export default function TestAgentPage() {
         headers: {
           "Content-Type": "application/sdp",
           Authorization: `Bearer ${ephemeralKey}`,
-          "OpenAI-Beta": "realtime=v1",
         },
       });
 
@@ -717,21 +716,28 @@ export default function TestAgentPage() {
         const sessionUpdate = {
           type: "session.update",
           session: {
+            type: "realtime",
             instructions: instructions,
-            voice: voice,
-            input_audio_transcription: {
-              model: "whisper-1",
-              language: getWhisperCode(language) ?? undefined,
+            audio: {
+              input: {
+                transcription: {
+                  model: "whisper-1",
+                  language: getWhisperCode(language) ?? undefined,
+                },
+                turn_detection:
+                  turnDetection === "disabled"
+                    ? null
+                    : {
+                        type: turnDetection === "semantic" ? "semantic_vad" : "server_vad",
+                        threshold: threshold,
+                        prefix_padding_ms: prefixPadding,
+                        silence_duration_ms: silenceDuration,
+                      },
+              },
+              output: {
+                voice: voice,
+              },
             },
-            turn_detection:
-              turnDetection === "disabled"
-                ? null
-                : {
-                    type: turnDetection === "semantic" ? "semantic_vad" : "server_vad",
-                    threshold: threshold,
-                    prefix_padding_ms: prefixPadding,
-                    silence_duration_ms: silenceDuration,
-                  },
             tools: tools,
             tool_choice: tools.length > 0 ? "auto" : "none",
           },
