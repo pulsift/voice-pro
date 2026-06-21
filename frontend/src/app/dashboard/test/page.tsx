@@ -686,12 +686,11 @@ export default function TestAgentPage() {
         }
       };
       pc.onicecandidateerror = (e) => {
-        const ev = e as RTCPeerConnectionIceErrorEvent;
         console.warn(
           `[ICE ${elapsed()}] candidate error:`,
-          ev.errorCode,
-          ev.errorText,
-          ev.url
+          e.errorCode,
+          e.errorText,
+          e.url
         );
       };
 
