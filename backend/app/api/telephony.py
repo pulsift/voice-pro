@@ -626,12 +626,14 @@ async def initiate_call(
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid workspace_id format") from e
 
-    # Load agent to get provider preference (verify user owns agent)
+    # Load agent to get provider preference (verify user owns agent).
+    # Agent.user_id is the INTEGER users.id (not the UUID) — comparing it to a UUID
+    # throws "operator does not exist: integer = uuid".
     user_uuid = user_id_to_uuid(current_user.id)
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(call_request.agent_id),
-            Agent.user_id == user_uuid,  # Ensure user owns the agent
+            Agent.user_id == current_user.id,  # Ensure user owns the agent
         )
     )
     agent = result.scalar_one_or_none()
