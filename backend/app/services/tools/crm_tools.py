@@ -505,10 +505,17 @@ class CRMTools:
             if result.get("success"):
                 return {
                     "success": True,
-                    "message": "Booked. The invite is on its way to the lead.",
+                    "message": (
+                        "Booked - the invite is on its way to the lead. Now: confirm the time "
+                        "back to them ONCE in a short line, give ONE warm goodbye, then call end_call."
+                    ),
                     "uid": result.get("uid"),
                 }
-            return {"success": False, "error": "booking_failed"}
+            return {
+                "success": False,
+                "error": "booking_failed",
+                "message": "The calendar hiccuped - tell them you'll email to lock it in, then call end_call.",
+            }
 
         # --- Internal calendar fallback (phone-based) ---
         if not contact_phone:

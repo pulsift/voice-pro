@@ -43,6 +43,7 @@ async def save_transcript_to_call_record(
     transcript: str,
     db: AsyncSession,
     log: Any,
+    agent_id: str | None = None,
 ) -> None:
     """Save transcript to the call record.
 
@@ -51,6 +52,7 @@ async def save_transcript_to_call_record(
         transcript: Formatted transcript text
         db: Database session
         log: Logger instance
+        agent_id: Agent UUID (for the fallback match below)
     """
     if not transcript.strip():
         log.debug("empty_transcript_skipped")
@@ -58,6 +60,27 @@ async def save_transcript_to_call_record(
 
     result = await db.execute(select(CallRecord).where(CallRecord.provider_call_id == call_sid))
     call_record = result.scalar_one_or_none()
+
+    # Fallback: the TeXML call leg's id (stored as provider_call_id) can differ from the
+    # media stream's call_control_id, so an exact match may miss. Attach to this agent's
+    # most-recent transcript-less record (one active call at a time in practice).
+    if not call_record and agent_id:
+        from datetime import UTC, datetime, timedelta
+
+        cutoff = datetime.now(UTC) - timedelta(minutes=20)
+        fb = await db.execute(
+            select(CallRecord)
+            .where(
+                CallRecord.agent_id == uuid.UUID(agent_id),
+                CallRecord.transcript.is_(None),
+                CallRecord.created_at >= cutoff,
+            )
+            .order_by(CallRecord.created_at.desc())
+            .limit(1)
+        )
+        call_record = fb.scalar_one_or_none()
+        if call_record:
+            log.info("transcript_fallback_matched", record_id=str(call_record.id))
 
     if call_record:
         call_record.transcript = transcript
@@ -149,7 +172,9 @@ async def twilio_media_stream(
             # Save transcript to call record if enabled
             if agent.enable_transcript and call_sid:
                 transcript = realtime_session.get_transcript()
-                await save_transcript_to_call_record(call_sid, transcript, db, log)
+                await save_transcript_to_call_record(
+                    call_sid, transcript, db, log, agent_id=agent_id
+                )
 
     except WebSocketDisconnect:
         log.info("twilio_websocket_disconnected")
@@ -483,7 +508,9 @@ async def telnyx_media_stream(
             # Save transcript to call record if enabled
             if agent.enable_transcript and call_control_id:
                 transcript = realtime_session.get_transcript()
-                await save_transcript_to_call_record(call_control_id, transcript, db, log)
+                await save_transcript_to_call_record(
+                    call_control_id, transcript, db, log, agent_id=agent_id
+                )
 
     except WebSocketDisconnect:
         log.info("telnyx_websocket_disconnected")

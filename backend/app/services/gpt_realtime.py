@@ -336,16 +336,19 @@ class GPTRealtimeSession:
                 "input": {
                     "format": {"type": "audio/pcmu"},
                     "transcription": {"model": "whisper-1"},
+                    # Less eager turn-taking so it stops cutting the caller off:
+                    # wait ~0.7s of silence before responding, slightly higher threshold.
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 200,
-                        "silence_duration_ms": 200,
+                        "threshold": 0.6,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 700,
                     },
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
                     "voice": voice,
+                    "speed": 0.9,  # slightly slower than default (caller felt it was too fast)
                 },
             },
             "tools": tools,

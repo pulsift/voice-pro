@@ -79,8 +79,11 @@ async def get_business_slots(
         resp.raise_for_status()
         data = resp.json().get("data", {})
 
-    picked: list[dict[str, str]] = []
-    seen_days: set[Any] = set()
+    # Offer one MORNING (9-12) + one AFTERNOON (12-17) slot rather than two earliest
+    # (which were both 8am). `extra` is a fallback if only one half-day has openings.
+    morning: dict[str, str] | None = None
+    afternoon: dict[str, str] | None = None
+    extra: dict[str, str] | None = None
 
     for date_key in sorted(data.keys()):
         slots = data[date_key]
@@ -94,25 +97,31 @@ async def get_business_slots(
             team_dt = dt.astimezone(team_tz)
             if team_dt.weekday() >= 5:  # Sat/Sun
                 continue
-            if not (settings.BOOKING_HOUR_START <= team_dt.hour < settings.BOOKING_HOUR_END):
+            h = team_dt.hour
+            if not (settings.BOOKING_HOUR_START <= h < settings.BOOKING_HOUR_END):
                 continue
-            day = team_dt.date()
-            if day in seen_days:
-                continue
-            seen_days.add(day)
-            lead_dt = dt.astimezone(lead_zone)
-            picked.append(
-                {
-                    "start": iso,
-                    "label": lead_dt.strftime("%A, %B %d at %I:%M %p").replace(" 0", " "),
-                }
-            )
-            if len(picked) >= max_slots:
-                log.info("slots_picked", count=len(picked))
-                return picked
+            entry = {
+                "start": iso,
+                # Day + time only — no date (the caller found the spoken date pointless).
+                "label": dt.astimezone(lead_zone).strftime("%A %I:%M %p").replace(" 0", " "),
+            }
+            if 9 <= h < 12 and morning is None:
+                morning = entry
+            elif 12 <= h <= 16 and afternoon is None:
+                afternoon = entry
+            elif extra is None:
+                extra = entry
 
-    log.info("slots_picked", count=len(picked))
-    return picked
+    picked = [s for s in (morning, afternoon) if s]
+    if len(picked) < max_slots and extra:
+        picked.append(extra)
+    log.info(
+        "slots_picked",
+        count=len(picked),
+        morning=morning is not None,
+        afternoon=afternoon is not None,
+    )
+    return picked[:max_slots]
 
 
 async def create_booking(
