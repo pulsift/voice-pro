@@ -26,6 +26,7 @@ import {
   Users,
   Calendar,
   FolderOpen,
+  MessageSquare,
   PanelLeftClose,
   PanelLeft,
   LogOut,
@@ -88,6 +89,12 @@ const navigation = [
     href: "/dashboard/calls",
     icon: History,
     color: "text-orange-400",
+  },
+  {
+    name: "Messages",
+    href: "/dashboard/messages",
+    icon: MessageSquare,
+    color: "text-teal-400",
   },
   {
     name: "Test Agent",
