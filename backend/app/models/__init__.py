@@ -8,6 +8,7 @@ from app.models.campaign import Campaign, CampaignContact
 from app.models.contact import Contact
 from app.models.phone_number import PhoneNumber
 from app.models.privacy_settings import ConsentRecord, PrivacySettings
+from app.models.sms_contact import SmsContact
 from app.models.sms_message import SmsMessage
 from app.models.user import User
 from app.models.user_integration import UserIntegration
@@ -25,6 +26,7 @@ __all__ = [
     "Contact",
     "PhoneNumber",
     "PrivacySettings",
+    "SmsContact",
     "SmsMessage",
     "User",
     "UserIntegration",
