@@ -146,7 +146,7 @@ export function EmbedAgentDialog({ open, onOpenChange, agent }: EmbedAgentDialog
   const getScriptTag = () => {
     if (!embedSettings) return "";
     const baseUrl = getBaseUrl();
-    return `<!-- Voice Noob Widget -->
+    return `<!-- Voice Pro Widget -->
 <script src="${baseUrl}/widget/v1/widget.js" defer></script>
 <voice-agent
   agent-id="${embedSettings.public_id}"

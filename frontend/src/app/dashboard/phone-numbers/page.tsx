@@ -47,14 +47,12 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { toast } from "sonner";
+import { searchPhoneNumbers, purchasePhoneNumber, type Provider } from "@/lib/api/telephony";
 import {
-  listPhoneNumbers,
-  searchPhoneNumbers,
-  purchasePhoneNumber,
-  releasePhoneNumber,
-  type PhoneNumber as ApiPhoneNumber,
-  type Provider,
-} from "@/lib/api/telephony";
+  listPhoneNumbers as listRegistryPhoneNumbers,
+  deletePhoneNumber,
+  type PhoneNumber as RegistryPhoneNumber,
+} from "@/lib/api/phone-numbers";
 import { fetchAgents, updateAgent, type Agent } from "@/lib/api/agents";
 import { api } from "@/lib/api";
 
@@ -142,65 +140,38 @@ export default function PhoneNumbersPage() {
       const agentsData = agentsList.status === "fulfilled" ? agentsList.value : [];
       setAgents(agentsData);
 
-      // Determine which workspace to use for phone number queries
-      const defaultWs = loadedWorkspaces.find((ws) => ws.is_default);
-      const workspaceId =
-        selectedWorkspaceId !== "all"
-          ? selectedWorkspaceId
-          : (defaultWs?.id ?? loadedWorkspaces[0]?.id);
+      // Load ALL registered numbers from the DB registry — the source of truth that
+      // the top-bar count reads. Only scope by workspace when a specific one is picked;
+      // "All Workspaces" returns everything, including numbers with no workspace.
+      const registry = await listRegistryPhoneNumbers({
+        page_size: 100,
+        workspace_id: selectedWorkspaceId !== "all" ? selectedWorkspaceId : undefined,
+      });
 
-      if (!workspaceId) {
-        // No workspaces available
-        setPhoneNumbers([]);
-        return;
-      }
+      const numbers: PhoneNumber[] = registry.phone_numbers.map((n: RegistryPhoneNumber) => ({
+        id: n.id,
+        phoneNumber: n.phone_number,
+        provider: n.provider,
+        agentId: n.assigned_agent_id ?? undefined,
+        agentName: n.assigned_agent_name ?? undefined,
+        workspaceId: n.workspace_id ?? undefined,
+        workspaceName: n.workspace_name ?? undefined,
+        isActive: n.status === "active",
+      }));
 
-      // Load phone numbers from both providers
-      const [telnyxNumbers, twilioNumbers] = await Promise.allSettled([
-        listPhoneNumbers("telnyx", workspaceId),
-        listPhoneNumbers("twilio", workspaceId),
-      ]);
-
-      const numbers: PhoneNumber[] = [];
-
-      // Process Telnyx numbers
-      if (telnyxNumbers.status === "fulfilled") {
-        numbers.push(
-          ...telnyxNumbers.value.map((n: ApiPhoneNumber) => ({
-            id: n.id,
-            phoneNumber: n.phone_number,
-            provider: "telnyx",
-            agentId: n.assigned_agent_id ?? undefined,
-            isActive: true,
-          }))
-        );
-      }
-
-      // Process Twilio numbers
-      if (twilioNumbers.status === "fulfilled") {
-        numbers.push(
-          ...twilioNumbers.value.map((n: ApiPhoneNumber) => ({
-            id: n.id,
-            phoneNumber: n.phone_number,
-            provider: "twilio",
-            agentId: n.assigned_agent_id ?? undefined,
-            isActive: true,
-          }))
-        );
-      }
-
-      // Map agent names to phone numbers
+      // Backfill agent names from the agents list where the registry didn't resolve one.
       const numbersWithAgents = numbers.map((num) => {
-        if (num.agentId) {
+        if (num.agentId && !num.agentName) {
           const agent = agentsData.find((a: Agent) => a.id === num.agentId);
           return { ...num, agentName: agent?.name };
         }
-        // Also check if any agent has this phone number assigned
-        const assignedAgent = agentsData.find(
-          (a: Agent) => a.phone_number_id === num.id || a.phone_number_id === num.phoneNumber
-        );
-        if (assignedAgent) {
-          return { ...num, agentId: assignedAgent.id, agentName: assignedAgent.name };
+        if (!num.agentId) {
+          const assignedAgent = agentsData.find(
+            (a: Agent) => a.phone_number_id === num.id || a.phone_number_id === num.phoneNumber
+          );
+          if (assignedAgent) {
+            return { ...num, agentId: assignedAgent.id, agentName: assignedAgent.name };
+          }
         }
         return num;
       });
@@ -335,19 +306,9 @@ export default function PhoneNumbersPage() {
   const confirmReleaseNumber = async () => {
     if (!numberToRelease) return;
 
-    const workspaceId = getActiveWorkspaceId();
-    if (!workspaceId) {
-      toast.error("No workspace available.");
-      return;
-    }
-
     try {
-      await releasePhoneNumber(
-        numberToRelease.id,
-        numberToRelease.provider as Provider,
-        workspaceId
-      );
-      toast.success(`Released ${numberToRelease.phoneNumber}`);
+      await deletePhoneNumber(numberToRelease.id);
+      toast.success(`Removed ${numberToRelease.phoneNumber}`);
       // Reload to reflect changes
       await loadData();
     } catch (error) {

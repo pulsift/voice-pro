@@ -15,7 +15,7 @@ describe("AppSidebar", () => {
 
   it("contains application branding", () => {
     renderSidebar();
-    expect(screen.getByText("Voice Noob")).toBeInTheDocument();
+    expect(screen.getByText("Voice Pro")).toBeInTheDocument();
   });
 
   it("renders navigation items", () => {

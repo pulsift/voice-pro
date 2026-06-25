@@ -30,7 +30,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark" suppressHydrationWarning>
       <head>
-        <title>Voice Noob</title>
+        <title>Voice Pro</title>
         <meta name="description" content="AI-powered voice agent platform" />
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
       </head>

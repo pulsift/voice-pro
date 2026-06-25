@@ -18,8 +18,8 @@ export interface Integration {
   icon: string;
   enabled: boolean;
   isPopular?: boolean;
-  isBuiltIn?: boolean; // Voice Noob built-in integration
-  badge?: string; // Custom badge text (e.g., "Voice Noob", "Popular")
+  isBuiltIn?: boolean; // Voice Pro built-in integration
+  badge?: string; // Custom badge text (e.g., "Voice Pro", "Popular")
   fields?: IntegrationField[];
   scopes?: string[];
   documentationUrl?: string;
@@ -46,7 +46,7 @@ export interface IntegrationTool {
 }
 
 export const AVAILABLE_INTEGRATIONS: Integration[] = [
-  // Built-in Voice Noob Tools (No external API needed)
+  // Built-in Voice Pro Tools (No external API needed)
   {
     id: "call_control",
     name: "Call Control",
@@ -57,7 +57,7 @@ export const AVAILABLE_INTEGRATIONS: Integration[] = [
     icon: "https://cdn.simpleicons.org/phone",
     enabled: true,
     isBuiltIn: true,
-    badge: "Voice Noob",
+    badge: "Voice Pro",
     documentationUrl: "/docs/call-control-tools",
     tools: [
       {
@@ -93,7 +93,7 @@ export const AVAILABLE_INTEGRATIONS: Integration[] = [
     icon: "https://cdn.simpleicons.org/contactlessPayment",
     enabled: true,
     isBuiltIn: true,
-    badge: "Voice Noob",
+    badge: "Voice Pro",
     documentationUrl: "/docs/crm-tools",
     tools: [
       {
@@ -122,7 +122,7 @@ export const AVAILABLE_INTEGRATIONS: Integration[] = [
     icon: "https://cdn.simpleicons.org/calendly",
     enabled: true,
     isBuiltIn: true,
-    badge: "Voice Noob",
+    badge: "Voice Pro",
     documentationUrl: "/docs/booking-tools",
     tools: [
       {

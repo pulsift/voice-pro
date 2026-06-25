@@ -55,7 +55,7 @@ export function Preloader() {
                 backgroundSize: "200% 100%",
               }}
             >
-              Voice Noob
+              Voice Pro
             </span>
 
             {/* Loading dots */}

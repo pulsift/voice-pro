@@ -1000,7 +1000,7 @@ export default function EmbedPage() {
             className="transition-colors duration-200 hover:underline"
             style={{ color: primaryColor }}
           >
-            Voice Noob
+            Voice Pro
           </a>
         </div>
       )}

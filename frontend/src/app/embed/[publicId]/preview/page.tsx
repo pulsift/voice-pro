@@ -5,7 +5,7 @@ import EmbedPage from "../page";
 export default function PreviewPage() {
   return (
     <div className="relative min-h-screen bg-black">
-      {/* Voice Noob Logo - centered */}
+      {/* Voice Pro Logo - centered */}
       <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
         <span
           className="animate-gradient-flow bg-clip-text text-3xl font-bold tracking-tight text-transparent"
@@ -14,7 +14,7 @@ export default function PreviewPage() {
             backgroundSize: "200% 100%",
           }}
         >
-          Voice Noob
+          Voice Pro
         </span>
       </div>
 
