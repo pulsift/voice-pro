@@ -1,5 +1,6 @@
 """CRM tools for voice agents - bookings, contacts, appointments."""
 
+import json
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -13,6 +14,7 @@ from app.core.cache import cache_invalidate
 from app.core.config import settings
 from app.models.appointment import Appointment
 from app.models.contact import Contact
+from app.services.fulfilment_webhook import schedule_fulfilment_webhook
 
 logger = structlog.get_logger()
 
@@ -137,13 +139,45 @@ class CRMTools:
             {
                 "type": "function",
                 "name": "book_appointment",
-                "description": "Book the appointment. The attendee's name and email are filled automatically from the call - never ask for them. Pass the chosen start time (the exact 'start' value from check_availability).",
+                "description": (
+                    "Book the appointment. Before calling this, you MUST have confirmed the lead's "
+                    "email on the call (read back what's on file and confirm it, or ask if you don't "
+                    "have one) and captured a quick ICP fit check (what they install, minimum project "
+                    "size in kW, target states/area) - pass both as arguments. The attendee's name is "
+                    "filled automatically from the call. Pass the chosen start time (the exact 'start' "
+                    "value from check_availability). If this call returns an error asking for missing "
+                    "info, ask the lead for it naturally, then call book_appointment again."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "scheduled_at": {
                             "type": "string",
                             "description": "Chosen appointment start time in ISO 8601 format - use the exact 'start' value returned by check_availability.",
+                        },
+                        "email": {
+                            "type": "string",
+                            "description": "REQUIRED. The lead's email address, confirmed out loud on the call (read back what's on file, or ask for it if you don't have one). Used for the calendar invite.",
+                        },
+                        "icp": {
+                            "type": "object",
+                            "description": "REQUIRED. Quick fit-check captured on the call, in 2-3 brief questions.",
+                            "properties": {
+                                "offer_types": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "What they install/sell, e.g. ['rooftop C&I', 'carport', 'storage', 'resi-expanding', 'finance-PPA'].",
+                                },
+                                "min_kw": {
+                                    "type": "number",
+                                    "description": "Minimum project size in kW they'll take on.",
+                                },
+                                "states": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Target states / service area.",
+                                },
+                            },
                         },
                         "time_zone": {
                             "type": "string",
@@ -166,7 +200,7 @@ class CRMTools:
                             "description": "Type of service/appointment",
                         },
                     },
-                    "required": ["scheduled_at"],
+                    "required": ["scheduled_at", "email", "icp"],
                 },
             },
             {
@@ -455,6 +489,8 @@ class CRMTools:
     async def book_appointment(
         self,
         scheduled_at: str,
+        email: str | None = None,
+        icp: dict[str, Any] | str | None = None,
         contact_phone: str | None = None,
         duration_minutes: int = 30,
         service_type: str | None = None,
@@ -464,11 +500,16 @@ class CRMTools:
         """Book an appointment.
 
         When Cal.com is configured, books on Cal.com (the host's real calendar) with
-        the attendee filled from per-call variables (leadName/leadEmail/tzName) so the
-        agent never asks. Otherwise falls back to the internal calendar (phone-based).
+        the attendee's name filled from per-call variables (leadName) but the email
+        and ICP fit-check must come from THIS call's arguments - the model is required
+        to confirm/collect them live before a booking can succeed (never silently
+        pulled from pre-seeded campaign data, so the agent can't skip the ask).
+        Otherwise falls back to the internal calendar (phone-based).
 
         Args:
             scheduled_at: ISO 8601 datetime (use the 'start' from check_availability)
+            email: Lead's email, confirmed on the call (Cal.com path: required)
+            icp: Quick ICP fit-check captured on the call (Cal.com path: required)
             contact_phone: Customer phone (internal fallback only)
             duration_minutes: Duration
             service_type: Service type
@@ -481,21 +522,38 @@ class CRMTools:
         # --- Cal.com path (preferred) ---
         if self._calcom_enabled():
             name = (self.variables.get("leadName") or "").strip() or "Guest"
-            email = (self.variables.get("leadEmail") or "").strip()
+            attendee_email = (email or "").strip()
             lead_tz = time_zone or self.variables.get("tzName") or settings.BOOKING_TEAM_TIMEZONE
-            if not email:
-                self.logger.warning("calcom_book_no_email")
-                return {"success": False, "error": "no_attendee_email"}
+
+            # Enforce the live ask/confirm - never fall back to pre-seeded campaign
+            # data silently, or the agent could skip it under time pressure.
+            if not attendee_email:
+                self.logger.warning("calcom_book_missing_email")
+                return {
+                    "success": False,
+                    "error": "missing_email",
+                    "message": "Ask the lead to confirm their email address, then call book_appointment again with it.",
+                }
+            if not icp:
+                self.logger.warning("calcom_book_missing_icp")
+                return {
+                    "success": False,
+                    "error": "missing_icp",
+                    "message": "Ask the lead the quick fit questions (what they install, minimum project size in kW, target states) before booking, then call book_appointment again with icp filled in.",
+                }
+
+            icp_str = icp if isinstance(icp, str) else json.dumps(icp, ensure_ascii=False)
             full_notes = notes or ""
             if service_type:
                 full_notes = f"{service_type}. {full_notes}".strip()
+            full_notes = f"{full_notes}\nICP: {icp_str}".strip()
             try:
                 from app.services.calcom_client import create_booking
 
                 result = await create_booking(
                     start_iso=scheduled_at,
                     name=name,
-                    email=email,
+                    email=attendee_email,
                     lead_tz=lead_tz,
                     notes=full_notes or None,
                 )
@@ -503,13 +561,28 @@ class CRMTools:
                 self.logger.exception("calcom_book_failed", error=str(e))
                 return {"success": False, "error": "booking_failed"}
             if result.get("success"):
+                booking_id = result.get("uid")
+                schedule_fulfilment_webhook(
+                    {
+                        "booking_id": booking_id,
+                        "name": name,
+                        "company": self.variables.get("company"),
+                        "email": attendee_email,
+                        "phone": self.variables.get("leadPhone") or self.variables.get("phone"),
+                        "icp": icp if isinstance(icp, dict) else icp_str,
+                        "campaign_id": self.variables.get("campaign_id")
+                        or self.variables.get("campaignId"),
+                        "conversation_id": self.variables.get("conversation_id")
+                        or self.variables.get("conversationId"),
+                    }
+                )
                 return {
                     "success": True,
                     "message": (
                         "Booked - the invite is on its way to the lead. Now: confirm the time "
                         "back to them ONCE in a short line, give ONE warm goodbye, then call end_call."
                     ),
-                    "uid": result.get("uid"),
+                    "uid": booking_id,
                 }
             return {
                 "success": False,

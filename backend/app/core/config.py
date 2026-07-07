@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     BOOKING_HOUR_START: int = 8
     BOOKING_HOUR_END: int = 20
 
+    # Fulfilment handoff (optional). When set, a successful Cal.com booking fires a
+    # fire-and-forget POST to f"{FULFIL_WEBHOOK_URL}/fulfil" with the booking + ICP
+    # payload so the fulfilment service can build the lead-magnet list. Unset = skip
+    # silently (no fulfilment service deployed yet / not wanted for this environment).
+    FULFIL_WEBHOOK_URL: str | None = None
+
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls
     OPENAI_TIMEOUT: float = 30.0  # LLM inference can be slow
