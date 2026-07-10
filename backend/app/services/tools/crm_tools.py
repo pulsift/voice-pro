@@ -1,8 +1,11 @@
 """CRM tools for voice agents - bookings, contacts, appointments."""
 
+import asyncio
 import json
+import re
 import uuid
-from datetime import datetime, timedelta
+from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -17,6 +20,9 @@ from app.models.contact import Contact
 from app.services.fulfilment_webhook import schedule_fulfilment_webhook
 
 logger = structlog.get_logger()
+MAX_BOOKING_ATTEMPTS = 2
+MAX_12_HOUR = 12
+MAX_MINUTE = 59
 
 
 class CRMTools:
@@ -54,10 +60,182 @@ class CRMTools:
         self.logger = logger.bind(
             component="crm_tools", user_id=user_id, workspace_id=str(workspace_id)
         )
+        self._offered_slots: list[dict[str, str]] = []
+        self._selected_slot_id: str | None = None
+        self._selected_start: str | None = None
+        self._normalized_timezone: str | None = None
+        self._user_turn = 0
+        self._offer_user_turn = 0
+        self._latest_user_utterance = ""
+        self._selection_user_turn = 0
+        self._booking_attempts: list[dict[str, Any]] = []
+        self._booking_completed: dict[str, Any] | None = None
 
     def _calcom_enabled(self) -> bool:
         """True when Cal.com is configured to back booking (else internal calendar)."""
         return bool(settings.CALCOM_API_KEY and settings.CALCOM_EVENT_TYPE_ID)
+
+    def observe_user_utterance(self, text: str) -> None:
+        """Observe one completed user transcript for transcript-bound slot selection."""
+        self._user_turn += 1
+        self._latest_user_utterance = text.strip()
+
+    def get_booking_attempts(self) -> list[dict[str, Any]]:
+        """Return a safe copy for later CallRecord persistence."""
+        return deepcopy(self._booking_attempts)
+
+    def _replace_offered_slots(self, slots: list[dict[str, str]], timezone: str) -> None:
+        self._offered_slots = [
+            {
+                "slot_id": f"slot_{index}",
+                "start": slot["start"],
+                "label": slot["label"],
+                "timezone": timezone,
+            }
+            for index, slot in enumerate(slots, start=1)
+        ]
+        self._normalized_timezone = timezone
+        self._selected_slot_id = None
+        self._selected_start = None
+        self._selection_user_turn = 0
+        self._offer_user_turn = self._user_turn
+        self._booking_attempts.append(
+            {
+                "operation": "availability",
+                "attempt": len(self._booking_attempts) + 1,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "category": "offered" if slots else "empty",
+                "timezone": timezone,
+                "turn": self._user_turn,
+                "slot_ids": [slot["slot_id"] for slot in self._offered_slots],
+            }
+        )
+
+    @staticmethod
+    def _canonical_start(value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC)
+
+    def _utterance_slot_candidates(self) -> set[str]:
+        """Conservatively infer the offered slot(s) named by the latest utterance."""
+        from zoneinfo import ZoneInfo
+
+        text = " ".join(self._latest_user_utterance.lower().split())
+        ordinal_candidates: set[str] = set()
+        if re.search(r"\b(first|earlier)\b", text) and self._offered_slots:
+            ordinal_candidates.add(self._offered_slots[0]["slot_id"])
+        if (
+            re.search(r"\b(second|later)\b", text)
+            and len(self._offered_slots) >= MAX_BOOKING_ATTEMPTS
+        ):
+            ordinal_candidates.add(self._offered_slots[1]["slot_id"])
+        if ordinal_candidates:
+            return ordinal_candidates
+
+        time_matches: set[tuple[int, int]] = set()
+        for match in re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text):
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            if 1 <= hour <= MAX_12_HOUR and minute <= MAX_MINUTE:
+                hour = hour % MAX_12_HOUR + (MAX_12_HOUR if match.group(3) == "pm" else 0)
+                time_matches.add((hour, minute))
+        for match in re.finditer(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text):
+            time_matches.add((int(match.group(1)), int(match.group(2))))
+        word_hours = {
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "eleven": 11,
+            "twelve": 12,
+        }
+        for word, hour in word_hours.items():
+            if re.search(rf"\b{word}\b", text):
+                # Spoken bare hours have no AM/PM. Match both halves of the day;
+                # the offered-slot set must still reduce this to exactly one slot.
+                time_matches.add((hour % MAX_12_HOUR, 0))
+                time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
+
+        day_names = {
+            name
+            for name in (
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+                "sunday",
+            )
+            if re.search(rf"\b{name}\b", text)
+        }
+        if not time_matches and not day_names:
+            return set()
+
+        zone = ZoneInfo(self._normalized_timezone or "UTC")
+        candidates: set[str] = set()
+        for slot in self._offered_slots:
+            start = self._canonical_start(slot["start"])
+            if start is None:
+                continue
+            local_start = start.astimezone(zone)
+            time_ok = not time_matches or (local_start.hour, local_start.minute) in time_matches
+            day_ok = not day_names or local_start.strftime("%A").lower() in day_names
+            if time_ok and day_ok:
+                candidates.add(slot["slot_id"])
+        return candidates
+
+    async def select_slot(self, slot_id: str) -> dict[str, Any]:
+        """Pin one offered slot only when the latest post-offer transcript agrees."""
+        if not self._offered_slots:
+            return {"success": False, "error": "slots_not_offered"}
+        if self._user_turn <= max(self._offer_user_turn, self._selection_user_turn):
+            return {
+                "success": False,
+                "error": "selection_not_heard",
+                "message": "Ask whether they want the first time or the second.",
+            }
+        offered = {slot["slot_id"]: slot for slot in self._offered_slots}
+        candidates = self._utterance_slot_candidates()
+        if slot_id not in offered or candidates != {slot_id}:
+            return {
+                "success": False,
+                "error": "ambiguous_slot_selection",
+                "message": "Ask whether they want the first time or the second.",
+            }
+        selected = offered[slot_id]
+        self._selected_slot_id = slot_id
+        self._selected_start = selected["start"]
+        self._selection_user_turn = self._user_turn
+        self._booking_attempts.append(
+            {
+                "operation": "select",
+                "attempt": len(self._booking_attempts) + 1,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "category": "selected",
+                "timezone": self._normalized_timezone,
+                "turn": self._user_turn,
+                "slot_id": slot_id,
+                "selected_start": selected["start"],
+            }
+        )
+        return {
+            "success": True,
+            "slot_id": slot_id,
+            "start": selected["start"],
+            "when": selected["label"],
+        }
 
     @staticmethod
     def get_tool_definitions() -> list[dict[str, Any]]:
@@ -138,15 +316,26 @@ class CRMTools:
             },
             {
                 "type": "function",
+                "name": "select_slot",
+                "description": "Select one of the latest offered slots after the lead clearly chooses it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slot_id": {
+                            "type": "string",
+                            "description": "Opaque slot ID returned by check_availability, such as slot_1 or slot_2.",
+                        },
+                    },
+                    "required": ["slot_id"],
+                },
+            },
+            {
+                "type": "function",
                 "name": "book_appointment",
                 "description": (
-                    "Book the appointment. Before calling this, you MUST have confirmed the lead's "
-                    "email on the call (read back what's on file and confirm it, or ask if you don't "
-                    "have one) and captured a quick ICP fit check (what they install, minimum project "
-                    "size in kW, target states/area) - pass both as arguments. The attendee's name is "
-                    "filled automatically from the call. Pass the chosen start time (the exact 'start' "
-                    "value from check_availability). If this call returns an error asking for missing "
-                    "info, ask the lead for it naturally, then call book_appointment again."
+                    "Book the selected appointment after select_slot succeeds and the ICP fit check "
+                    "is captured. The attendee name and email on file are filled automatically; pass "
+                    "email only if the lead volunteers a correction. Pass the exact selected start."
                 ),
                 "parameters": {
                     "type": "object",
@@ -157,7 +346,7 @@ class CRMTools:
                         },
                         "email": {
                             "type": "string",
-                            "description": "REQUIRED. The lead's email address, confirmed out loud on the call (read back what's on file, or ask for it if you don't have one). Used for the calendar invite.",
+                            "description": "Optional corrected email volunteered by the lead. Otherwise the email on file is used silently.",
                         },
                         "icp": {
                             "type": "object",
@@ -200,7 +389,7 @@ class CRMTools:
                             "description": "Type of service/appointment",
                         },
                     },
-                    "required": ["scheduled_at", "email", "icp"],
+                    "required": ["scheduled_at", "icp"],
                 },
             },
             {
@@ -391,7 +580,7 @@ class CRMTools:
             self.logger.exception("create_contact_failed", error=str(e))
             return {"success": False, "error": str(e)}
 
-    async def check_availability(
+    async def check_availability(  # noqa: PLR0912
         self,
         date: str | None = None,
         duration_minutes: int = 30,  # noqa: ARG002
@@ -413,11 +602,26 @@ class CRMTools:
         """
         # --- Cal.com path (preferred) ---
         if self._calcom_enabled():
-            lead_tz = time_zone or self.variables.get("tzName") or settings.BOOKING_TEAM_TIMEZONE
-            try:
-                from app.services.calcom_client import get_business_slots
+            from app.services.calcom_client import get_business_slots, normalize_timezone
 
+            lead_tz = normalize_timezone(
+                spoken=time_zone,
+                fallback=self.variables.get("tzName"),
+                team_default=settings.BOOKING_TEAM_TIMEZONE,
+            )
+            if lead_tz is None:
+                self._offered_slots = []
+                self._selected_slot_id = None
+                self._selected_start = None
+                self._normalized_timezone = None
+                return {
+                    "success": False,
+                    "error": "timezone_unresolved",
+                    "message": "Ask for their city once before checking the calendar.",
+                }
+            try:
                 slots = await get_business_slots(lead_tz=lead_tz)
+                self._replace_offered_slots(slots, lead_tz)
                 if not slots:
                     return {
                         "success": True,
@@ -426,10 +630,17 @@ class CRMTools:
                     }
                 return {
                     "success": True,
-                    "slots": [{"when": s["label"], "start": s["start"]} for s in slots],
-                    "message": "Offer these two. Speak the 'when' naturally; pass the matching 'start' to book_appointment.",
+                    "timezone": lead_tz,
+                    "slots": [
+                        {"slot_id": s["slot_id"], "when": s["label"], "start": s["start"]}
+                        for s in self._offered_slots
+                    ],
+                    "message": "Offer these times, hear a clear choice, then call select_slot with its slot_id.",
                 }
             except Exception as e:
+                self._offered_slots = []
+                self._selected_slot_id = None
+                self._selected_start = None
                 self.logger.exception("calcom_check_availability_failed", error=str(e))
                 return {"success": False, "error": "calendar_unavailable"}
 
@@ -486,7 +697,7 @@ class CRMTools:
             self.logger.exception("check_availability_failed", error=str(e))
             return {"success": False, "error": str(e)}
 
-    async def book_appointment(
+    async def book_appointment(  # noqa: PLR0911, PLR0912, PLR0915
         self,
         scheduled_at: str,
         email: str | None = None,
@@ -499,16 +710,14 @@ class CRMTools:
     ) -> dict[str, Any]:
         """Book an appointment.
 
-        When Cal.com is configured, books on Cal.com (the host's real calendar) with
-        the attendee's name filled from per-call variables (leadName) but the email
-        and ICP fit-check must come from THIS call's arguments - the model is required
-        to confirm/collect them live before a booking can succeed (never silently
-        pulled from pre-seeded campaign data, so the agent can't skip the ask).
+        When Cal.com is configured, a current transcript-bound selected slot is
+        mandatory. ICP comes from this call; email uses a volunteered correction or
+        silently falls back to the seeded address on file.
         Otherwise falls back to the internal calendar (phone-based).
 
         Args:
             scheduled_at: ISO 8601 datetime (use the 'start' from check_availability)
-            email: Lead's email, confirmed on the call (Cal.com path: required)
+            email: Optional corrected email volunteered on the call
             icp: Quick ICP fit-check captured on the call (Cal.com path: required)
             contact_phone: Customer phone (internal fallback only)
             duration_minutes: Duration
@@ -521,18 +730,37 @@ class CRMTools:
         """
         # --- Cal.com path (preferred) ---
         if self._calcom_enabled():
-            name = (self.variables.get("leadName") or "").strip() or "Guest"
-            attendee_email = (email or "").strip()
-            lead_tz = time_zone or self.variables.get("tzName") or settings.BOOKING_TEAM_TIMEZONE
+            del (
+                time_zone
+            )  # Deliberately ignored: booking must reuse the stored normalized timezone.
+            if self._booking_completed is not None:
+                return deepcopy(self._booking_completed)
+            if not self._offered_slots:
+                return {"success": False, "error": "slots_not_offered"}
+            if not self._selected_start or not self._selected_slot_id:
+                return {"success": False, "error": "slot_not_selected"}
+            supplied_start = self._canonical_start(scheduled_at)
+            selected_start = self._canonical_start(self._selected_start)
+            if supplied_start is None or selected_start is None or supplied_start != selected_start:
+                return {"success": False, "error": "slot_mismatch"}
 
-            # Enforce the live ask/confirm - never fall back to pre-seeded campaign
-            # data silently, or the agent could skip it under time pressure.
-            if not attendee_email:
+            name = (self.variables.get("leadName") or "").strip() or "Guest"
+            attendee_email = (email or "").strip() or str(
+                self.variables.get("leadEmail") or ""
+            ).strip()
+            lead_tz = self._normalized_timezone or "UTC"
+
+            if (
+                not attendee_email
+                or "{{" in attendee_email
+                or "}}" in attendee_email
+                or attendee_email.lower() in {"none", "null", "n/a", "unknown"}
+            ):
                 self.logger.warning("calcom_book_missing_email")
                 return {
                     "success": False,
                     "error": "missing_email",
-                    "message": "Ask the lead to confirm their email address, then call book_appointment again with it.",
+                    "message": "Ask for an email once, then call book_appointment again with it.",
                 }
             if not icp:
                 self.logger.warning("calcom_book_missing_icp")
@@ -548,20 +776,150 @@ class CRMTools:
                 full_notes = f"{service_type}. {full_notes}".strip()
             full_notes = f"{full_notes}\nICP: {icp_str}".strip()
             try:
-                from app.services.calcom_client import create_booking
+                from app.services.calcom_client import create_booking, find_existing_booking
 
-                result = await create_booking(
-                    start_iso=scheduled_at,
-                    name=name,
-                    email=attendee_email,
-                    lead_tz=lead_tz,
-                    notes=full_notes or None,
-                )
+                booking_result: dict[str, Any] = {}
+                selected_attempts = [
+                    attempt
+                    for attempt in self._booking_attempts
+                    if attempt.get("operation") == "create"
+                    and attempt.get("selected_start") == self._selected_start
+                ]
+                prior_count = len(selected_attempts)
+                if selected_attempts:
+                    last_category = selected_attempts[-1].get("category")
+                    if last_category == "rejected":
+                        return {
+                            "success": False,
+                            "error": "booking_rejected",
+                            "status_code": selected_attempts[-1].get("status_code"),
+                        }
+                    if last_category == "transient":
+                        booking_result = await find_existing_booking(
+                            start_iso=self._selected_start,
+                            email=attendee_email,
+                        )
+                        self._booking_attempts.append(
+                            {
+                                "operation": "reconcile",
+                                "attempt": len(self._booking_attempts) + 1,
+                                "timestamp": datetime.now(UTC).isoformat(),
+                                "selected_start": self._selected_start,
+                                "timezone": lead_tz,
+                                "category": booking_result.get("category"),
+                                "status_code": booking_result.get("status_code"),
+                                "uid": booking_result.get("uid")
+                                if booking_result.get("success")
+                                else None,
+                                "raw_body": str(booking_result.get("raw_body") or "")[:1000],
+                            }
+                        )
+                        if booking_result.get("success"):
+                            prior_count = MAX_BOOKING_ATTEMPTS
+                        elif booking_result.get("category") == "reconcile_unavailable":
+                            return {
+                                "success": False,
+                                "error": "booking_outcome_unknown",
+                                "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
+                            }
+                        elif prior_count >= MAX_BOOKING_ATTEMPTS:
+                            return {
+                                "success": False,
+                                "error": "booking_failed",
+                                "message": "The calendar hiccuped - tell them you'll email to lock it in, then call end_call.",
+                            }
+
+                # Reconcile before the first POST as well as after an unknown POST.
+                # This closes the process/session boundary: a repeated tool call after
+                # reconnect or redeploy cannot create a second booking for the same
+                # attendee and exact start.
+                if prior_count == 0 and not booking_result:
+                    booking_result = await find_existing_booking(
+                        start_iso=self._selected_start,
+                        email=attendee_email,
+                    )
+                    self._booking_attempts.append(
+                        {
+                            "operation": "reconcile",
+                            "attempt": len(self._booking_attempts) + 1,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "selected_start": self._selected_start,
+                            "timezone": lead_tz,
+                            "category": booking_result.get("category"),
+                            "status_code": booking_result.get("status_code"),
+                            "uid": booking_result.get("uid")
+                            if booking_result.get("success")
+                            else None,
+                            "raw_body": str(booking_result.get("raw_body") or "")[:1000],
+                        }
+                    )
+                    if booking_result.get("success"):
+                        prior_count = MAX_BOOKING_ATTEMPTS
+                    elif booking_result.get("category") == "reconcile_unavailable":
+                        return {
+                            "success": False,
+                            "error": "booking_outcome_unknown",
+                            "message": "The calendar cannot safely verify this time. Do not retry it; tell them the team will confirm by email.",
+                        }
+
+                remaining_attempts = MAX_BOOKING_ATTEMPTS - prior_count
+                for local_attempt in range(remaining_attempts):
+                    booking_result = await create_booking(
+                        start_iso=self._selected_start,
+                        name=name,
+                        email=attendee_email,
+                        lead_tz=lead_tz,
+                        notes=full_notes or None,
+                    )
+                    self._booking_attempts.append(
+                        {
+                            "operation": "create",
+                            "attempt": len(self._booking_attempts) + 1,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "selected_start": self._selected_start,
+                            "timezone": lead_tz,
+                            "category": booking_result.get("category", "rejected"),
+                            "status_code": booking_result.get("status_code"),
+                            "uid": booking_result.get("uid")
+                            if booking_result.get("success")
+                            else None,
+                            "raw_body": str(booking_result.get("raw_body") or "")[:1000],
+                        }
+                    )
+                    if booking_result.get("category") != "transient":
+                        break
+                    reconciliation = await find_existing_booking(
+                        start_iso=self._selected_start,
+                        email=attendee_email,
+                    )
+                    self._booking_attempts.append(
+                        {
+                            "operation": "reconcile",
+                            "attempt": len(self._booking_attempts) + 1,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                            "selected_start": self._selected_start,
+                            "timezone": lead_tz,
+                            "category": reconciliation.get("category"),
+                            "status_code": reconciliation.get("status_code"),
+                            "uid": reconciliation.get("uid")
+                            if reconciliation.get("success")
+                            else None,
+                            "raw_body": str(reconciliation.get("raw_body") or "")[:1000],
+                        }
+                    )
+                    if reconciliation.get("success"):
+                        booking_result = reconciliation
+                        break
+                    if reconciliation.get("category") == "reconcile_unavailable":
+                        booking_result = reconciliation
+                        break
+                    if local_attempt < remaining_attempts - 1:
+                        await asyncio.sleep(0.1)
             except Exception as e:
                 self.logger.exception("calcom_book_failed", error=str(e))
                 return {"success": False, "error": "booking_failed"}
-            if result.get("success"):
-                booking_id = result.get("uid")
+            if booking_result.get("success"):
+                booking_id = booking_result.get("uid")
                 schedule_fulfilment_webhook(
                     {
                         "booking_id": booking_id,
@@ -576,13 +934,53 @@ class CRMTools:
                         or self.variables.get("conversationId"),
                     }
                 )
-                return {
+                self._selected_slot_id = None
+                self._selected_start = None
+                self._booking_completed = {
                     "success": True,
                     "message": (
                         "Booked - the invite is on its way to the lead. Now: confirm the time "
                         "back to them ONCE in a short line, give ONE warm goodbye, then call end_call."
                     ),
                     "uid": booking_id,
+                }
+                return deepcopy(self._booking_completed)
+            if booking_result.get("category") == "conflict":
+                from app.services.calcom_client import get_business_slots
+
+                try:
+                    fresh_slots = await get_business_slots(lead_tz=lead_tz)
+                except Exception as e:
+                    self._replace_offered_slots([], lead_tz)
+                    self.logger.exception("calcom_conflict_refresh_failed", error=str(e))
+                    return {"success": False, "error": "calendar_unavailable"}
+                self._replace_offered_slots(fresh_slots, lead_tz)
+                if not fresh_slots:
+                    return {
+                        "success": False,
+                        "error": "calendar_unavailable",
+                        "message": "The calendar has no current openings. End without booking.",
+                    }
+                return {
+                    "success": False,
+                    "error": "slot_conflict",
+                    "slots": [
+                        {"slot_id": s["slot_id"], "when": s["label"], "start": s["start"]}
+                        for s in self._offered_slots
+                    ],
+                    "message": "That time was just taken. Offer these fresh times without choosing one automatically.",
+                }
+            if booking_result.get("category") == "rejected":
+                return {
+                    "success": False,
+                    "error": "booking_rejected",
+                    "status_code": booking_result.get("status_code"),
+                }
+            if booking_result.get("category") == "reconcile_unavailable":
+                return {
+                    "success": False,
+                    "error": "booking_outcome_unknown",
+                    "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
                 }
             return {
                 "success": False,
@@ -875,6 +1273,8 @@ class CRMTools:
             return await self.create_contact(**arguments)
         if tool_name == "check_availability":
             return await self.check_availability(**arguments)
+        if tool_name == "select_slot":
+            return await self.select_slot(**arguments)
         if tool_name == "book_appointment":
             return await self.book_appointment(**arguments)
         if tool_name == "list_appointments":

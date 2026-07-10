@@ -1,6 +1,7 @@
 """GPT Realtime API service for Premium tier voice agents."""
 
 import json
+import re
 import types
 import uuid
 from typing import Any
@@ -45,9 +46,6 @@ LANGUAGE_NAMES: dict[str, str] = {
     "ms-MY": "Malay",
     "fil-PH": "Filipino",
 }
-
-
-import re
 
 _VAR_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 
@@ -188,7 +186,9 @@ class GPTRealtimeSession:
         self.user_id_uuid = user_id_to_uuid(user_id)  # UUID for UserSettings queries
         self.workspace_id = workspace_id  # For workspace-isolated API key lookup
         self.agent_config = agent_config
-        self.variables = variables or {}  # Per-call lead/offer data (prompt fill + booking attendee)
+        self.variables = (
+            variables or {}
+        )  # Per-call lead/offer data (prompt fill + booking attendee)
         self.session_id = session_id or str(uuid.uuid4())
         self.connection: Any = None
         self.tool_registry: ToolRegistry | None = None
@@ -199,6 +199,8 @@ class GPTRealtimeSession:
         # Initial greeting (triggered after event loop starts to avoid race condition)
         self._pending_initial_greeting: str | None = None
         self._greeting_triggered: bool = False
+        self.realtime_model = settings.OPENAI_REALTIME_MODEL
+        self.realtime_reasoning_effort = settings.OPENAI_REALTIME_REASONING_EFFORT
         self.logger = logger.bind(
             component="gpt_realtime",
             session_id=self.session_id,
@@ -266,9 +268,13 @@ class GPTRealtimeSession:
         if not self.client:
             raise ValueError("OpenAI client not initialized")
 
-        # Use the latest production gpt-realtime model (released Aug 2025)
-        model = "gpt-realtime-2025-08-28"
-        self.logger.info("connecting_to_openai_realtime", model=model)
+        model = self.realtime_model
+        reasoning_effort = self._effective_reasoning_effort()
+        self.logger.info(
+            "connecting_to_openai_realtime",
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
 
         try:
             # Use the GA realtime.connect() (the beta namespace + flat session shape
@@ -328,7 +334,7 @@ class GPTRealtimeSession:
         # GA Realtime session shape (nested audio config). Audio is G.711 mu-law 8kHz
         # both ways to match Telnyx PCMU media with no transcoding. (speed/temperature
         # dropped — not part of the GA session shape; were beta-only here.)
-        session_config = {
+        session_config: dict[str, Any] = {
             "type": "realtime",
             "output_modalities": ["audio"],
             "instructions": instructions,
@@ -354,6 +360,9 @@ class GPTRealtimeSession:
             "tools": tools,
             "tool_choice": "auto",
         }
+        reasoning_effort = self._effective_reasoning_effort()
+        if reasoning_effort:
+            session_config["reasoning"] = {"effort": reasoning_effort}
 
         self.logger.info("configuring_session", tool_count=len(tools), enabled_tools=enabled_tools)
 
@@ -381,6 +390,17 @@ class GPTRealtimeSession:
             )
             raise
 
+    def _effective_reasoning_effort(self) -> str | None:
+        """Return configured reasoning effort only for Realtime 2 models."""
+        effort = self.realtime_reasoning_effort
+        if effort in {"low", "medium", "high"} and self.realtime_model.startswith(
+            "gpt-realtime-2."
+        ):
+            return effort
+        if effort:
+            self.logger.warning("invalid_realtime_reasoning_effort", effort=effort)
+        return None
+
     async def handle_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         """Handle tool call from GPT Realtime by routing to internal tools.
 
@@ -399,7 +419,7 @@ class GPTRealtimeSession:
         self.logger.info(
             "handling_tool_call",
             tool_name=tool_name,
-            arguments=arguments,
+            argument_keys=sorted(arguments),
         )
 
         # Execute tool via internal tool registry
@@ -436,8 +456,7 @@ class GPTRealtimeSession:
 
                     # Handle transcription
                     elif event_type == "conversation.item.input_audio_transcription.completed":
-                        # Transcription available in event.transcript
-                        pass
+                        self.observe_user_transcript(getattr(event, "transcript", ""))
 
                     # Handle errors
                     elif event_type == "error":
@@ -596,6 +615,24 @@ class GPTRealtimeSession:
             self._transcript_entries.append(TranscriptEntry(role="user", content=text.strip()))
             self.logger.debug("user_transcript_added", text_length=len(text))
 
+    def observe_user_transcript(self, text: str) -> None:
+        """Observe a completed caller turn, independently of transcript persistence."""
+        utterance = text.strip()
+        if not utterance:
+            return
+
+        if self.tool_registry:
+            self.tool_registry.observe_user_utterance(utterance)
+
+        if self.agent_config.get("enable_transcript", False):
+            self.add_user_transcript(utterance)
+
+        self.logger.debug(
+            "user_utterance_observed",
+            text_length=len(utterance),
+            persisted=bool(self.agent_config.get("enable_transcript", False)),
+        )
+
     def add_assistant_transcript(self, text: str) -> None:
         """Add an assistant transcript entry.
 
@@ -639,6 +676,12 @@ class GPTRealtimeSession:
             List of transcript entry dictionaries
         """
         return [entry.to_dict() for entry in self._transcript_entries]
+
+    def get_booking_attempts(self) -> list[dict[str, Any]]:
+        """Return sanitized booking diagnostics captured during this call."""
+        if not self.tool_registry:
+            return []
+        return self.tool_registry.get_booking_attempts()
 
     async def cleanup(self) -> None:
         """Cleanup resources."""

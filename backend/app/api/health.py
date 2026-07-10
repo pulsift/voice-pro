@@ -22,6 +22,8 @@ async def health_check() -> dict[str, str]:
         "status": "healthy",
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION,
+        "realtime_model": settings.OPENAI_REALTIME_MODEL,
+        "realtime_reasoning_effort": settings.OPENAI_REALTIME_REASONING_EFFORT or "",
     }
 
 

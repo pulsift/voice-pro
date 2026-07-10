@@ -7,6 +7,8 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
+
 
 class TestBasicHealthCheck:
     """Test basic health check endpoint."""
@@ -21,6 +23,10 @@ class TestBasicHealthCheck:
         assert data["status"] == "healthy"
         assert data["app"] == "Voice Noob API"
         assert "version" in data
+        assert data["realtime_model"] == settings.OPENAI_REALTIME_MODEL
+        assert data["realtime_reasoning_effort"] == (
+            settings.OPENAI_REALTIME_REASONING_EFFORT or ""
+        )
 
 
 class TestDatabaseHealthCheck:

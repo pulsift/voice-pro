@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -114,6 +114,11 @@ class CallRecord(Base):
         Text, nullable=True, comment="URL to call recording"
     )
     transcript: Mapped[str | None] = mapped_column(Text, nullable=True, comment="Call transcript")
+    booking_attempts: Mapped[list[dict[str, object]] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Sanitized Cal.com booking-attempt diagnostics captured during the call",
+    )
 
     # Timestamps
     started_at: Mapped[datetime] = mapped_column(

@@ -42,6 +42,7 @@ class CallRecordResponse(BaseModel):
     duration_seconds: int
     recording_url: str | None
     transcript: str | None
+    booking_attempts: list[dict[str, object]]
     started_at: datetime
     answered_at: datetime | None
     ended_at: datetime | None
@@ -169,6 +170,7 @@ async def list_calls(
                 duration_seconds=record.duration_seconds,
                 recording_url=record.recording_url,
                 transcript=record.transcript,
+                booking_attempts=record.booking_attempts or [],
                 started_at=record.started_at,
                 answered_at=record.answered_at,
                 ended_at=record.ended_at,
@@ -245,6 +247,7 @@ async def get_call(
         duration_seconds=record.duration_seconds,
         recording_url=record.recording_url,
         transcript=record.transcript,
+        booking_attempts=record.booking_attempts or [],
         started_at=record.started_at,
         answered_at=record.answered_at,
         ended_at=record.ended_at,

@@ -99,6 +99,10 @@ class Settings(BaseSettings):
 
     # Voice & AI Services
     OPENAI_API_KEY: str | None = None
+    # Keep the proven production model as the default. Deployments can opt into a
+    # newer Realtime model without another code change.
+    OPENAI_REALTIME_MODEL: str = "gpt-realtime-2025-08-28"
+    OPENAI_REALTIME_REASONING_EFFORT: str | None = None
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 

@@ -206,6 +206,14 @@ class ToolRegistry:
 
         return tools
 
+    def observe_user_utterance(self, text: str) -> None:
+        """Forward a completed caller utterance to the per-call CRM state."""
+        self.crm_tools.observe_user_utterance(text)
+
+    def get_booking_attempts(self) -> list[dict[str, Any]]:
+        """Return sanitized booking diagnostics from the per-call CRM state."""
+        return self.crm_tools.get_booking_attempts()
+
     async def execute_tool(  # noqa: PLR0911
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
@@ -233,6 +241,7 @@ class ToolRegistry:
             "search_customer",
             "create_contact",
             "check_availability",
+            "select_slot",
             "book_appointment",
             "list_appointments",
             "cancel_appointment",

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import user_id_to_uuid
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallRecord
@@ -38,14 +39,19 @@ async def get_agent_workspace_id(agent_id: uuid.UUID, db: AsyncSession) -> uuid.
     return row
 
 
-async def save_transcript_to_call_record(
+async def save_transcript_to_call_record(  # noqa: PLR0912
     call_sid: str,
     transcript: str,
     db: AsyncSession,
     log: Any,
     agent_id: str | None = None,
+    booking_attempts: list[dict[str, Any]] | None = None,
+    owner_user_id: uuid.UUID | None = None,
+    workspace_id: uuid.UUID | None = None,
+    provider: str | None = None,
+    expected_to_number: str | None = None,
 ) -> None:
-    """Save transcript to the call record.
+    """Save transcript and sanitized booking diagnostics to the call record.
 
     Args:
         call_sid: Provider call ID (CallSid for Twilio, call_control_id for Telnyx)
@@ -53,41 +59,138 @@ async def save_transcript_to_call_record(
         db: Database session
         log: Logger instance
         agent_id: Agent UUID (for the fallback match below)
+        booking_attempts: Sanitized Cal.com attempt details for post-mortems
+        owner_user_id: Owning user UUID required to scope fallback matching
+        workspace_id: Workspace UUID required to scope fallback matching
+        provider: Telephony provider required to scope fallback matching
+        expected_to_number: Destination number, when known, for fallback matching
     """
-    if not transcript.strip():
-        log.debug("empty_transcript_skipped")
+    if not transcript.strip() and booking_attempts is None:
+        log.debug("empty_call_artifacts_skipped")
         return
 
-    result = await db.execute(select(CallRecord).where(CallRecord.provider_call_id == call_sid))
-    call_record = result.scalar_one_or_none()
+    call_record: CallRecord | None = None
+    exact_match_ambiguous = False
+    if owner_user_id and provider:
+        exact = await db.execute(
+            select(CallRecord)
+            .where(
+                CallRecord.provider_call_id == call_sid,
+                CallRecord.provider == provider,
+                CallRecord.user_id == owner_user_id,
+                CallRecord.workspace_id == workspace_id,
+            )
+            .limit(2)
+            .with_for_update()
+        )
+        exact_candidates = exact.scalars().all()
+        if len(exact_candidates) == 1:
+            call_record = exact_candidates[0]
+        elif len(exact_candidates) > 1:
+            exact_match_ambiguous = True
+            log.warning(
+                "call_record_exact_match_ambiguous",
+                call_sid=call_sid,
+                candidate_count=len(exact_candidates),
+            )
+    else:
+        log.warning("call_record_scope_incomplete", call_sid=call_sid)
 
-    # Fallback: the TeXML call leg's id (stored as provider_call_id) can differ from the
-    # media stream's call_control_id, so an exact match may miss. Attach to this agent's
-    # most-recent transcript-less record (one active call at a time in practice).
-    if not call_record and agent_id:
+    # A media-stream ID can differ from the stored call-leg ID. Fall back only when
+    # every stable identity dimension is available and exactly one fresh record
+    # matches. Existing artifacts are merged below; never guess between concurrent calls.
+    if not call_record and not exact_match_ambiguous and agent_id and owner_user_id and provider:
         from datetime import UTC, datetime, timedelta
 
         cutoff = datetime.now(UTC) - timedelta(minutes=20)
+        filters = [
+            CallRecord.agent_id == uuid.UUID(agent_id),
+            CallRecord.user_id == owner_user_id,
+            CallRecord.workspace_id == workspace_id,
+            CallRecord.provider == provider,
+            CallRecord.created_at >= cutoff,
+        ]
+        if expected_to_number:
+            filters.append(CallRecord.to_number == expected_to_number)
         fb = await db.execute(
             select(CallRecord)
-            .where(
-                CallRecord.agent_id == uuid.UUID(agent_id),
-                CallRecord.transcript.is_(None),
-                CallRecord.created_at >= cutoff,
-            )
+            .where(*filters)
             .order_by(CallRecord.created_at.desc())
-            .limit(1)
+            .limit(2)
+            .with_for_update()
         )
-        call_record = fb.scalar_one_or_none()
-        if call_record:
+        candidates = fb.scalars().all()
+        if len(candidates) == 1:
+            call_record = candidates[0]
             log.info("transcript_fallback_matched", record_id=str(call_record.id))
+        elif len(candidates) > 1:
+            log.warning("call_record_fallback_ambiguous", candidate_count=len(candidates))
+        else:
+            log.warning("call_record_fallback_not_found")
 
     if call_record:
-        call_record.transcript = transcript
-        await db.commit()
-        log.info("transcript_saved", record_id=str(call_record.id), length=len(transcript))
+        changed = False
+        existing_transcript = (call_record.transcript or "").strip()
+        incoming_transcript = transcript.strip()
+        if incoming_transcript and len(incoming_transcript) > len(existing_transcript):
+            call_record.transcript = transcript
+            changed = True
+        if booking_attempts is not None:
+            existing_attempts = list(call_record.booking_attempts or [])
+            merged_attempts = [dict(attempt) for attempt in existing_attempts]
+            for attempt in booking_attempts:
+                if attempt not in merged_attempts:
+                    merged_attempts.append(dict(attempt))
+            if call_record.booking_attempts != merged_attempts:
+                call_record.booking_attempts = merged_attempts
+                changed = True
+        if changed:
+            await db.commit()
+        log.info(
+            "call_artifacts_saved",
+            record_id=str(call_record.id),
+            transcript_length=len(call_record.transcript or ""),
+            booking_attempt_count=len(call_record.booking_attempts or []),
+            changed=changed,
+        )
     else:
-        log.warning("call_record_not_found_for_transcript", call_sid=call_sid)
+        log.warning("call_record_not_found_for_artifacts", call_sid=call_sid)
+
+
+async def _run_bridge_tasks(
+    provider_to_realtime: Any,
+    realtime_to_provider: Any,
+    log: Any,
+    provider: str,
+    timeout_seconds: float = 300.0,
+) -> None:
+    """Stop both bridge directions as soon as either direction terminates."""
+    tasks = {
+        asyncio.create_task(provider_to_realtime()),
+        asyncio.create_task(realtime_to_provider()),
+    }
+    try:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            timeout_event = {
+                "twilio": "twilio_bridge_timeout",
+                "telnyx": "telnyx_bridge_timeout",
+            }.get(provider, "telephony_bridge_timeout")
+            log.warning(
+                timeout_event,
+                message="Call exceeded max duration, forcing cleanup",
+            )
+        for task in pending:
+            task.cancel()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @router.websocket("/twilio/{agent_id}")
@@ -169,11 +272,19 @@ async def twilio_media_stream(
                 enable_transcript=agent.enable_transcript,
             )
 
-            # Save transcript to call record if enabled
-            if agent.enable_transcript and call_sid:
-                transcript = realtime_session.get_transcript()
+            # Persist booking diagnostics on every call; transcript text remains opt-in.
+            if call_sid:
+                transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
                 await save_transcript_to_call_record(
-                    call_sid, transcript, db, log, agent_id=agent_id
+                    call_sid,
+                    transcript,
+                    db,
+                    log,
+                    agent_id=agent_id,
+                    booking_attempts=realtime_session.get_booking_attempts(),
+                    owner_user_id=user_id_to_uuid(agent.user_id),
+                    workspace_id=workspace_id,
+                    provider="twilio",
                 )
 
     except WebSocketDisconnect:
@@ -328,21 +439,25 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         pending_end_call = True
 
                 # Capture transcript events
-                elif (
-                    enable_transcript
-                    and event_type == "conversation.item.input_audio_transcription.completed"
-                ):
-                    # User speech transcription
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    # Always expose the completed caller turn to booking state. The
+                    # session separately applies the transcript-history toggle.
                     if hasattr(event, "transcript") and event.transcript:
-                        realtime_session.add_user_transcript(event.transcript)
-                        log.debug("user_transcript_captured", length=len(event.transcript))
+                        realtime_session.observe_user_transcript(event.transcript)
+                        log.debug("user_utterance_observed", length=len(event.transcript))
 
-                elif enable_transcript and event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
+                elif enable_transcript and event_type in (
+                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
+                ):
                     # Assistant speech transcript delta
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
+                elif enable_transcript and event_type in (
+                    "response.audio_transcript.done",
+                    "response.output_audio_transcript.done",
+                ):
                     # Assistant speech transcript complete
                     realtime_session.flush_assistant_text()
 
@@ -380,18 +495,12 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         except Exception as e:
             log.exception("realtime_to_twilio_error", error=str(e))
 
-    # Run both directions concurrently with timeout to prevent hung tasks
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                twilio_to_realtime(),
-                realtime_to_twilio(),
-                return_exceptions=True,
-            ),
-            timeout=300.0,  # 5 minute max call duration before forced cleanup
-        )
-    except TimeoutError:
-        log.warning("twilio_bridge_timeout", message="Call exceeded max duration, forcing cleanup")
+    await _run_bridge_tasks(
+        twilio_to_realtime,
+        realtime_to_twilio,
+        log,
+        "twilio",
+    )
 
     # Close WebSocket to hang up the call if end_call was triggered
     if should_end_call:
@@ -485,7 +594,7 @@ async def telnyx_media_stream(
             from app.services.gpt_realtime import render_template
 
             agent_config["initial_greeting"] = render_template(
-                agent_config["initial_greeting"], call_variables
+                str(agent_config["initial_greeting"]), call_variables
             )
 
         # Initialize GPT Realtime session
@@ -505,11 +614,23 @@ async def telnyx_media_stream(
                 enable_transcript=agent.enable_transcript,
             )
 
-            # Save transcript to call record if enabled
-            if agent.enable_transcript and call_control_id:
-                transcript = realtime_session.get_transcript()
+            # Persist booking diagnostics on every call; transcript text remains opt-in.
+            if call_control_id:
+                transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
                 await save_transcript_to_call_record(
-                    call_control_id, transcript, db, log, agent_id=agent_id
+                    call_control_id,
+                    transcript,
+                    db,
+                    log,
+                    agent_id=agent_id,
+                    booking_attempts=realtime_session.get_booking_attempts(),
+                    owner_user_id=user_id_to_uuid(agent.user_id),
+                    workspace_id=workspace_id,
+                    provider="telnyx",
+                    expected_to_number=str(
+                        call_variables.get("leadPhone") or call_variables.get("phone") or ""
+                    )
+                    or None,
                 )
 
     except WebSocketDisconnect:
@@ -629,21 +750,25 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                         pending_end_call = True
 
                 # Capture transcript events
-                elif (
-                    enable_transcript
-                    and event_type == "conversation.item.input_audio_transcription.completed"
-                ):
-                    # User speech transcription
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    # Always expose the completed caller turn to booking state. The
+                    # session separately applies the transcript-history toggle.
                     if hasattr(event, "transcript") and event.transcript:
-                        realtime_session.add_user_transcript(event.transcript)
-                        log.debug("user_transcript_captured", length=len(event.transcript))
+                        realtime_session.observe_user_transcript(event.transcript)
+                        log.debug("user_utterance_observed", length=len(event.transcript))
 
-                elif enable_transcript and event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta"):
+                elif enable_transcript and event_type in (
+                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
+                ):
                     # Assistant speech transcript delta
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
+                elif enable_transcript and event_type in (
+                    "response.audio_transcript.done",
+                    "response.output_audio_transcript.done",
+                ):
                     # Assistant speech transcript complete
                     realtime_session.flush_assistant_text()
 
@@ -666,18 +791,12 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
         except Exception as e:
             log.exception("realtime_to_telnyx_error", error=str(e))
 
-    # Run both directions concurrently with timeout to prevent hung tasks
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                telnyx_to_realtime(),
-                realtime_to_telnyx(),
-                return_exceptions=True,
-            ),
-            timeout=300.0,  # 5 minute max call duration before forced cleanup
-        )
-    except TimeoutError:
-        log.warning("telnyx_bridge_timeout", message="Call exceeded max duration, forcing cleanup")
+    await _run_bridge_tasks(
+        telnyx_to_realtime,
+        realtime_to_telnyx,
+        log,
+        "telnyx",
+    )
 
     # Close WebSocket to hang up the call if end_call was triggered
     if should_end_call:
