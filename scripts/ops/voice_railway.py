@@ -87,7 +87,10 @@ def show_status(
             runtime_proven = (
                 health_status == 200
                 and (not expected_model or runtime_model == expected_model)
-                and (expected_model is None or runtime_reasoning == expected_reasoning)
+                and (
+                    expected_model is None
+                    or (runtime_reasoning or None) == (expected_reasoning or None)
+                )
             )
             print(
                 f"runtime_config_proven={str(runtime_proven).lower()} "

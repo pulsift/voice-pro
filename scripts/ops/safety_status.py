@@ -10,6 +10,7 @@ from typing import Any
 from ops_common import (
     FULFILMENT,
     REAL_CAMPAIGN_IDS,
+    SEEDED_LEAD_ID,
     SEEDED_PHONE,
     SENDKIT,
     TEST_CAMPAIGN_ID,
@@ -18,6 +19,22 @@ from ops_common import (
     request_json,
     user_env,
 )
+
+
+def seeded_lead_phone() -> str:
+    """Read the seeded lead's STORED phone from SendKit — the number the dialer will
+    actually call. Proving this equals the seed (not just that a constant equals itself)
+    is what closes 'prove the destination before dialing'."""
+    status, payload = request_json(
+        f"{SENDKIT}/v1/leads/{SEEDED_LEAD_ID}",
+        headers={"X-Api-Key": user_env("SENDKIT_WORKSPACE_API_KEY")},
+    )
+    if status != 200:
+        raise OpsError(f"SendKit lead read returned HTTP {status}")
+    lead = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(lead, dict):
+        lead = payload if isinstance(payload, dict) else {}
+    return str(lead.get("phoneNumber") or lead.get("phone") or "").strip()
 
 
 def campaign_rows(payload: object) -> list[dict[str, Any]]:
@@ -91,14 +108,19 @@ def main() -> int:
 
     paused = kill_paused()
     print(f"kill_switch_on={str(paused).lower()}")
-    print(f"seeded_destination_valid={str(SEEDED_PHONE == '+963998183191').lower()}")
+    try:
+        lead_phone = seeded_lead_phone()
+    except OpsError:
+        lead_phone = ""
+    destination_valid = SEEDED_PHONE == "+963998183191" and lead_phone == SEEDED_PHONE
+    print(f"seeded_destination_valid={str(destination_valid).lower()}")
 
     campaign_safe = (
         not missing_real
         and len(real) == len(REAL_CAMPAIGN_IDS)
         and all(row[2] == "draft" for row in real)
     )
-    safe = stub and paused and campaign_safe and SEEDED_PHONE == "+963998183191"
+    safe = stub and paused and campaign_safe and destination_valid
     print(
         f"safe={str(safe).lower()} real_campaign_count={len(real)} "
         f"missing_real_campaigns={len(missing_real)} all_real_draft={str(campaign_safe).lower()}"

@@ -27,7 +27,7 @@ from ops_common import (
     request_json,
     set_kill_switch,
 )
-from safety_status import list_campaigns
+from safety_status import list_campaigns, seeded_lead_phone
 
 
 def watchdog(after: int) -> int:
@@ -102,13 +102,21 @@ def preflight(
     """Fail closed before the kill switch can be disarmed."""
     if SEEDED_PHONE != "+963998183191":
         raise OpsError("seeded destination invariant failed")
+    # Prove the destination BEFORE anything can disarm: read the lead the dialer will
+    # actually call and require its stored phone to equal the seed. A constant check
+    # alone would not catch a lead fixture whose phone drifted to a stranger's number.
+    if seeded_lead_phone() != SEEDED_PHONE:
+        raise OpsError("seeded lead's stored phone does not match the seed; refusing to disarm")
     token = admin_token()
     backend_status, backend_health = request_json(f"{BACKEND}/health")
     if backend_status != 200 or not isinstance(backend_health, dict):
         raise OpsError(f"backend health returned HTTP {backend_status}")
+    # Treat unset reasoning uniformly: /health emits "" while the CLI passes None for
+    # the old-model path, so normalize both sides or the old-model call never runs.
     if (
         backend_health.get("realtime_model") != expected_model
-        or backend_health.get("realtime_reasoning_effort") != expected_reasoning
+        or (backend_health.get("realtime_reasoning_effort") or None)
+        != (expected_reasoning or None)
     ):
         raise OpsError(
             "backend runtime model/config does not match the expected test config"
