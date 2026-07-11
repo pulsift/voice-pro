@@ -1,5 +1,7 @@
 """Telnyx telephony service implementation."""
 
+from urllib.parse import urlsplit, urlunsplit
+
 import httpx
 import structlog
 import telnyx
@@ -13,6 +15,14 @@ from app.services.telephony.base import (
 )
 
 logger = structlog.get_logger()
+HTTP_SERVER_ERROR_MIN = 500
+
+
+def is_unknown_telnyx_dial_outcome(exc: Exception) -> bool:
+    """Return True when Telnyx may have accepted a dial despite the local error."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= HTTP_SERVER_ERROR_MIN
+    return isinstance(exc, httpx.RequestError)
 
 
 class TelnyxService(TelephonyProvider):
@@ -78,6 +88,16 @@ class TelnyxService(TelephonyProvider):
         # TeXML-instructions webhook (our /webhooks/telnyx/answer) that returns
         # <Connect><Stream> to bridge media. Call-progress events go to the
         # application's configured status_callback.
+        parsed_webhook = urlsplit(webhook_url)
+        answer_path = parsed_webhook.path
+        status_path = (
+            answer_path[: -len("/answer")] + "/status"
+            if answer_path.endswith("/answer")
+            else "/webhooks/telnyx/status"
+        )
+        status_callback_url = urlunsplit(
+            (parsed_webhook.scheme, parsed_webhook.netloc, status_path, "", "")
+        )
         connection_id = await self._get_connection_id()
         if not connection_id:
             raise ValueError(
@@ -89,6 +109,9 @@ class TelnyxService(TelephonyProvider):
             "To": to_number,
             "From": from_number,
             "Url": webhook_url,
+            "StatusCallback": status_callback_url,
+            "StatusCallbackMethod": "POST",
+            "StatusCallbackEvent": "initiated ringing answered completed",
         }
 
         response = await client.post(
@@ -522,7 +545,8 @@ class TelnyxService(TelephonyProvider):
                     # Update the webhook URL in case it changed
                     update_payload: dict[str, str] = {"voice_url": voice_url}
                     if status_callback_url:
-                        update_payload["status_callback_url"] = status_callback_url
+                        update_payload["status_callback"] = status_callback_url
+                        update_payload["status_callback_method"] = "POST"
 
                     await client.patch(f"/texml_applications/{app_id}", json=update_payload)
                     self.logger.info("updated_texml_app", id=app_id)
@@ -535,7 +559,7 @@ class TelnyxService(TelephonyProvider):
                 "voice_method": "POST",
             }
             if status_callback_url:
-                create_payload["status_callback_url"] = status_callback_url
+                create_payload["status_callback"] = status_callback_url
                 create_payload["status_callback_method"] = "POST"
 
             response = await client.post("/texml_applications", json=create_payload)

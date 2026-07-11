@@ -8,17 +8,17 @@ This module provides:
 - WebSocket endpoint for telephony media streaming
 """
 
+import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.settings import get_user_api_keys
 from app.core.auth import CurrentUser, user_id_to_uuid
@@ -29,18 +29,203 @@ from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
-from app.models.workspace import AgentWorkspace
-from app.services.telephony.telnyx_service import TelnyxService
+from app.models.workspace import AgentWorkspace, Workspace
+from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import TwilioService
 
 if TYPE_CHECKING:
-    from app.models.contact import Contact
     from app.services.telephony.base import PhoneNumber
 
 router = APIRouter(prefix="/api/v1/telephony", tags=["telephony"])
 webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 logger = structlog.get_logger()
+
+_TERMINAL_CALL_STATUSES = {
+    CallStatus.COMPLETED.value,
+    CallStatus.FAILED.value,
+    CallStatus.BUSY.value,
+    CallStatus.NO_ANSWER.value,
+    CallStatus.CANCELED.value,
+}
+
+
+def _parse_telnyx_timestamp(value: Any) -> datetime | None:
+    """Parse an optional Telnyx event timestamp without trusting local time."""
+    if not value:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=UTC)
+        text = str(value).strip()
+        if text.isdigit():
+            return datetime.fromtimestamp(float(text), tz=UTC)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _parse_telnyx_duration(value: Any) -> int | None:
+    """Return a non-negative provider duration, or None when absent/invalid."""
+    if value in (None, ""):
+        return None
+    try:
+        return max(0, int(float(str(value))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _telnyx_form_event(form: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Translate Telnyx TeXML's TwiML-style form fields to one lifecycle event."""
+    raw_status = str(form.get("CallStatus") or form.get("call_status") or "").lower()
+    normalized = raw_status.replace("-", "_")
+    event_map = {
+        "queued": "call.initiated",
+        "initiated": "call.initiated",
+        "ringing": "call.ringing",
+        "answered": "call.answered",
+        "in_progress": "call.answered",
+        "completed": "call.hangup",
+        "busy": "call.hangup",
+        "no_answer": "call.hangup",
+        "failed": "call.hangup",
+        "canceled": "call.hangup",
+        "cancelled": "call.hangup",
+    }
+    payload = dict(form)
+    cause_map = {
+        "busy": "USER_BUSY",
+        "no_answer": "NO_ANSWER",
+        "failed": "FAILED",
+        "canceled": "ORIGINATOR_CANCEL",
+        "cancelled": "ORIGINATOR_CANCEL",
+    }
+    if normalized in cause_map and not payload.get("hangup_cause"):
+        payload["hangup_cause"] = cause_map[normalized]
+    return event_map.get(normalized, ""), payload
+
+
+def _telnyx_terminal_status(payload: dict[str, Any]) -> str:
+    """Map a Telnyx hangup cause to the durable CallRecord status."""
+    hangup_cause = (
+        str(payload.get("hangup_cause") or payload.get("HangupCause") or "").strip().upper()
+    )
+    if hangup_cause == "USER_BUSY":
+        return CallStatus.BUSY.value
+    if hangup_cause == "NO_ANSWER":
+        return CallStatus.NO_ANSWER.value
+    if hangup_cause in ("CALL_REJECTED", "ORIGINATOR_CANCEL"):
+        return CallStatus.CANCELED.value
+    if hangup_cause and hangup_cause not in ("NORMAL_CLEARING", "NORMAL_RELEASE"):
+        return CallStatus.FAILED.value
+    return CallStatus.COMPLETED.value
+
+
+def _apply_telnyx_lifecycle_event(
+    call_record: CallRecord,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    event_at: datetime,
+    provider_duration: int | None,
+) -> None:
+    """Apply one Telnyx lifecycle event idempotently."""
+    was_terminal = call_record.status in _TERMINAL_CALL_STATUSES
+    if event_type == "call.initiated" and not was_terminal:
+        call_record.status = CallStatus.INITIATED.value
+    elif event_type == "call.ringing" and not was_terminal:
+        call_record.status = CallStatus.RINGING.value
+    elif event_type == "call.answered":
+        if not call_record.answered_at:
+            call_record.answered_at = event_at
+        if not was_terminal:
+            call_record.status = CallStatus.IN_PROGRESS.value
+    elif event_type == "call.hangup":
+        if not call_record.ended_at:
+            call_record.ended_at = event_at
+        terminal_status = _telnyx_terminal_status(payload)
+        # Media stop can establish generic completion before the signed callback.
+        # Let a specific carrier outcome refine it, but never let a later generic
+        # completion erase busy/no-answer/canceled/failed evidence.
+        if not was_terminal or (
+            call_record.status == CallStatus.COMPLETED.value
+            and terminal_status != CallStatus.COMPLETED.value
+        ):
+            call_record.status = terminal_status
+
+        if provider_duration is not None:
+            call_record.duration_seconds = provider_duration
+        elif call_record.answered_at and call_record.ended_at:
+            elapsed = (call_record.ended_at - call_record.answered_at).total_seconds()
+            call_record.duration_seconds = max(0, int(elapsed))
+
+
+def _telnyx_phone_number(value: Any) -> str:
+    """Extract an E.164-like number from either TeXML or Call Control shapes."""
+    if isinstance(value, dict):
+        value = value.get("phone_number") or value.get("number")
+    return str(value or "")
+
+
+async def _find_telnyx_lifecycle_record(
+    *,
+    identifiers: set[str],
+    from_number: str,
+    to_number: str,
+    db: AsyncSession,
+) -> tuple[CallRecord | None, int]:
+    """Lock an exact record or reconcile one pre-dial pending row with bounded retries."""
+    candidate_count = 0
+    for delay in (0.0, 0.05, 0.1, 0.2, 0.4):
+        if delay:
+            await db.rollback()
+            await asyncio.sleep(delay)
+
+        exact = await db.execute(
+            select(CallRecord)
+            .where(
+                CallRecord.provider == "telnyx",
+                or_(*(CallRecord.provider_call_id == value for value in identifiers)),
+            )
+            .limit(2)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        candidates = exact.scalars().all()
+        candidate_count = len(candidates)
+        if candidate_count == 1:
+            return candidates[0], candidate_count
+
+        if candidate_count == 0 and from_number and to_number:
+            pending = await db.execute(
+                select(CallRecord.id)
+                .where(
+                    CallRecord.provider == "telnyx",
+                    CallRecord.provider_call_id.like("pending:%"),
+                    CallRecord.from_number == from_number,
+                    CallRecord.to_number == to_number,
+                    CallRecord.created_at >= datetime.now(UTC) - timedelta(minutes=2),
+                    CallRecord.ended_at.is_(None),
+                )
+                .order_by(CallRecord.created_at.desc())
+                .limit(2)
+            )
+            pending_ids = pending.scalars().all()
+            candidate_count = len(pending_ids)
+            if candidate_count == 1:
+                locked = await db.execute(
+                    select(CallRecord)
+                    .where(CallRecord.id == pending_ids[0])
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                record = locked.scalar_one()
+                if record.provider_call_id.startswith("pending:"):
+                    record.provider_call_id = sorted(identifiers)[0]
+                return record, candidate_count
+
+    return None, candidate_count
 
 
 # =============================================================================
@@ -186,11 +371,44 @@ async def get_agent_workspace_id(agent_id: uuid.UUID, db: AsyncSession) -> uuid.
     Returns:
         Workspace UUID if agent belongs to a workspace, None otherwise
     """
+    result = await db.execute(select(AgentWorkspace).where(AgentWorkspace.agent_id == agent_id))
+    memberships = result.scalars().all()
+    if len(memberships) == 1:
+        return memberships[0].workspace_id
+    defaults = [membership.workspace_id for membership in memberships if membership.is_default]
+    return defaults[0] if len(defaults) == 1 else None
+
+
+async def resolve_outbound_workspace_id(
+    *,
+    agent_id: uuid.UUID,
+    owner_user_id: int,
+    requested_workspace_id: uuid.UUID | None,
+    db: AsyncSession,
+) -> uuid.UUID | None:
+    """Resolve one owner-scoped workspace, refusing ambiguous multi-workspace calls."""
     result = await db.execute(
-        select(AgentWorkspace.workspace_id).where(AgentWorkspace.agent_id == agent_id).limit(1)
+        select(AgentWorkspace)
+        .join(Workspace, Workspace.id == AgentWorkspace.workspace_id)
+        .where(
+            AgentWorkspace.agent_id == agent_id,
+            Workspace.user_id == owner_user_id,
+        )
     )
-    row = result.scalar_one_or_none()
-    return row
+    memberships = result.scalars().all()
+    if requested_workspace_id is not None:
+        if not any(row.workspace_id == requested_workspace_id for row in memberships):
+            raise HTTPException(status_code=400, detail="Agent does not belong to that workspace")
+        return requested_workspace_id
+    if len(memberships) <= 1:
+        return memberships[0].workspace_id if memberships else None
+    defaults = [row.workspace_id for row in memberships if row.is_default]
+    if len(defaults) == 1:
+        return defaults[0]
+    raise HTTPException(
+        status_code=400,
+        detail="workspace_id is required because the agent has multiple workspaces",
+    )
 
 
 async def update_campaign_contact_from_call(
@@ -207,95 +425,77 @@ async def update_campaign_contact_from_call(
         duration_seconds: Call duration in seconds
         db: Database session
     """
-    # Only process outbound calls (campaigns make outbound calls)
-    if call_record.direction != CallDirection.OUTBOUND.value:
+    # A manual call has no authoritative campaign identity. Never infer one from a
+    # shared phone number or agent because that can mutate an unrelated campaign.
+    if call_record.direction != CallDirection.OUTBOUND.value or call_record.contact_id is None:
         return
 
-    # Find campaign contact that is currently being called to this number
-    # from this campaign's agent (use selectinload to avoid N+1 queries)
     result = await db.execute(
         select(CampaignContact)
         .join(Campaign)
-        .options(selectinload(CampaignContact.contact))
         .where(
             CampaignContact.status == CampaignContactStatus.CALLING.value,
+            CampaignContact.contact_id == call_record.contact_id,
             Campaign.agent_id == call_record.agent_id,
         )
+        .limit(2)
+        .with_for_update()
     )
     campaign_contacts = result.scalars().all()
 
-    if not campaign_contacts:
+    if len(campaign_contacts) != 1:
+        logger.warning(
+            "campaign_contact_not_found_or_ambiguous",
+            call_record_id=str(call_record.id),
+            contact_id=call_record.contact_id,
+            candidate_count=len(campaign_contacts),
+        )
         return
 
-    # Find the matching campaign contact by phone number
-    for cc in campaign_contacts:
-        # Contact is already loaded via selectinload
-        contact: Contact | None = cc.contact
+    cc = campaign_contacts[0]
+    log = logger.bind(
+        campaign_contact_id=str(cc.id),
+        contact_id=call_record.contact_id,
+        call_status=call_status,
+    )
+    status_map = {
+        CallStatus.COMPLETED.value: CampaignContactStatus.COMPLETED.value,
+        CallStatus.BUSY.value: CampaignContactStatus.BUSY.value,
+        CallStatus.FAILED.value: CampaignContactStatus.FAILED.value,
+        CallStatus.NO_ANSWER.value: CampaignContactStatus.NO_ANSWER.value,
+        CallStatus.CANCELED.value: CampaignContactStatus.FAILED.value,
+    }
+    new_status = status_map.get(call_status, CampaignContactStatus.COMPLETED.value)
+    cc.status = new_status
+    cc.last_call_id = call_record.id
+    cc.last_call_duration_seconds = duration_seconds
+    cc.last_call_outcome = call_status
 
-        if not contact:
-            continue
+    campaign_result = await db.execute(
+        select(Campaign).where(Campaign.id == cc.campaign_id).with_for_update()
+    )
+    campaign = campaign_result.scalar_one_or_none()
+    if campaign:
+        campaign.total_call_duration_seconds += duration_seconds
+        if new_status == CampaignContactStatus.COMPLETED.value:
+            campaign.contacts_completed += 1
+        elif new_status in (
+            CampaignContactStatus.FAILED.value,
+            CampaignContactStatus.BUSY.value,
+            CampaignContactStatus.NO_ANSWER.value,
+        ):
+            if cc.attempts < campaign.max_attempts_per_contact:
+                from datetime import timedelta
 
-        # Check if phone numbers match (normalize both)
-        contact_phone = contact.phone_number.lstrip("+").replace("-", "").replace(" ", "")
-        to_phone = call_record.to_number.lstrip("+").replace("-", "").replace(" ", "")
+                cc.status = CampaignContactStatus.PENDING.value
+                cc.next_attempt_at = datetime.now(UTC) + timedelta(
+                    minutes=campaign.retry_delay_minutes
+                )
+                log.info("Scheduling retry", next_attempt=cc.next_attempt_at.isoformat())
+            else:
+                campaign.contacts_failed += 1
 
-        if contact_phone != to_phone:
-            continue
-
-        # Found the matching campaign contact - update its status
-        log = logger.bind(
-            campaign_contact_id=str(cc.id),
-            contact_id=contact.id,
-            call_status=call_status,
-        )
-
-        # Map call status to campaign contact status
-        status_map = {
-            CallStatus.COMPLETED.value: CampaignContactStatus.COMPLETED.value,
-            CallStatus.BUSY.value: CampaignContactStatus.BUSY.value,
-            CallStatus.FAILED.value: CampaignContactStatus.FAILED.value,
-            CallStatus.NO_ANSWER.value: CampaignContactStatus.NO_ANSWER.value,
-            CallStatus.CANCELED.value: CampaignContactStatus.FAILED.value,
-        }
-
-        new_status = status_map.get(call_status, CampaignContactStatus.COMPLETED.value)
-        cc.status = new_status
-        cc.last_call_id = call_record.id
-        cc.last_call_duration_seconds = duration_seconds
-        cc.last_call_outcome = call_status
-
-        # Get the campaign to update stats
-        campaign_result = await db.execute(select(Campaign).where(Campaign.id == cc.campaign_id))
-        campaign = campaign_result.scalar_one_or_none()
-
-        if campaign:
-            campaign.total_call_duration_seconds += duration_seconds
-
-            if new_status == CampaignContactStatus.COMPLETED.value:
-                campaign.contacts_completed += 1
-            elif new_status in (
-                CampaignContactStatus.FAILED.value,
-                CampaignContactStatus.BUSY.value,
-                CampaignContactStatus.NO_ANSWER.value,
-            ):
-                # Check if we should retry
-                if cc.attempts < campaign.max_attempts_per_contact:
-                    # Schedule retry
-                    from datetime import timedelta
-
-                    cc.status = CampaignContactStatus.PENDING.value
-                    cc.next_attempt_at = datetime.now(UTC) + timedelta(
-                        minutes=campaign.retry_delay_minutes
-                    )
-                    log.info(
-                        "Scheduling retry",
-                        next_attempt=cc.next_attempt_at.isoformat(),
-                    )
-                else:
-                    campaign.contacts_failed += 1
-
-        log.info("Campaign contact updated", new_status=new_status)
-        break  # Only update one campaign contact per call
+    log.info("Campaign contact updated", new_status=new_status)
 
 
 # =============================================================================
@@ -592,7 +792,7 @@ async def release_phone_number(
 
 @router.post("/calls", response_model=CallResponse)
 @limiter.limit("30/minute")  # Rate limit outbound call initiation (costs money!)
-async def initiate_call(
+async def initiate_call(  # noqa: PLR0915
     call_request: InitiateCallRequest,
     request: Request,
     current_user: CurrentUser,
@@ -640,6 +840,13 @@ async def initiate_call(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    workspace_uuid = await resolve_outbound_workspace_id(
+        agent_id=agent.id,
+        owner_user_id=current_user.id,
+        requested_workspace_id=workspace_uuid,
+        db=db,
+    )
+
     # Determine provider from agent's phone number configuration
     # Default to Telnyx if not specified
     provider = "telnyx"
@@ -658,6 +865,8 @@ async def initiate_call(
     # answer webhook -> media WS can personalize the prompt + fill the booking attendee)
     base_url = str(request.base_url).rstrip("/")
     webhook_url = f"{base_url}/webhooks/{'telnyx' if telnyx_service else 'twilio'}/answer?agent_id={call_request.agent_id}"
+    if workspace_uuid:
+        webhook_url = f"{webhook_url}&workspace_id={workspace_uuid}"
     if call_request.variables:
         import base64
         import json as _json
@@ -665,14 +874,61 @@ async def initiate_call(
         cv = base64.urlsafe_b64encode(_json.dumps(call_request.variables).encode()).decode()
         webhook_url = f"{webhook_url}&cv={cv}"
 
+    call_record: CallRecord | None = None
     if telnyx_service:
         provider = "telnyx"
-        call_info = await telnyx_service.initiate_call(
-            to_number=call_request.to_number,
+        # Commit a correlation row before asking Telnyx to dial. An immediate status
+        # callback can then reconcile by the unique pending From/To record instead of
+        # being permanently lost in the POST-before-record race.
+        call_record = CallRecord(
+            user_id=user_id_to_uuid(current_user.id),
+            workspace_id=workspace_uuid,
+            provider=provider,
+            provider_call_id=f"pending:{uuid.uuid4()}",
+            agent_id=agent.id,
+            direction=CallDirection.OUTBOUND.value,
+            status=CallStatus.INITIATED.value,
             from_number=call_request.from_number,
-            webhook_url=webhook_url,
-            agent_id=call_request.agent_id,
+            to_number=call_request.to_number,
         )
+        db.add(call_record)
+        await db.commit()
+        try:
+            call_info = await telnyx_service.initiate_call(
+                to_number=call_request.to_number,
+                from_number=call_request.from_number,
+                webhook_url=webhook_url,
+                agent_id=call_request.agent_id,
+            )
+        except Exception as exc:
+            if is_unknown_telnyx_dial_outcome(exc):
+                log.warning(
+                    "telnyx_dial_outcome_unknown",
+                    record_id=str(call_record.id),
+                    error_type=type(exc).__name__,
+                )
+                raise
+            locked = await db.execute(
+                select(CallRecord)
+                .where(CallRecord.id == call_record.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            failed_record = locked.scalar_one()
+            failed_record.status = CallStatus.FAILED.value
+            failed_record.ended_at = datetime.now(UTC)
+            await db.commit()
+            raise
+
+        locked = await db.execute(
+            select(CallRecord)
+            .where(CallRecord.id == call_record.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        call_record = locked.scalar_one()
+        call_record.provider_call_id = call_info.call_id
+        await db.commit()
     elif twilio_service:
         provider = "twilio"
         call_info = await twilio_service.initiate_call(
@@ -686,20 +942,20 @@ async def initiate_call(
 
     log.info("call_initiated", call_id=call_info.call_id, provider=provider)
 
-    # Create call record for outbound call (workspace_uuid already available from query param)
-    call_record = CallRecord(
-        user_id=user_id_to_uuid(current_user.id),
-        workspace_id=workspace_uuid,
-        provider=provider,
-        provider_call_id=call_info.call_id,
-        agent_id=uuid.UUID(call_request.agent_id),
-        direction=CallDirection.OUTBOUND.value,
-        status=CallStatus.INITIATED.value,
-        from_number=call_request.from_number,
-        to_number=call_request.to_number,
-    )
-    db.add(call_record)
-    await db.commit()
+    if call_record is None:
+        call_record = CallRecord(
+            user_id=user_id_to_uuid(current_user.id),
+            workspace_id=workspace_uuid,
+            provider=provider,
+            provider_call_id=call_info.call_id,
+            agent_id=agent.id,
+            direction=CallDirection.OUTBOUND.value,
+            status=CallStatus.INITIATED.value,
+            from_number=call_request.from_number,
+            to_number=call_request.to_number,
+        )
+        db.add(call_record)
+        await db.commit()
     log.info("call_record_created", record_id=str(call_record.id))
 
     return CallResponse(
@@ -1026,6 +1282,7 @@ async def telnyx_answer_webhook(
     request: Request,
     agent_id: str = Query(default=""),
     cv: str = Query(default=""),
+    workspace_id: str = Query(default=""),
 ) -> Response:
     """Handle Telnyx outbound call connection.
 
@@ -1044,10 +1301,17 @@ async def telnyx_answer_webhook(
     base_url = str(request.base_url).rstrip("/")
     ws_url = base_url.replace("http://", "wss://").replace("https://", "wss://")
     stream_url = f"{ws_url}/ws/telephony/telnyx/{agent_id}"
+    query_parts: list[str] = []
+    if workspace_id:
+        from urllib.parse import quote
+
+        query_parts.append(f"workspace_id={quote(workspace_id, safe='')}")
     if cv:
         from urllib.parse import quote
 
-        stream_url = f"{stream_url}?cv={quote(cv, safe='')}"
+        query_parts.append(f"cv={quote(cv, safe='')}")
+    if query_parts:
+        stream_url = f"{stream_url}?{'&'.join(query_parts)}"
 
     telnyx_service = TelnyxService("")
     texml = telnyx_service.generate_answer_response(stream_url, agent_id)
@@ -1067,68 +1331,100 @@ async def telnyx_status_callback(
     # Validate Telnyx signature
     await verify_telnyx_webhook(request)
 
-    # TeXML status callbacks are form-encoded (TwiML-style), not the Call Control JSON
-    # this handler expects — don't 500 on them. Call status is tracked via the media-WS
-    # lifecycle for now. (TODO: map TeXML status fields CallSid/CallStatus.)
+    event_type = ""
+    payload: dict[str, Any] = {}
+    identifiers: set[str] = set()
+    from_number = ""
+    to_number = ""
+    event_at: datetime | None = None
+    provider_duration: int | None = None
+
+    # Telnyx Call Control sends JSON; TeXML applications send TwiML-style form data.
+    # Support both because outbound calls in this service use the TeXML endpoint.
     try:
         body = await request.json()
     except Exception:
-        logger.info("telnyx_status_non_json_ignored")
+        form = dict(await request.form())
+        event_type, payload = _telnyx_form_event(form)
+        identifiers.update(
+            str(value)
+            for value in (
+                form.get("CallSid"),
+                form.get("call_sid"),
+                form.get("CallControlId"),
+                form.get("call_control_id"),
+            )
+            if value
+        )
+        event_at = _parse_telnyx_timestamp(form.get("Timestamp") or form.get("timestamp"))
+        provider_duration = _parse_telnyx_duration(
+            form.get("CallDuration") or form.get("call_duration") or form.get("duration_seconds")
+        )
+        from_number = _telnyx_phone_number(form.get("From") or form.get("from"))
+        to_number = _telnyx_phone_number(form.get("To") or form.get("to"))
+    else:
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        event_type = str(data.get("event_type", ""))
+        raw_payload = data.get("payload", {})
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        identifiers.update(
+            str(value)
+            for value in (
+                payload.get("call_control_id"),
+                payload.get("call_leg_id"),
+                payload.get("call_session_id"),
+                payload.get("call_sid"),
+            )
+            if value
+        )
+        event_at = _parse_telnyx_timestamp(
+            data.get("occurred_at") or payload.get("occurred_at") or payload.get("timestamp")
+        )
+        provider_duration = _parse_telnyx_duration(
+            payload.get("duration_secs")
+            or payload.get("duration_seconds")
+            or payload.get("call_duration")
+        )
+        from_number = _telnyx_phone_number(payload.get("from") or payload.get("from_number"))
+        to_number = _telnyx_phone_number(payload.get("to") or payload.get("to_number"))
+
+    if not event_type or not identifiers:
+        logger.warning(
+            "telnyx_status_unusable",
+            event_type=event_type,
+            identifier_count=len(identifiers),
+        )
         return {"status": "received"}
-    data = body.get("data", {})
-    event_type = data.get("event_type", "")
-    payload = data.get("payload", {})
-    call_control_id = payload.get("call_control_id", "")
+
+    call_identifier = sorted(identifiers)[0]
 
     log = logger.bind(
         webhook="telnyx_status",
         event_type=event_type,
-        call_control_id=call_control_id,
+        call_identifier=call_identifier,
     )
     log.info("telnyx_status_update")
 
-    # Find and update call record
-    result = await db.execute(
-        select(CallRecord).where(CallRecord.provider_call_id == call_control_id)
+    call_record, candidate_count = await _find_telnyx_lifecycle_record(
+        identifiers=identifiers,
+        from_number=from_number,
+        to_number=to_number,
+        db=db,
     )
-    call_record = result.scalar_one_or_none()
 
     if call_record:
-        # Map Telnyx event types to our status
-        event_status_map = {
-            "call.initiated": CallStatus.INITIATED.value,
-            "call.ringing": CallStatus.RINGING.value,
-            "call.answered": CallStatus.IN_PROGRESS.value,
-            "call.hangup": CallStatus.COMPLETED.value,
-            "call.machine.detection.ended": None,  # Don't change status
-        }
+        _apply_telnyx_lifecycle_event(
+            call_record,
+            event_type,
+            payload,
+            event_at=event_at or datetime.now(UTC),
+            provider_duration=provider_duration,
+        )
 
-        new_status = event_status_map.get(event_type)
-        if new_status:
-            call_record.status = new_status
-
-        # Update timestamps based on event
-        if event_type == "call.answered" and not call_record.answered_at:
-            call_record.answered_at = datetime.now(UTC)
-        elif event_type == "call.hangup":
-            call_record.ended_at = datetime.now(UTC)
-            # Calculate duration if we have answered_at
-            if call_record.answered_at:
-                duration = (call_record.ended_at - call_record.answered_at).total_seconds()
-                call_record.duration_seconds = int(duration)
-
-            # Check hangup cause for failed calls
-            hangup_cause = payload.get("hangup_cause", "")
-            if hangup_cause == "USER_BUSY":
-                call_record.status = CallStatus.BUSY.value
-            elif hangup_cause == "NO_ANSWER":
-                call_record.status = CallStatus.NO_ANSWER.value
-            elif hangup_cause in ("CALL_REJECTED", "ORIGINATOR_CANCEL"):
-                call_record.status = CallStatus.CANCELED.value
-            elif hangup_cause and hangup_cause not in ("NORMAL_CLEARING", "NORMAL_RELEASE"):
-                call_record.status = CallStatus.FAILED.value
-
-            # Update campaign contact status if this was a campaign call
+        # The updater itself only accepts a campaign contact still in CALLING state,
+        # so retry callbacks cannot increment campaign totals twice. Calling it for
+        # every hangup also covers a media-stop fallback that arrived first.
+        if event_type == "call.hangup":
             await update_campaign_contact_from_call(
                 call_record=call_record,
                 call_status=call_record.status,
@@ -1137,8 +1433,16 @@ async def telnyx_status_callback(
             )
 
         await db.commit()
-        log.info("call_record_updated", record_id=str(call_record.id), event=event_type)
+        log.info(
+            "call_record_updated",
+            record_id=str(call_record.id),
+            lifecycle_event=event_type,
+        )
     else:
-        log.warning("call_record_not_found", call_control_id=call_control_id)
+        log.warning(
+            "call_record_not_found_or_ambiguous",
+            call_identifier=call_identifier,
+            candidate_count=candidate_count,
+        )
 
     return {"status": "received"}

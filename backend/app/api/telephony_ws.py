@@ -9,6 +9,8 @@ import base64
 import contextlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -19,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import user_id_to_uuid
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.call_record import CallRecord
+from app.models.call_record import CallRecord, CallStatus
 from app.models.workspace import AgentWorkspace
 from app.services.gpt_realtime import GPTRealtimeSession
 
@@ -29,14 +31,134 @@ logger = structlog.get_logger()
 # Constants for event logging
 EVENT_LOG_THRESHOLD = 20  # Log first N events, then every 100th
 
+_TERMINAL_CALL_STATUSES = {
+    CallStatus.COMPLETED.value,
+    CallStatus.FAILED.value,
+    CallStatus.BUSY.value,
+    CallStatus.NO_ANSWER.value,
+    CallStatus.CANCELED.value,
+}
+
 
 async def get_agent_workspace_id(agent_id: uuid.UUID, db: AsyncSession) -> uuid.UUID | None:
     """Get workspace ID for an agent."""
+    result = await db.execute(select(AgentWorkspace).where(AgentWorkspace.agent_id == agent_id))
+    memberships = result.scalars().all()
+    if len(memberships) == 1:
+        return memberships[0].workspace_id
+    defaults = [membership.workspace_id for membership in memberships if membership.is_default]
+    return defaults[0] if len(defaults) == 1 else None
+
+
+async def resolve_media_workspace_id(
+    agent_id: uuid.UUID,
+    requested_workspace_id: str | None,
+    db: AsyncSession,
+) -> uuid.UUID | None:
+    """Validate an explicit outbound workspace, or resolve one unambiguous fallback."""
+    if not requested_workspace_id:
+        result = await db.execute(select(AgentWorkspace).where(AgentWorkspace.agent_id == agent_id))
+        memberships = result.scalars().all()
+        if len(memberships) <= 1:
+            return memberships[0].workspace_id if memberships else None
+        defaults = [membership.workspace_id for membership in memberships if membership.is_default]
+        if len(defaults) == 1:
+            return defaults[0]
+        raise ValueError("Media workspace is ambiguous")
+    try:
+        workspace_id = uuid.UUID(requested_workspace_id)
+    except ValueError as exc:
+        raise ValueError("Invalid media workspace ID") from exc
     result = await db.execute(
-        select(AgentWorkspace.workspace_id).where(AgentWorkspace.agent_id == agent_id).limit(1)
+        select(AgentWorkspace.id).where(
+            AgentWorkspace.agent_id == agent_id,
+            AgentWorkspace.workspace_id == workspace_id,
+        )
     )
-    row = result.scalar_one_or_none()
-    return row
+    if result.scalar_one_or_none() is None:
+        raise ValueError("Agent does not belong to media workspace")
+    return workspace_id
+
+
+async def update_telnyx_media_lifecycle(
+    call_control_id: str,
+    db: AsyncSession,
+    log: Any,
+    *,
+    agent_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    workspace_id: uuid.UUID | None,
+    expected_to_number: str | None,
+    ended: bool,
+) -> None:
+    """Use the signed-in media stream as a lifecycle fallback for TeXML callbacks."""
+    exact = await db.execute(
+        select(CallRecord)
+        .where(
+            CallRecord.provider == "telnyx",
+            CallRecord.provider_call_id == call_control_id,
+            CallRecord.user_id == owner_user_id,
+            CallRecord.workspace_id == workspace_id,
+        )
+        .limit(2)
+        .with_for_update()
+    )
+    candidates = exact.scalars().all()
+
+    # TeXML creates a CallSid while Media Streams exposes call_control_id. If those
+    # differ, accept only one recent, still-open call in the same identity scope.
+    if not candidates:
+        filters = [
+            CallRecord.provider == "telnyx",
+            CallRecord.agent_id == agent_id,
+            CallRecord.user_id == owner_user_id,
+            CallRecord.workspace_id == workspace_id,
+            CallRecord.created_at >= datetime.now(UTC) - timedelta(minutes=20),
+            CallRecord.ended_at.is_(None),
+        ]
+        if expected_to_number:
+            filters.append(CallRecord.to_number == expected_to_number)
+        fallback = await db.execute(
+            select(CallRecord)
+            .where(*filters)
+            .order_by(CallRecord.created_at.desc())
+            .limit(2)
+            .with_for_update()
+        )
+        candidates = fallback.scalars().all()
+
+    if len(candidates) != 1:
+        log.warning(
+            "telnyx_media_lifecycle_record_not_found_or_ambiguous",
+            call_control_id=call_control_id,
+            candidate_count=len(candidates),
+            ended=ended,
+        )
+        return
+
+    call_record = candidates[0]
+    now = datetime.now(UTC)
+    if ended:
+        if not call_record.ended_at:
+            call_record.ended_at = now
+        if call_record.status not in _TERMINAL_CALL_STATUSES:
+            call_record.status = CallStatus.COMPLETED.value
+        if call_record.answered_at:
+            elapsed = (call_record.ended_at - call_record.answered_at).total_seconds()
+            call_record.duration_seconds = max(call_record.duration_seconds or 0, int(elapsed), 0)
+    else:
+        if not call_record.answered_at:
+            call_record.answered_at = now
+        if call_record.status not in _TERMINAL_CALL_STATUSES:
+            call_record.status = CallStatus.IN_PROGRESS.value
+
+    await db.commit()
+    log.info(
+        "telnyx_media_lifecycle_updated",
+        record_id=str(call_record.id),
+        status=call_record.status,
+        ended=ended,
+    )
 
 
 async def save_transcript_to_call_record(  # noqa: PLR0912
@@ -243,7 +365,6 @@ async def twilio_media_stream(
         # agent.user_id is now directly the integer user ID
         user_id_int = agent.user_id
 
-        # Get workspace for the agent
         workspace_id = await get_agent_workspace_id(agent.id, db)
 
         # Build agent config
@@ -512,7 +633,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
 
 @router.websocket("/telnyx/{agent_id}")
-async def telnyx_media_stream(
+async def telnyx_media_stream(  # noqa: PLR0915
     websocket: WebSocket,
     agent_id: str,
     db: AsyncSession = Depends(get_db),
@@ -560,8 +681,18 @@ async def telnyx_media_stream(
         # agent.user_id is now directly the integer user ID
         user_id_int = agent.user_id
 
-        # Get workspace for the agent
-        workspace_id = await get_agent_workspace_id(agent.id, db)
+        # Outbound answer webhooks carry the authoritative workspace selected by
+        # initiate_call. Inbound/legacy streams may fall back only when unambiguous.
+        try:
+            workspace_id = await resolve_media_workspace_id(
+                agent.id,
+                websocket.query_params.get("workspace_id"),
+                db,
+            )
+        except ValueError as exc:
+            log.warning("invalid_media_workspace", error=str(exc))
+            await websocket.close(code=4003, reason="Invalid workspace")
+            return
 
         # Build agent config
         agent_config = {
@@ -606,16 +737,48 @@ async def telnyx_media_stream(
             workspace_id=workspace_id,
             variables=call_variables,
         ) as realtime_session:
+            owner_user_id = user_id_to_uuid(agent.user_id)
+            expected_to_number = (
+                str(call_variables.get("leadPhone") or call_variables.get("phone") or "") or None
+            )
+
+            async def update_media_lifecycle_safely(
+                lifecycle_call_control_id: str, *, ended: bool
+            ) -> None:
+                try:
+                    await update_telnyx_media_lifecycle(
+                        lifecycle_call_control_id,
+                        db,
+                        log,
+                        agent_id=agent.id,
+                        owner_user_id=owner_user_id,
+                        workspace_id=workspace_id,
+                        expected_to_number=expected_to_number,
+                        ended=ended,
+                    )
+                except Exception as exc:
+                    await db.rollback()
+                    log.exception(
+                        "telnyx_media_lifecycle_update_failed",
+                        ended=ended,
+                        error=str(exc),
+                    )
+
+            async def on_stream_started(started_call_control_id: str) -> None:
+                await update_media_lifecycle_safely(started_call_control_id, ended=False)
+
             # Handle Telnyx media stream and capture call_control_id
             call_control_id = await _handle_telnyx_stream(
                 websocket=websocket,
                 realtime_session=realtime_session,
                 log=log,
                 enable_transcript=agent.enable_transcript,
+                on_stream_started=on_stream_started,
             )
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_control_id:
+                await update_media_lifecycle_safely(call_control_id, ended=True)
                 transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
                 await save_transcript_to_call_record(
                     call_control_id,
@@ -624,13 +787,10 @@ async def telnyx_media_stream(
                     log,
                     agent_id=agent_id,
                     booking_attempts=realtime_session.get_booking_attempts(),
-                    owner_user_id=user_id_to_uuid(agent.user_id),
+                    owner_user_id=owner_user_id,
                     workspace_id=workspace_id,
                     provider="telnyx",
-                    expected_to_number=str(
-                        call_variables.get("leadPhone") or call_variables.get("phone") or ""
-                    )
-                    or None,
+                    expected_to_number=expected_to_number,
                 )
 
     except WebSocketDisconnect:
@@ -646,6 +806,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
     realtime_session: GPTRealtimeSession,
     log: Any,
     enable_transcript: bool = False,
+    on_stream_started: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Handle Telnyx Media Stream messages.
 
@@ -654,6 +815,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
         realtime_session: GPT Realtime session
         log: Logger instance
         enable_transcript: Whether to capture transcript
+        on_stream_started: Optional lifecycle callback invoked once the call ID is known
 
     Returns:
         The call_control_id for transcript saving
@@ -681,6 +843,8 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                         stream_id=stream_id,
                         call_control_id=call_control_id,
                     )
+                    if call_control_id and on_stream_started:
+                        await on_stream_started(call_control_id)
 
                 elif event == "media":
                     # Decode base64 PCMU audio and forward to Realtime

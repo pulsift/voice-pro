@@ -145,3 +145,33 @@ async def test_telnyx_end_call_cancels_provider_sibling_and_closes_socket() -> N
     assert call_control_id == "call-control-1"
     assert websocket.cancelled.is_set()
     websocket.close.assert_awaited_once_with(code=1000, reason="Call ended by agent")
+
+
+@pytest.mark.asyncio
+async def test_telnyx_stream_start_invokes_lifecycle_callback() -> None:
+    websocket = ScriptedWebSocket(
+        [
+            json.dumps(
+                {
+                    "event": "start",
+                    "stream_id": "stream-1",
+                    "start": {"call_control_id": "call-control-1"},
+                }
+            ),
+            json.dumps({"event": "stop"}),
+        ]
+    )
+    callback = AsyncMock()
+
+    call_control_id = await asyncio.wait_for(
+        _handle_telnyx_stream(
+            websocket,
+            make_session(BlockingConnection()),
+            MagicMock(),
+            on_stream_started=callback,
+        ),
+        timeout=0.5,
+    )
+
+    assert call_control_id == "call-control-1"
+    callback.assert_awaited_once_with("call-control-1")

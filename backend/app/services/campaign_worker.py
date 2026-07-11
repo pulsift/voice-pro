@@ -9,6 +9,7 @@ This background worker:
 
 import asyncio
 import contextlib
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytz  # type: ignore[import-untyped]
@@ -19,6 +20,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.settings import get_user_api_keys
 from app.db.session import AsyncSessionLocal
+from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import (
     Campaign,
     CampaignContact,
@@ -26,7 +28,7 @@ from app.models.campaign import (
     CampaignStatus,
 )
 from app.models.contact import Contact
-from app.services.telephony.telnyx_service import TelnyxService
+from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import TwilioService
 
 logger = structlog.get_logger()
@@ -34,6 +36,10 @@ logger = structlog.get_logger()
 # Worker configuration
 POLL_INTERVAL_SECONDS = 5  # How often to check for work
 MAX_CALLS_PER_TICK = 10  # Maximum calls to initiate per poll cycle
+
+
+class CampaignDialOutcomeUnknownError(Exception):
+    """Telnyx may have accepted the call; automatic redial would risk duplication."""
 
 
 class CampaignWorker:
@@ -106,7 +112,7 @@ class CampaignWorker:
                         campaign_name=campaign.name,
                     )
 
-    async def _process_campaign(  # noqa: PLR0915
+    async def _process_campaign(  # noqa: PLR0912, PLR0915
         self, campaign: Campaign, db: AsyncSession
     ) -> None:
         """Process a single campaign.
@@ -228,6 +234,13 @@ class CampaignWorker:
                     campaign_contact=campaign_contact,
                     contact=contact,
                     telephony_service=telephony_service,
+                    db=db,
+                )
+            except CampaignDialOutcomeUnknownError:
+                log.warning(
+                    "Campaign dial outcome unknown; awaiting provider callback",
+                    contact_id=contact.id,
+                    phone=contact.phone_number,
                 )
             except Exception:
                 log.exception(
@@ -235,7 +248,6 @@ class CampaignWorker:
                     contact_id=contact.id,
                     phone=contact.phone_number,
                 )
-                campaign_contact.attempts += 1
                 campaign_contact.last_call_outcome = "initiation_failed"
 
                 # Check if we should retry
@@ -327,6 +339,7 @@ class CampaignWorker:
         campaign_contact: CampaignContact,
         contact: Contact,
         telephony_service: TelnyxService | TwilioService,
+        db: AsyncSession,
     ) -> None:
         """Initiate an outbound call for a campaign contact.
 
@@ -335,6 +348,7 @@ class CampaignWorker:
             campaign_contact: Campaign contact record
             contact: Contact to call
             telephony_service: Telephony service
+            db: Database session used to precommit durable call correlation
         """
         log = self.logger.bind(
             campaign_id=str(campaign.id),
@@ -347,28 +361,70 @@ class CampaignWorker:
         webhook_url = (
             f"{self.base_url}/webhooks/{provider}/answer"
             f"?agent_id={campaign.agent_id}"
+            f"&workspace_id={campaign.workspace_id}"
             f"&campaign_id={campaign.id}"
             f"&campaign_contact_id={campaign_contact.id}"
         )
 
         log.info("Initiating campaign call", webhook_url=webhook_url)
 
-        # Initiate the call
-        call_info = await telephony_service.initiate_call(
-            to_number=contact.phone_number,
+        call_record = CallRecord(
+            user_id=campaign.user_id,
+            workspace_id=campaign.workspace_id,
+            provider=provider,
+            provider_call_id=f"pending:{uuid.uuid4()}",
+            agent_id=campaign.agent_id,
+            contact_id=contact.id,
+            direction=CallDirection.OUTBOUND.value,
+            status=CallStatus.INITIATED.value,
             from_number=campaign.from_phone_number,
-            webhook_url=webhook_url,
-            agent_id=str(campaign.agent_id),
+            to_number=contact.phone_number,
         )
+        db.add(call_record)
 
-        # Update campaign contact status
+        # Mark CALLING in the same pre-dial commit so an immediate terminal callback
+        # can lock and resolve the trusted campaign contact without racing this worker.
         campaign_contact.status = CampaignContactStatus.CALLING.value
         campaign_contact.attempts += 1
         campaign_contact.last_attempt_at = datetime.now(UTC)
-        campaign_contact.last_call_outcome = call_info.status.value
-
-        # Update campaign stats
+        campaign_contact.last_call_outcome = CallStatus.INITIATED.value
         campaign.contacts_called += 1
+        await db.commit()
+
+        try:
+            call_info = await telephony_service.initiate_call(
+                to_number=contact.phone_number,
+                from_number=campaign.from_phone_number,
+                webhook_url=webhook_url,
+                agent_id=str(campaign.agent_id),
+            )
+        except Exception as exc:
+            if isinstance(telephony_service, TelnyxService) and is_unknown_telnyx_dial_outcome(exc):
+                raise CampaignDialOutcomeUnknownError from exc
+            # A definitive provider rejection never produced a call. Undo the
+            # pre-dial metric reservation; the attempt itself remains counted.
+            campaign.contacts_called = max(0, campaign.contacts_called - 1)
+            locked = await db.execute(
+                select(CallRecord)
+                .where(CallRecord.id == call_record.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            failed_record = locked.scalar_one()
+            failed_record.status = CallStatus.FAILED.value
+            failed_record.ended_at = datetime.now(UTC)
+            await db.commit()
+            raise
+
+        locked = await db.execute(
+            select(CallRecord)
+            .where(CallRecord.id == call_record.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        call_record = locked.scalar_one()
+        call_record.provider_call_id = call_info.call_id
+        await db.commit()
 
         log.info(
             "Campaign call initiated",
