@@ -34,6 +34,16 @@ backend\.venv\Scripts\python.exe scripts\ops\seeded_call.py --confirm --window 3
 
 This can call only the compiled-in Sami seed. Before disarming it requires the exact successful Railway deployment/commit/model, tested prompt hash, backend health, fulfilment stub mode, five draft campaigns, and kill switch ON. It starts a detached watchdog before disarming and re-arms as soon as the first new exact-destination CallRecord appears. It also re-arms in `finally` and keeps the watchdog alive if immediate re-arm cannot be verified.
 
+### Saturday/weekend direct Voice Pro route
+
+VA-10 intentionally enforces its weekday calling window. For a supervised Saturday or weekend test, bypass VA-10 without weakening that production rule:
+
+```powershell
+backend\.venv\Scripts\python.exe scripts\ops\seeded_call.py --mode direct --confirm --window 300 --expected-sha <commit> --expected-deployment-id <deployment> --expected-model <model> --expected-reasoning <low-or-none> --expected-prompt-sha <prompt-sha>
+```
+
+Direct mode retains the same exact deployment, model, prompt, backend, fulfilment-stub, five-draft-campaign, kill-switch, and stored-seed preflight. It authenticates at runtime and POSTs only the compiled Sami destination, Telnyx caller, agent, and fixed test variables to Voice Pro's existing `/api/v1/telephony/calls` endpoint. It never disarms the kill switch; the switch must remain ON before the POST and throughout CallRecord polling. The default `--mode n8n` behavior is unchanged.
+
 ## Evidence and cleanup
 
 ```powershell
