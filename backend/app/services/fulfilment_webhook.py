@@ -11,6 +11,7 @@ or duplicated delivery carries the same booking_id so the receiver can dedupe.
 """
 
 import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -22,43 +23,77 @@ logger = structlog.get_logger()
 
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 1.0
+_UID_GUARD_TTL_SECONDS = 24 * 60 * 60
+_HTTP_SUCCESS_MIN = 200
+_HTTP_SUCCESS_MAX = 300
+_HTTP_SERVER_ERROR = 500
+_HTTP_REQUEST_TIMEOUT = 408
+_HTTP_TOO_MANY_REQUESTS = 429
+_RETRYABLE_CLIENT_STATUSES = {_HTTP_REQUEST_TIMEOUT, _HTTP_TOO_MANY_REQUESTS}
 
 # Keep references to in-flight background tasks so they aren't garbage-collected
 # mid-flight (asyncio only holds a weak reference to a bare create_task() result).
-_background_tasks: set[asyncio.Task[None]] = set()
+_background_tasks: set[asyncio.Task[bool]] = set()
+
+# A media-stream reconnect creates a fresh CRMTools instance. Keep a bounded,
+# process-local record of booking UIDs already dispatched so the new instance does
+# not re-fire the same fulfilment webhook. The receiver remains the cross-process
+# idempotency authority.
+_scheduled_booking_ids: dict[str, float] = {}
 
 
-async def _post_with_retries(url: str, payload: dict[str, Any]) -> None:
-    """POST payload to url, retrying 3x with exponential backoff on 5xx/timeout."""
+async def _post_with_retries(url: str, payload: dict[str, Any]) -> bool:
+    """POST payload, returning whether delivery reached a terminal outcome.
+
+    Successful 2xx and non-retryable responses are terminal. HTTP 408/429,
+    5xx, and transport failures are retried and return False when exhausted.
+    """
     log = logger.bind(component="fulfilment_webhook", booking_id=payload.get("booking_id"))
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(url, json=payload)
-            if resp.status_code < 500:
-                if resp.status_code >= 400:
-                    log.warning(
-                        "fulfil_webhook_client_error",
-                        status=resp.status_code,
-                        body=resp.text[:300],
-                        attempt=attempt,
-                    )
-                else:
-                    log.info("fulfil_webhook_delivered", status=resp.status_code, attempt=attempt)
-                return
-            log.warning("fulfil_webhook_server_error", status=resp.status_code, attempt=attempt)
+            if _HTTP_SUCCESS_MIN <= resp.status_code < _HTTP_SUCCESS_MAX:
+                log.info("fulfil_webhook_delivered", status=resp.status_code, attempt=attempt)
+                return True
+            if (
+                resp.status_code in _RETRYABLE_CLIENT_STATUSES
+                or resp.status_code >= _HTTP_SERVER_ERROR
+            ):
+                log.warning(
+                    "fulfil_webhook_retryable_response",
+                    status=resp.status_code,
+                    attempt=attempt,
+                )
+            else:
+                log.warning(
+                    "fulfil_webhook_terminal_response",
+                    status=resp.status_code,
+                    body=resp.text[:300],
+                    attempt=attempt,
+                )
+                return True
         except (httpx.TimeoutException, httpx.TransportError) as e:
             log.warning("fulfil_webhook_transport_error", error=str(e), attempt=attempt)
         except Exception:
             # Unexpected/programming error - don't retry, just log and give up quietly.
             log.exception("fulfil_webhook_unexpected_error", attempt=attempt)
-            return
+            return False
 
         if attempt < _MAX_ATTEMPTS:
             await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)))
 
     log.error("fulfil_webhook_failed_all_attempts", attempts=_MAX_ATTEMPTS)
+    return False
+
+
+def _finish_background_task(task: asyncio.Task[bool], booking_id: str | None) -> None:
+    """Release task state and permit a later dispatch when all delivery attempts failed."""
+    _background_tasks.discard(task)
+    terminal = not task.cancelled() and task.exception() is None and task.result()
+    if booking_id and not terminal:
+        _scheduled_booking_ids.pop(booking_id, None)
 
 
 def schedule_fulfilment_webhook(payload: dict[str, Any]) -> None:
@@ -72,7 +107,22 @@ def schedule_fulfilment_webhook(payload: dict[str, Any]) -> None:
         logger.debug("fulfil_webhook_skipped_not_configured")
         return
 
+    booking_id_value = payload.get("booking_id")
+    booking_id = (
+        booking_id_value if isinstance(booking_id_value, str) and booking_id_value else None
+    )
+    now = time.monotonic()
+    expired_before = now - _UID_GUARD_TTL_SECONDS
+    for seen_id, scheduled_at in list(_scheduled_booking_ids.items()):
+        if scheduled_at < expired_before:
+            _scheduled_booking_ids.pop(seen_id, None)
+    if booking_id and booking_id in _scheduled_booking_ids:
+        logger.info("fulfil_webhook_skipped_duplicate", booking_id=booking_id)
+        return
+
     target = url.rstrip("/") + "/fulfil"
     task = asyncio.create_task(_post_with_retries(target, payload))
+    if booking_id:
+        _scheduled_booking_ids[booking_id] = now
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(lambda completed: _finish_background_task(completed, booking_id))

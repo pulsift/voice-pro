@@ -21,6 +21,7 @@ from app.services.fulfilment_webhook import schedule_fulfilment_webhook
 
 logger = structlog.get_logger()
 MAX_BOOKING_ATTEMPTS = 2
+MIN_SLOTS_FOR_SECOND_SELECTION = 2
 MAX_12_HOUR = 12
 MAX_MINUTE = 59
 
@@ -131,7 +132,7 @@ class CRMTools:
             ordinal_candidates.add(self._offered_slots[0]["slot_id"])
         if (
             re.search(r"\b(second|later)\b", text)
-            and len(self._offered_slots) >= MAX_BOOKING_ATTEMPTS
+            and len(self._offered_slots) >= MIN_SLOTS_FOR_SECOND_SELECTION
         ):
             ordinal_candidates.add(self._offered_slots[1]["slot_id"])
         if ordinal_candidates:
