@@ -584,6 +584,8 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
+                    # First response.done is the greeting's — reopen the inbound gate.
+                    realtime_session.open_input_gate()
                     # Log full response details for debugging
                     response_data = getattr(event, "response", None)
                     if response_data:
@@ -603,6 +605,11 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break
+
+                # Surface Realtime API errors (previously silent) and fail-open the gate.
+                elif event_type == "error":
+                    log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
+                    realtime_session.open_input_gate()
 
                 # Log other events
                 elif event_type in [
@@ -938,11 +945,20 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
+                    # First response.done is the greeting's — reopen the inbound gate
+                    # so the caller is heard from here on. Idempotent after the first.
+                    realtime_session.open_input_gate()
                     log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break
+
+                # Surface Realtime API errors (previously silent) and fail-open the
+                # gate so an errored greeting can never deadlock the caller's audio.
+                elif event_type == "error":
+                    log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
+                    realtime_session.open_input_gate()
 
                 elif event_type in [
                     "response.audio.done",

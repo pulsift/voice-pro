@@ -199,6 +199,12 @@ class GPTRealtimeSession:
         # Initial greeting (triggered after event loop starts to avoid race condition)
         self._pending_initial_greeting: str | None = None
         self._greeting_triggered: bool = False
+        # Inbound-audio gate. Open by default; closed while an initial greeting is
+        # pending so the caller's early "hello" can't trigger VAD and cancel the
+        # greeting mid-birth. Re-opened when the greeting response completes (or on
+        # error, fail-open). Covers both the Telnyx and Twilio bridges since both
+        # feed audio through send_audio().
+        self._input_gate_open: bool = True
         self.realtime_model = settings.OPENAI_REALTIME_MODEL
         self.realtime_reasoning_effort = settings.OPENAI_REALTIME_REASONING_EFFORT
         self.logger = logger.bind(
@@ -380,6 +386,8 @@ class GPTRealtimeSession:
             initial_greeting = self.agent_config.get("initial_greeting")
             if initial_greeting:
                 self._pending_initial_greeting = initial_greeting
+                # Close the inbound-audio gate until the greeting finishes.
+                self._input_gate_open = False
                 self.logger.info(
                     "initial_greeting_pending",
                     greeting=initial_greeting[:50],
@@ -579,6 +587,12 @@ class GPTRealtimeSession:
             self.logger.exception("initial_greeting_failed", error=str(e))
             return False
 
+    def open_input_gate(self) -> None:
+        """Allow caller audio through again (greeting finished, or fail-open on error)."""
+        if not self._input_gate_open:
+            self._input_gate_open = True
+            self.logger.info("input_gate_opened")
+
     async def send_audio(self, audio_data: bytes) -> None:
         """Send audio input to GPT Realtime using SDK.
 
@@ -587,6 +601,10 @@ class GPTRealtimeSession:
         """
         if not self.connection:
             self.logger.error("send_audio_failed_no_connection")
+            return
+
+        # Drop caller audio while the greeting is playing so it can't cancel it.
+        if not self._input_gate_open:
             return
 
         try:

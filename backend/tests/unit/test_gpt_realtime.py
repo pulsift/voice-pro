@@ -26,6 +26,27 @@ def test_realtime_model_has_proven_safe_default() -> None:
     assert Settings.model_fields["OPENAI_REALTIME_REASONING_EFFORT"].default is None
 
 
+def test_input_gate_open_by_default() -> None:
+    # No greeting configured => gate must stay open, or caller audio would deadlock.
+    assert make_session()._input_gate_open is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_send_audio_dropped_while_gate_closed_then_forwarded() -> None:
+    session = make_session()
+    session._input_gate_open = False  # noqa: SLF001 - greeting in progress
+    session.connection = MagicMock()
+    session.connection.input_audio_buffer.append = AsyncMock()
+
+    await session.send_audio(b"\x00\x01")
+    session.connection.input_audio_buffer.append.assert_not_awaited()  # dropped mid-greeting
+
+    session.open_input_gate()  # greeting response.done
+    assert session._input_gate_open is True  # noqa: SLF001
+    await session.send_audio(b"\x00\x01")
+    session.connection.input_audio_buffer.append.assert_awaited_once()  # now forwarded
+
+
 def test_completed_utterance_reaches_tools_when_history_is_disabled() -> None:
     session = make_session(enable_transcript=False)
     session.tool_registry = MagicMock()
