@@ -302,17 +302,24 @@ async def get_twilio_service(
     user_uuid = user_id_to_uuid(user_id)
     user_settings = await get_user_api_keys(user_uuid, db, workspace_id=workspace_id)
 
-    if (
-        not user_settings
-        or not user_settings.twilio_account_sid
-        or not user_settings.twilio_auth_token
-    ):
+    account_sid = user_settings.twilio_account_sid if user_settings else None
+    auth_token = user_settings.twilio_auth_token if user_settings else None
+
+    # Fall back to the user-level creds, then the platform env creds (single-tenant
+    # own-tool; mirrors get_telnyx_service). This is what makes Twilio resolvable from
+    # settings.TWILIO_ACCOUNT_SID + settings.TWILIO_AUTH_TOKEN.
+    if (not account_sid or not auth_token) and workspace_id:
+        ul = await get_user_api_keys(user_uuid, db, workspace_id=None)
+        if ul and ul.twilio_account_sid and ul.twilio_auth_token:
+            account_sid, auth_token = ul.twilio_account_sid, ul.twilio_auth_token
+    if not account_sid or not auth_token:
+        account_sid = account_sid or settings.TWILIO_ACCOUNT_SID
+        auth_token = auth_token or settings.TWILIO_AUTH_TOKEN
+
+    if not account_sid or not auth_token:
         return None
 
-    return TwilioService(
-        account_sid=user_settings.twilio_account_sid,
-        auth_token=user_settings.twilio_auth_token,
-    )
+    return TwilioService(account_sid=account_sid, auth_token=auth_token)
 
 
 async def get_telnyx_service(
@@ -344,6 +351,22 @@ async def get_telnyx_service(
         return None
 
     return TelnyxService(api_key=api_key, public_key=public_key)
+
+
+def select_outbound_provider(
+    preferred: str | None, *, has_telnyx: bool, has_twilio: bool
+) -> str | None:
+    """Pick the outbound telephony provider.
+
+    Honours the configured preference (`TELEPHONY_OUTBOUND_PROVIDER`, default "twilio")
+    and falls back to the other provider only if the preferred one isn't configured.
+    Returns None when neither is available. This is what keeps Telnyx dormant while
+    Twilio is present, and re-enables Telnyx by flipping the preference.
+    """
+    pref = (preferred or "twilio").lower()
+    if pref == "telnyx":
+        return "telnyx" if has_telnyx else ("twilio" if has_twilio else None)
+    return "twilio" if has_twilio else ("telnyx" if has_telnyx else None)
 
 
 async def get_agent_by_phone_number(phone_number: str, db: AsyncSession) -> Agent | None:
@@ -847,24 +870,29 @@ async def initiate_call(  # noqa: PLR0915
         db=db,
     )
 
-    # Determine provider from agent's phone number configuration
-    # Default to Telnyx if not specified
-    provider = "telnyx"
-
-    # Try Telnyx first
+    # Select the outbound provider: honour TELEPHONY_OUTBOUND_PROVIDER, falling back to
+    # the other only if the preferred one isn't configured. Twilio is first-class;
+    # Telnyx is dormant (used only when preferred, or as a fallback).
     telnyx_service = await get_telnyx_service(current_user.id, db, workspace_id=workspace_uuid)
     twilio_service = await get_twilio_service(current_user.id, db, workspace_id=workspace_uuid)
 
-    if not telnyx_service and not twilio_service:
+    preferred = (settings.TELEPHONY_OUTBOUND_PROVIDER or "twilio").lower()
+    provider = select_outbound_provider(
+        preferred, has_telnyx=telnyx_service is not None, has_twilio=twilio_service is not None
+    )
+
+    if provider is None:
         raise HTTPException(
             status_code=400,
             detail="No telephony provider configured. Please add Twilio or Telnyx credentials in Settings.",
         )
+    if provider != preferred:
+        log.warning("telephony_provider_fallback", preferred=preferred, using=provider)
 
     # Build webhook URL (forward per-call variables as base64-JSON in ?cv= so the
     # answer webhook -> media WS can personalize the prompt + fill the booking attendee)
     base_url = str(request.base_url).rstrip("/")
-    webhook_url = f"{base_url}/webhooks/{'telnyx' if telnyx_service else 'twilio'}/answer?agent_id={call_request.agent_id}"
+    webhook_url = f"{base_url}/webhooks/{provider}/answer?agent_id={call_request.agent_id}"
     if workspace_uuid:
         webhook_url = f"{webhook_url}&workspace_id={workspace_uuid}"
     if call_request.variables:
@@ -874,88 +902,64 @@ async def initiate_call(  # noqa: PLR0915
         cv = base64.urlsafe_b64encode(_json.dumps(call_request.variables).encode()).decode()
         webhook_url = f"{webhook_url}&cv={cv}"
 
-    call_record: CallRecord | None = None
-    if telnyx_service:
-        provider = "telnyx"
-        # Commit a correlation row before asking Telnyx to dial. An immediate status
-        # callback can then reconcile by the unique pending From/To record instead of
-        # being permanently lost in the POST-before-record race.
-        call_record = CallRecord(
-            user_id=user_id_to_uuid(current_user.id),
-            workspace_id=workspace_uuid,
-            provider=provider,
-            provider_call_id=f"pending:{uuid.uuid4()}",
-            agent_id=agent.id,
-            direction=CallDirection.OUTBOUND.value,
-            status=CallStatus.INITIATED.value,
-            from_number=call_request.from_number,
-            to_number=call_request.to_number,
-        )
-        db.add(call_record)
-        await db.commit()
-        try:
-            call_info = await telnyx_service.initiate_call(
-                to_number=call_request.to_number,
-                from_number=call_request.from_number,
-                webhook_url=webhook_url,
-                agent_id=call_request.agent_id,
-            )
-        except Exception as exc:
-            if is_unknown_telnyx_dial_outcome(exc):
-                log.warning(
-                    "telnyx_dial_outcome_unknown",
-                    record_id=str(call_record.id),
-                    error_type=type(exc).__name__,
-                )
-                raise
-            locked = await db.execute(
-                select(CallRecord)
-                .where(CallRecord.id == call_record.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            failed_record = locked.scalar_one()
-            failed_record.status = CallStatus.FAILED.value
-            failed_record.ended_at = datetime.now(UTC)
-            await db.commit()
-            raise
+    # Commit a correlation row BEFORE dialing (both providers). An immediate status
+    # callback can then reconcile by the unique pending From/To record instead of
+    # being lost in the POST-before-record race.
+    call_record = CallRecord(
+        user_id=user_id_to_uuid(current_user.id),
+        workspace_id=workspace_uuid,
+        provider=provider,
+        provider_call_id=f"pending:{uuid.uuid4()}",
+        agent_id=agent.id,
+        direction=CallDirection.OUTBOUND.value,
+        status=CallStatus.INITIATED.value,
+        from_number=call_request.from_number,
+        to_number=call_request.to_number,
+    )
+    db.add(call_record)
+    await db.commit()
 
+    service = telnyx_service if provider == "telnyx" else twilio_service
+    try:
+        call_info = await service.initiate_call(
+            to_number=call_request.to_number,
+            from_number=call_request.from_number,
+            webhook_url=webhook_url,
+            agent_id=call_request.agent_id,
+        )
+    except Exception as exc:
+        # Telnyx-only: an unknown dial outcome must NOT be marked failed (the call may
+        # still be live); surface it and let reconciliation settle the record.
+        if provider == "telnyx" and is_unknown_telnyx_dial_outcome(exc):
+            log.warning(
+                "telnyx_dial_outcome_unknown",
+                record_id=str(call_record.id),
+                error_type=type(exc).__name__,
+            )
+            raise
         locked = await db.execute(
             select(CallRecord)
             .where(CallRecord.id == call_record.id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        call_record = locked.scalar_one()
-        call_record.provider_call_id = call_info.call_id
+        failed_record = locked.scalar_one()
+        failed_record.status = CallStatus.FAILED.value
+        failed_record.ended_at = datetime.now(UTC)
         await db.commit()
-    elif twilio_service:
-        provider = "twilio"
-        call_info = await twilio_service.initiate_call(
-            to_number=call_request.to_number,
-            from_number=call_request.from_number,
-            webhook_url=webhook_url,
-            agent_id=call_request.agent_id,
-        )
-    else:
-        raise HTTPException(status_code=500, detail="Failed to initialize telephony service")
+        raise
+
+    locked = await db.execute(
+        select(CallRecord)
+        .where(CallRecord.id == call_record.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    call_record = locked.scalar_one()
+    call_record.provider_call_id = call_info.call_id
+    await db.commit()
 
     log.info("call_initiated", call_id=call_info.call_id, provider=provider)
-
-    if call_record is None:
-        call_record = CallRecord(
-            user_id=user_id_to_uuid(current_user.id),
-            workspace_id=workspace_uuid,
-            provider=provider,
-            provider_call_id=call_info.call_id,
-            agent_id=agent.id,
-            direction=CallDirection.OUTBOUND.value,
-            status=CallStatus.INITIATED.value,
-            from_number=call_request.from_number,
-            to_number=call_request.to_number,
-        )
-        db.add(call_record)
-        await db.commit()
     log.info("call_record_created", record_id=str(call_record.id))
 
     return CallResponse(
@@ -1170,23 +1174,38 @@ async def twilio_status_callback(
 async def twilio_answer_webhook(
     request: Request,
     agent_id: str = Query(default=""),
+    cv: str = Query(default=""),
+    workspace_id: str = Query(default=""),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Handle Twilio outbound call connection.
 
-    Called when an outbound call is answered by the recipient.
-    Returns TwiML to connect to our WebSocket.
+    Called when an outbound call is answered by the recipient. Returns TwiML to connect
+    to our WebSocket. Per-call variables (base64 JSON in `cv`, set on the outbound call's
+    Url) are forwarded to the media WS so the session can personalize the prompt + fill
+    the booking attendee — mirroring the Telnyx path.
     """
     # Validate Twilio signature
     await verify_twilio_webhook(request)
 
-    log = logger.bind(webhook="twilio_answer", agent_id=agent_id)
+    log = logger.bind(webhook="twilio_answer", agent_id=agent_id, has_cv=bool(cv))
     log.info("twilio_outbound_answered")
 
-    # Build WebSocket URL
+    # Build WebSocket URL (forward the per-call variables blob if present)
     base_url = str(request.base_url).rstrip("/")
     ws_url = base_url.replace("http://", "wss://").replace("https://", "wss://")
     stream_url = f"{ws_url}/ws/telephony/twilio/{agent_id}"
+    query_parts: list[str] = []
+    if workspace_id:
+        from urllib.parse import quote
+
+        query_parts.append(f"workspace_id={quote(workspace_id, safe='')}")
+    if cv:
+        from urllib.parse import quote
+
+        query_parts.append(f"cv={quote(cv, safe='')}")
+    if query_parts:
+        stream_url = f"{stream_url}?{'&'.join(query_parts)}"
 
     twilio_service = TwilioService("", "")
     twiml = twilio_service.generate_answer_response(stream_url, agent_id)

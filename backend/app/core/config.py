@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     TELNYX_PUBLIC_KEY: str | None = None
     TWILIO_ACCOUNT_SID: str | None = None
     TWILIO_AUTH_TOKEN: str | None = None
+    # Outbound caller ID (E.164) for Twilio calls, and the preferred outbound
+    # provider. The gate makes Twilio first-class; Telnyx stays in the codebase,
+    # dormant, and is used only as a fallback (or by flipping this to "telnyx").
+    TWILIO_FROM_NUMBER: str | None = None
+    TELEPHONY_OUTBOUND_PROVIDER: str = "twilio"
 
     # Cal.com booking (used by the voice agent's check_availability / book_appointment
     # when configured; otherwise the agent falls back to the internal calendar).

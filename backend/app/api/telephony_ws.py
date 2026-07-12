@@ -316,7 +316,7 @@ async def _run_bridge_tasks(
 
 
 @router.websocket("/twilio/{agent_id}")
-async def twilio_media_stream(
+async def twilio_media_stream(  # noqa: PLR0915
     websocket: WebSocket,
     agent_id: str,
     db: AsyncSession = Depends(get_db),
@@ -365,7 +365,18 @@ async def twilio_media_stream(
         # agent.user_id is now directly the integer user ID
         user_id_int = agent.user_id
 
-        workspace_id = await get_agent_workspace_id(agent.id, db)
+        # Outbound answer webhooks carry the authoritative workspace selected by
+        # initiate_call. Inbound/legacy streams may fall back only when unambiguous.
+        try:
+            workspace_id = await resolve_media_workspace_id(
+                agent.id,
+                websocket.query_params.get("workspace_id"),
+                db,
+            )
+        except ValueError as exc:
+            log.warning("invalid_media_workspace", error=str(exc))
+            await websocket.close(code=4003, reason="Invalid workspace")
+            return
 
         # Build agent config
         agent_config = {
@@ -377,6 +388,30 @@ async def twilio_media_stream(
             "initial_greeting": agent.initial_greeting,
         }
 
+        # Per-call lead/offer variables (base64 JSON in ?cv=) — personalize the prompt +
+        # fill the Cal.com booking attendee. Mirrors the Telnyx media stream.
+        call_variables: dict[str, Any] = {}
+        cv = websocket.query_params.get("cv")
+        if cv:
+            try:
+                padded = cv + "=" * (-len(cv) % 4)  # tolerate unpadded base64url
+                decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode("utf-8"))
+                if isinstance(decoded, dict):
+                    call_variables = decoded
+                    log.info("call_variables_loaded", keys=list(call_variables.keys()))
+                else:
+                    log.warning("call_variables_not_dict", got=type(decoded).__name__)
+            except Exception as e:
+                log.warning("call_variables_decode_failed", error=str(e))
+
+        # Always render the greeting (defaults fill any {{placeholders}} so none leak raw).
+        if agent_config.get("initial_greeting"):
+            from app.services.gpt_realtime import render_template
+
+            agent_config["initial_greeting"] = render_template(
+                str(agent_config["initial_greeting"]), call_variables
+            )
+
         # Initialize GPT Realtime session
         async with GPTRealtimeSession(
             db=db,
@@ -384,6 +419,7 @@ async def twilio_media_stream(
             agent_config=agent_config,
             session_id=session_id,
             workspace_id=workspace_id,
+            variables=call_variables,
         ) as realtime_session:
             # Handle Twilio media stream and capture call_sid
             call_sid = await _handle_twilio_stream(

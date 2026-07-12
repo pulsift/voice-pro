@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.settings import get_user_api_keys
+from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import (
@@ -315,23 +316,34 @@ class CampaignWorker:
             workspace_id=campaign.workspace_id,
         )
 
-        if not user_settings:
-            return None
+        # Resolve creds from workspace settings, then platform env (mirrors the API
+        # resolvers so the worker also works from env creds).
+        telnyx_key = (user_settings.telnyx_api_key if user_settings else None) or settings.TELNYX_API_KEY
+        telnyx_pub = (
+            user_settings.telnyx_public_key if user_settings else None
+        ) or settings.TELNYX_PUBLIC_KEY
+        twilio_sid = (
+            user_settings.twilio_account_sid if user_settings else None
+        ) or settings.TWILIO_ACCOUNT_SID
+        twilio_tok = (
+            user_settings.twilio_auth_token if user_settings else None
+        ) or settings.TWILIO_AUTH_TOKEN
 
-        # Prefer Telnyx, fall back to Twilio
-        if user_settings.telnyx_api_key:
-            return TelnyxService(
-                api_key=user_settings.telnyx_api_key,
-                public_key=user_settings.telnyx_public_key,
+        def _telnyx() -> TelnyxService | None:
+            return TelnyxService(api_key=telnyx_key, public_key=telnyx_pub) if telnyx_key else None
+
+        def _twilio() -> TwilioService | None:
+            return (
+                TwilioService(account_sid=twilio_sid, auth_token=twilio_tok)
+                if (twilio_sid and twilio_tok)
+                else None
             )
 
-        if user_settings.twilio_account_sid and user_settings.twilio_auth_token:
-            return TwilioService(
-                account_sid=user_settings.twilio_account_sid,
-                auth_token=user_settings.twilio_auth_token,
-            )
-
-        return None
+        # Honour the outbound-provider gate; Telnyx stays dormant unless preferred/fallback.
+        preferred = (settings.TELEPHONY_OUTBOUND_PROVIDER or "twilio").lower()
+        if preferred == "telnyx":
+            return _telnyx() or _twilio()
+        return _twilio() or _telnyx()
 
     async def _initiate_call(
         self,

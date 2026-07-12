@@ -30,7 +30,7 @@ from ops_common import (
 from safety_status import list_campaigns, seeded_lead_phone
 
 
-DIRECT_FROM_NUMBER = "+14086649020"
+DIRECT_FROM_NUMBER = "+16693694746"  # Pulsift Twilio number (outbound caller ID)
 DIRECT_TEST_VARIABLES: dict[str, str] = {
     "agentName": "Dave",
     "leadName": "Sami",
