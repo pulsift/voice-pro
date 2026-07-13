@@ -367,6 +367,10 @@ class GPTRealtimeSession:
             "tools": tools,
             "tool_choice": "auto",
         }
+        if settings.REALTIME_INPUT_NOISE_REDUCTION in ("near_field", "far_field"):
+            session_config["audio"]["input"]["noise_reduction"] = {
+                "type": settings.REALTIME_INPUT_NOISE_REDUCTION
+            }
         reasoning_effort = self._effective_reasoning_effort()
         if reasoning_effort:
             session_config["reasoning"] = {"effort": reasoning_effort}
@@ -526,8 +530,11 @@ class GPTRealtimeSession:
                     "output": json.dumps(result),
                 }
             )
-            # Trigger GPT to generate a response after the function call
-            await self.connection.response.create()
+            # Trigger GPT to generate a response after the function call.
+            # wait_for_user is the official noise/silence no-op: forcing a
+            # response here would defeat it, so stay silent instead.
+            if name != "wait_for_user":
+                await self.connection.response.create()
 
         self.logger.info(
             "function_call_completed",

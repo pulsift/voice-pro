@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     REALTIME_VAD_THRESHOLD: float = 0.6
     REALTIME_VAD_PREFIX_PADDING_MS: int = 300
     REALTIME_VAD_SILENCE_DURATION_MS: int = 700
+    # Optional input noise reduction ("near_field" | "far_field"). Filters audio
+    # before VAD and the model — cuts phantom turns from line noise on PSTN.
+    REALTIME_INPUT_NOISE_REDUCTION: str | None = None
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 

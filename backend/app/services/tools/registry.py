@@ -228,6 +228,7 @@ class ToolRegistry:
         """
         # Call Control tools
         call_control_tool_names = {
+            "wait_for_user",
             "end_call",
             "transfer_call",
             "send_dtmf",

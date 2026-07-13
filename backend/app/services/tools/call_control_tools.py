@@ -34,6 +34,21 @@ class CallControlTools:
         return [
             {
                 "type": "function",
+                "name": "wait_for_user",
+                "description": (
+                    "Call this when the latest audio does not need a spoken response, "
+                    "such as silence, background noise, hold music, TV audio, side "
+                    "conversation, or speech not addressed to you. Do not respond "
+                    "conversationally after calling this tool - just wait for the "
+                    "caller's next clear utterance."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+            {
+                "type": "function",
                 "name": "end_call",
                 "description": (
                     "End the current phone call. Use this when the conversation is complete, "
@@ -111,6 +126,17 @@ class CallControlTools:
         ]
 
     @staticmethod
+    def _execute_wait_for_user(_arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute wait_for_user tool - a deliberate no-op.
+
+        Gives the model a way to produce NO spoken output when the committed
+        audio was noise/silence/side conversation. The session skips the usual
+        post-tool response.create for this tool.
+        """
+        logger.info("wait_for_user_requested")
+        return {"success": True, "message": "Waiting for the caller."}
+
+    @staticmethod
     def _execute_end_call(arguments: dict[str, Any]) -> dict[str, Any]:
         """Execute end_call tool."""
         reason = arguments.get("reason", "conversation_complete")
@@ -181,6 +207,7 @@ class CallControlTools:
             Dict with action type and parameters for the realtime session to handle
         """
         handlers = {
+            "wait_for_user": CallControlTools._execute_wait_for_user,
             "end_call": CallControlTools._execute_end_call,
             "transfer_call": CallControlTools._execute_transfer_call,
             "send_dtmf": CallControlTools._execute_send_dtmf,

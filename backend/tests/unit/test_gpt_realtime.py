@@ -194,3 +194,62 @@ async def test_tool_logging_records_argument_keys_without_values() -> None:
     logged = repr(session.logger.info.call_args)
     assert "private@example.com" not in logged
     assert "sensitive qualification notes" not in logged
+
+
+def _make_tool_call_event(name: str) -> MagicMock:
+    event = MagicMock()
+    event.call_id = "call_123"
+    event.name = name
+    event.arguments = "{}"
+    return event
+
+
+def _make_session_with_connection() -> GPTRealtimeSession:
+    session = make_session()
+    session.tool_registry = MagicMock()
+    session.tool_registry.execute_tool = AsyncMock(return_value={"success": True})
+    session.connection = MagicMock()
+    session.connection.conversation.item.create = AsyncMock()
+    session.connection.response.create = AsyncMock()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_wait_for_user_skips_response_create() -> None:
+    """wait_for_user is the noise/silence no-op: the session must NOT force a
+    spoken response after it, or the model can never stay quiet on noise."""
+    session = _make_session_with_connection()
+
+    result = await session.handle_function_call_event(_make_tool_call_event("wait_for_user"))
+
+    assert result == {"success": True}
+    session.connection.conversation.item.create.assert_awaited_once()  # output still returned
+    session.connection.response.create.assert_not_awaited()  # but no forced speech
+
+
+@pytest.mark.asyncio
+async def test_other_tools_still_trigger_response_create() -> None:
+    session = _make_session_with_connection()
+
+    await session.handle_function_call_event(_make_tool_call_event("check_availability"))
+
+    session.connection.response.create.assert_awaited_once()
+
+
+def test_wait_for_user_registered_as_call_control_tool() -> None:
+    from app.services.tools.call_control_tools import CallControlTools
+
+    names = [tool["name"] for tool in CallControlTools.get_tool_definitions()]
+    assert "wait_for_user" in names
+
+    registry = ToolRegistry(db=MagicMock(), user_id=1)
+    definitions = registry.get_all_tool_definitions(["call_control"])
+    assert "wait_for_user" in [tool["name"] for tool in definitions]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_user_executes_as_noop() -> None:
+    registry = ToolRegistry(db=MagicMock(), user_id=1)
+    result = await registry.execute_tool("wait_for_user", {})
+    assert result["success"] is True
+    assert "action" not in result  # must not trigger telephony actions
