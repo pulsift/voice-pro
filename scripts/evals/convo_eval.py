@@ -86,6 +86,10 @@ FORBIDDEN_SPOKEN = (
     "first time or the second",
     "the first or the second",
     "first option or",
+    # Constraint narration / choosing on the caller's behalf (live call 6).
+    "can't take",
+    "a clear choice",
+    "i'll go with",
 )
 
 BOOKED_CLAIMS = ("booked", "you're set", "you are set", "locked in")
@@ -305,6 +309,16 @@ def check_not_booked(convo: Conversation, violations: list[str]) -> None:
         violations.append("call not ended with end_call")
 
 
+def check_garbled_line(convo: Conversation, violations: list[str]) -> None:
+    categories = [a.get("category") for a in convo.crm.get_booking_attempts()]
+    if "selected" in categories or "created" in categories:
+        violations.append("selected/booked off garbage input")
+    if not convo.ended:
+        violations.append("did not bail out of the unusable line (no end_call)")
+    if not any("email" in t.lower() for t in convo.assistant_texts):
+        violations.append("never offered the email fallback before bailing")
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "happy_natural": {
         "turns": [
@@ -362,6 +376,29 @@ SCENARIOS: dict[str, dict[str, Any]] = {
                 if re.search(
                     r"wednesday at|on wednesday we (have|do)", convo.assistant_texts[-1].lower()
                 )
+                else None
+            ),
+        },
+    },
+    "garbled_line": {
+        # Live call 6: side-conversation / Whisper noise-hallucinations commit
+        # as caller turns. The agent must not treat them as answers, must not
+        # run the calendar without a real timezone, and must bail to the email
+        # fallback instead of looping.
+        "turns": [
+            "Hello?",
+            "Yeah, now's fine.",
+            "No that's fine, include it.",
+            "Thank you for watching.",
+            "13 14 15 16.",
+            "Subtitles by the Amara community.",
+            "MBC news, thank you.",
+        ],
+        "final": check_garbled_line,
+        "mid_checks": {
+            4: lambda convo, violations: (
+                violations.append("ran the calendar without a real timezone answer")
+                if convo.crm.get_booking_attempts()
                 else None
             ),
         },
