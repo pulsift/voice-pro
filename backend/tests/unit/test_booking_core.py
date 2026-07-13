@@ -153,6 +153,45 @@ async def test_spoken_bare_hour_selects_the_only_matching_offered_slot() -> None
 
 
 @pytest.mark.asyncio
+async def test_bare_digit_hour_and_dotted_meridiem_select_a_slot() -> None:
+    """Live-call regression (2026-07-13): 'Tuesday at 1 my time' and
+    'Tuesday at 1 p.m.' were clear picks but the matcher rejected both."""
+    tools = make_tools()
+    slots = [
+        {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},  # 10:00 +03
+        {"start": "2026-07-14T10:00:00Z", "label": "Tuesday 1:00 PM"},  # 13:00 +03
+    ]
+    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+        await tools.check_availability(time_zone="Asia/Damascus")
+
+    tools.observe_user_utterance("All right, let's just go for Tuesday at 1 my time.")
+    selected = await tools.select_slot("slot_2")
+    assert selected["success"] is True
+    assert selected["start"] == slots[1]["start"]
+
+    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+        await tools.check_availability(time_zone="Asia/Damascus")
+    tools.observe_user_utterance("Sorry, I want the Tuesday at 1 p.m.")
+    selected = await tools.select_slot("slot_2")
+    assert selected["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_bare_digit_still_ambiguous_when_it_matches_both_slots() -> None:
+    tools = make_tools()
+    slots = [
+        {"start": "2026-07-14T01:00:00Z", "label": "Tuesday 1:00 AM"},
+        {"start": "2026-07-14T13:00:00Z", "label": "Tuesday 1:00 PM"},
+    ]
+    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+        await tools.check_availability(time_zone="UTC")
+
+    tools.observe_user_utterance("Tuesday at 1 works")
+    result = await tools.select_slot("slot_2")
+    assert result["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
 async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
     tools = make_tools()
     create_booking = AsyncMock(

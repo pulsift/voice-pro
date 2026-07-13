@@ -122,22 +122,9 @@ class CRMTools:
             return None
         return parsed.astimezone(UTC)
 
-    def _utterance_slot_candidates(self) -> set[str]:
-        """Conservatively infer the offered slot(s) named by the latest utterance."""
-        from zoneinfo import ZoneInfo
-
-        text = " ".join(self._latest_user_utterance.lower().split())
-        ordinal_candidates: set[str] = set()
-        if re.search(r"\b(first|earlier)\b", text) and self._offered_slots:
-            ordinal_candidates.add(self._offered_slots[0]["slot_id"])
-        if (
-            re.search(r"\b(second|later)\b", text)
-            and len(self._offered_slots) >= MIN_SLOTS_FOR_SECOND_SELECTION
-        ):
-            ordinal_candidates.add(self._offered_slots[1]["slot_id"])
-        if ordinal_candidates:
-            return ordinal_candidates
-
+    @staticmethod
+    def _extract_time_matches(text: str) -> set[tuple[int, int]]:
+        """Parse every (hour, minute) the utterance could be naming."""
         time_matches: set[tuple[int, int]] = set()
         for match in re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text):
             hour = int(match.group(1))
@@ -167,7 +154,38 @@ class CRMTools:
                 # the offered-slot set must still reduce this to exactly one slot.
                 time_matches.add((hour % MAX_12_HOUR, 0))
                 time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
+        # Bare DIGIT hours ("at 1", "around 10") - transcription often writes
+        # digits, not words. Same both-halves treatment as spoken word hours.
+        for match in re.finditer(
+            r"\b(?:at|around|about|for)\s+(\d{1,2})\b(?!\s*(?::|am|pm))", text
+        ):
+            hour = int(match.group(1))
+            if 1 <= hour <= MAX_12_HOUR:
+                time_matches.add((hour % MAX_12_HOUR, 0))
+                time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
+        if re.search(r"\bnoon\b|\bmidday\b", text):
+            time_matches.add((12, 0))
+        return time_matches
 
+    def _utterance_slot_candidates(self) -> set[str]:
+        """Conservatively infer the offered slot(s) named by the latest utterance."""
+        from zoneinfo import ZoneInfo
+
+        text = " ".join(self._latest_user_utterance.lower().split())
+        # Whisper writes dotted meridiems ("1 p.m.") - normalize to "1 pm".
+        text = re.sub(r"\b([ap])\.\s?m\.?", r"\1m", text)
+        ordinal_candidates: set[str] = set()
+        if re.search(r"\b(first|earlier)\b", text) and self._offered_slots:
+            ordinal_candidates.add(self._offered_slots[0]["slot_id"])
+        if (
+            re.search(r"\b(second|later)\b", text)
+            and len(self._offered_slots) >= MIN_SLOTS_FOR_SECOND_SELECTION
+        ):
+            ordinal_candidates.add(self._offered_slots[1]["slot_id"])
+        if ordinal_candidates:
+            return ordinal_candidates
+
+        time_matches = self._extract_time_matches(text)
         day_names = {
             name
             for name in (
@@ -213,7 +231,11 @@ class CRMTools:
             return {
                 "success": False,
                 "error": "ambiguous_slot_selection",
-                "message": "Ask whether they want the first time or the second.",
+                "message": (
+                    "The caller has not clearly named one offered time yet. Ask "
+                    "naturally which of the two works - 'the first time or the "
+                    "second?' - and NEVER mention formats, systems, or tools."
+                ),
             }
         selected = offered[slot_id]
         self._selected_slot_id = slot_id
