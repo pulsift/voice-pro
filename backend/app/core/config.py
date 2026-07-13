@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     APP_NAME: str = "Voice Pro API"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
+    # Structlog level override ("DEBUG"|"INFO"|"WARNING"...). Without it, prod
+    # (DEBUG=False) filters to WARNING and telephony INFO (greeting, gate,
+    # wait_for_user) is invisible - which has repeatedly slowed live debugging.
+    LOG_LEVEL: str | None = None
     API_V1_PREFIX: str = "/api/v1"
 
     # Server
