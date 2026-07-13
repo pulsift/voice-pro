@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     # newer Realtime model without another code change.
     OPENAI_REALTIME_MODEL: str = "gpt-realtime-2025-08-28"
     OPENAI_REALTIME_REASONING_EFFORT: str | None = None
+    # Telephony turn-detection (server VAD). Noisy PSTN routes commit noise bursts
+    # as phantom caller turns at the default sensitivity; raise the threshold via
+    # env without a code change. Defaults preserve prior hardcoded behaviour.
+    REALTIME_VAD_THRESHOLD: float = 0.6
+    REALTIME_VAD_PREFIX_PADDING_MS: int = 300
+    REALTIME_VAD_SILENCE_DURATION_MS: int = 700
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 

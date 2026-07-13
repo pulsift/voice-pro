@@ -348,13 +348,14 @@ class GPTRealtimeSession:
                 "input": {
                     "format": {"type": "audio/pcmu"},
                     "transcription": {"model": "whisper-1"},
-                    # Less eager turn-taking so it stops cutting the caller off:
-                    # wait ~0.7s of silence before responding, slightly higher threshold.
+                    # Less eager turn-taking so it stops cutting the caller off.
+                    # Env-tunable: noisy PSTN routes need a higher threshold so
+                    # line noise can't commit phantom caller turns.
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.6,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 700,
+                        "threshold": settings.REALTIME_VAD_THRESHOLD,
+                        "prefix_padding_ms": settings.REALTIME_VAD_PREFIX_PADDING_MS,
+                        "silence_duration_ms": settings.REALTIME_VAD_SILENCE_DURATION_MS,
                     },
                 },
                 "output": {
