@@ -1,7 +1,6 @@
+# ruff: noqa: T201, PLR0912 - CLI eval tool: prints ARE the interface; the
+# event-drain switch is intentionally one loop.
 """Two-AI conversational eval for the voice agent - no phone, no human.
-
-ruff: noqa: T201, PLR0912
-(CLI eval tool: prints ARE the interface; the event-drain switch is one loop.)
 
 Plays the CALLER by text against the production prompt + model + the REAL
 booking gate (CRMTools with a faked Cal.com calendar and neutralized
