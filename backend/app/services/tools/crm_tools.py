@@ -148,12 +148,23 @@ class CRMTools:
             "eleven": 11,
             "twelve": 12,
         }
+        # "one" doubles as a pronoun ("the morning one") - only count it as an
+        # hour in a time context. Other number words are safe bare.
+        one_as_hour = (
+            r"\b(?:at|around|about|for)\s+one\b"
+            r"|\bone\s+o'?clock\b"
+            r"|\bone\s+(?:in|at|pm|am)\b"
+        )
         for word, hour in word_hours.items():
-            if re.search(rf"\b{word}\b", text):
-                # Spoken bare hours have no AM/PM. Match both halves of the day;
-                # the offered-slot set must still reduce this to exactly one slot.
-                time_matches.add((hour % MAX_12_HOUR, 0))
-                time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
+            if word == "one":
+                if not re.search(one_as_hour, text):
+                    continue
+            elif not re.search(rf"\b{word}\b", text):
+                continue
+            # Spoken bare hours have no AM/PM. Match both halves of the day;
+            # the offered-slot set must still reduce this to exactly one slot.
+            time_matches.add((hour % MAX_12_HOUR, 0))
+            time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
         # Bare DIGIT hours ("at 1", "around 10") - transcription often writes
         # digits, not words. Same both-halves treatment as spoken word hours.
         for match in re.finditer(
@@ -199,7 +210,16 @@ class CRMTools:
             )
             if re.search(rf"\b{name}\b", text)
         }
-        if not time_matches and not day_names:
+        # Day-part references ("the morning one", "the afternoon slot") are how
+        # people naturally answer when the two times are re-offered by name.
+        periods: list[tuple[int, int]] = []
+        if re.search(r"\bmorning\b", text):
+            periods.append((0, 12))
+        if re.search(r"\bafternoon\b", text):
+            periods.append((12, 18))
+        if re.search(r"\bevening\b|\btonight\b", text):
+            periods.append((17, 24))
+        if not time_matches and not day_names and not periods:
             return set()
 
         zone = ZoneInfo(self._normalized_timezone or "UTC")
@@ -211,7 +231,10 @@ class CRMTools:
             local_start = start.astimezone(zone)
             time_ok = not time_matches or (local_start.hour, local_start.minute) in time_matches
             day_ok = not day_names or local_start.strftime("%A").lower() in day_names
-            if time_ok and day_ok:
+            period_ok = not periods or any(
+                lo <= local_start.hour < hi for lo, hi in periods
+            )
+            if time_ok and day_ok and period_ok:
                 candidates.add(slot["slot_id"])
         return candidates
 
@@ -223,7 +246,12 @@ class CRMTools:
             return {
                 "success": False,
                 "error": "selection_not_heard",
-                "message": "Ask whether they want the first time or the second.",
+                "message": (
+                    "Wait for the caller to answer. Re-offer the two times BY NAME "
+                    "if needed ('was that the Tuesday at ten, or the one in the "
+                    "afternoon?') - never say 'first or second', never mention "
+                    "formats, systems, or tools."
+                ),
             }
         offered = {slot["slot_id"]: slot for slot in self._offered_slots}
         candidates = self._utterance_slot_candidates()
@@ -232,9 +260,10 @@ class CRMTools:
                 "success": False,
                 "error": "ambiguous_slot_selection",
                 "message": (
-                    "The caller has not clearly named one offered time yet. Ask "
-                    "naturally which of the two works - 'the first time or the "
-                    "second?' - and NEVER mention formats, systems, or tools."
+                    "The caller has not clearly named one offered time yet. Re-offer "
+                    "the two times BY NAME, naturally ('was that the Tuesday at ten, "
+                    "or the one in the afternoon?') - never say 'first or second', "
+                    "never mention formats, systems, or tools."
                 ),
             }
         selected = offered[slot_id]

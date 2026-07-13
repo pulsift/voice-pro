@@ -177,6 +177,39 @@ async def test_bare_digit_hour_and_dotted_meridiem_select_a_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_day_part_answers_select_the_matching_slot() -> None:
+    """'The morning one' / 'the afternoon' are natural answers when the two
+    times are re-offered by name (the ordinal question is banned)."""
+    tools = make_tools()
+    slots = [
+        {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},  # 10:00 +03
+        {"start": "2026-07-14T10:00:00Z", "label": "Tuesday 1:00 PM"},  # 13:00 +03
+    ]
+    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+        await tools.check_availability(time_zone="Asia/Damascus")
+
+    tools.observe_user_utterance("Let's do the morning one.")
+    assert (await tools.select_slot("slot_1"))["success"] is True
+
+    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+        await tools.check_availability(time_zone="Asia/Damascus")
+    tools.observe_user_utterance("The afternoon works better for me.")
+    assert (await tools.select_slot("slot_2"))["success"] is True
+
+    # Two morning slots -> a day-part answer alone must stay ambiguous.
+    morning_slots = [
+        {"start": "2026-07-14T05:00:00Z", "label": "Tuesday 8:00 AM"},
+        {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},
+    ]
+    with patch(
+        "app.services.calcom_client.get_business_slots", AsyncMock(return_value=morning_slots)
+    ):
+        await tools.check_availability(time_zone="Asia/Damascus")
+    tools.observe_user_utterance("the morning one")
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
 async def test_bare_digit_still_ambiguous_when_it_matches_both_slots() -> None:
     tools = make_tools()
     slots = [

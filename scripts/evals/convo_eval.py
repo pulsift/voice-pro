@@ -81,6 +81,11 @@ FORBIDDEN_SPOKEN = (
     "system needs",
     "the system",
     "timestamp",
+    # Sami's rule: nobody says "the first time or the second?" on a real call -
+    # the agent must re-offer the two times by name instead.
+    "first time or the second",
+    "the first or the second",
+    "first option or",
 )
 
 BOOKED_CLAIMS = ("booked", "you're set", "you are set", "locked in")
@@ -322,7 +327,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "Go ahead, why not.",
             "Damascus.",
             "Yeah.",
-            "The first time please.",
+            "The morning one.",
             "Commercial solar mainly, hundred kilowatts minimum.",
             "Just Texas.",
             "Great, sounds good, bye.",
