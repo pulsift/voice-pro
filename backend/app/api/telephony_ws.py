@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import user_id_to_uuid
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallRecord, CallStatus
@@ -520,6 +521,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
     async def realtime_to_twilio() -> None:  # noqa: PLR0912, PLR0915
         """Forward audio from GPT Realtime to Twilio."""
         nonlocal should_end_call
+        greeting_fallback_task: asyncio.Task[None] | None = None
 
         try:
             if not realtime_session.connection:
@@ -529,7 +531,12 @@ async def _handle_twilio_stream(  # noqa: PLR0915
             log.info("realtime_to_twilio_started", waiting_for_events=True)
             event_count = 0
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
-            greeting_triggered = False  # Track if we've triggered the greeting
+
+            async def _greeting_fallback() -> None:
+                # Callee-speaks-first: only greet if the answerer stays silent.
+                await asyncio.sleep(settings.REALTIME_GREETING_FALLBACK_SECONDS)
+                if await realtime_session.trigger_initial_greeting():
+                    log.info("initial_greeting_triggered_by_silence_fallback")
 
             async for event in realtime_session.connection:
                 event_type = event.type
@@ -539,13 +546,17 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 if event_count <= EVENT_LOG_THRESHOLD or event_count % 100 == 0:
                     log.info("realtime_event_received", event_type=event_type, count=event_count)
 
-                # Trigger initial greeting after session is configured
-                # This avoids race condition where audio events arrive before listener is ready
-                if event_type == "session.updated" and not greeting_triggered:
-                    greeting_triggered = True
-                    triggered = await realtime_session.trigger_initial_greeting()
-                    if triggered:
-                        log.info("initial_greeting_triggered_after_session_update")
+                # Callee-speaks-first: arm the silent-answerer fallback once the
+                # session is configured; the caller's own speech disarms it.
+                if event_type == "session.updated" and greeting_fallback_task is None:
+                    greeting_fallback_task = asyncio.create_task(_greeting_fallback())
+                    log.info("greeting_fallback_armed")
+
+                elif event_type == "input_audio_buffer.speech_started":
+                    if realtime_session.consume_pending_greeting():
+                        log.info("caller_spoke_first_prompt_greeting_active")
+                    if greeting_fallback_task and not greeting_fallback_task.done():
+                        greeting_fallback_task.cancel()
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -651,13 +662,15 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 elif event_type in [
                     "response.audio.done",
                     "response.output_audio.done",
-                    "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                 ]:
                     log.debug("realtime_event", event_type=event_type)
 
         except Exception as e:
             log.exception("realtime_to_twilio_error", error=str(e))
+        finally:
+            if greeting_fallback_task and not greeting_fallback_task.done():
+                greeting_fallback_task.cancel()
 
     await _run_bridge_tasks(
         twilio_to_realtime,
@@ -906,9 +919,10 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
         except Exception as e:
             log.exception("telnyx_to_realtime_error", error=str(e))
 
-    async def realtime_to_telnyx() -> None:  # noqa: PLR0912
+    async def realtime_to_telnyx() -> None:  # noqa: PLR0912, PLR0915
         """Forward audio from GPT Realtime to Telnyx."""
         nonlocal should_end_call
+        greeting_fallback_task: asyncio.Task[None] | None = None
 
         try:
             if not realtime_session.connection:
@@ -916,18 +930,27 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                 return
 
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
-            greeting_triggered = False  # Track if we've triggered the greeting
+
+            async def _greeting_fallback() -> None:
+                # Callee-speaks-first: only greet if the answerer stays silent.
+                await asyncio.sleep(settings.REALTIME_GREETING_FALLBACK_SECONDS)
+                if await realtime_session.trigger_initial_greeting():
+                    log.info("initial_greeting_triggered_by_silence_fallback")
 
             async for event in realtime_session.connection:
                 event_type = event.type
 
-                # Trigger initial greeting after session is configured
-                # This avoids race condition where audio events arrive before listener is ready
-                if event_type == "session.updated" and not greeting_triggered:
-                    greeting_triggered = True
-                    triggered = await realtime_session.trigger_initial_greeting()
-                    if triggered:
-                        log.info("initial_greeting_triggered_after_session_update")
+                # Callee-speaks-first: arm the silent-answerer fallback once the
+                # session is configured; the caller's own speech disarms it.
+                if event_type == "session.updated" and greeting_fallback_task is None:
+                    greeting_fallback_task = asyncio.create_task(_greeting_fallback())
+                    log.info("greeting_fallback_armed")
+
+                elif event_type == "input_audio_buffer.speech_started":
+                    if realtime_session.consume_pending_greeting():
+                        log.info("caller_spoke_first_prompt_greeting_active")
+                    if greeting_fallback_task and not greeting_fallback_task.done():
+                        greeting_fallback_task.cancel()
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -999,13 +1022,15 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                 elif event_type in [
                     "response.audio.done",
                     "response.output_audio.done",
-                    "input_audio_buffer.speech_started",
                     "input_audio_buffer.speech_stopped",
                 ]:
                     log.debug("realtime_event", event_type=event_type)
 
         except Exception as e:
             log.exception("realtime_to_telnyx_error", error=str(e))
+        finally:
+            if greeting_fallback_task and not greeting_fallback_task.done():
+                greeting_fallback_task.cancel()
 
     await _run_bridge_tasks(
         telnyx_to_realtime,

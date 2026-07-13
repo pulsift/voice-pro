@@ -253,3 +253,36 @@ async def test_wait_for_user_executes_as_noop() -> None:
     result = await registry.execute_tool("wait_for_user", {})
     assert result["success"] is True
     assert "action" not in result  # must not trigger telephony actions
+
+
+def test_caller_speech_consumes_pending_greeting_once() -> None:
+    """Callee-speaks-first: the caller's first words disarm the fallback so it
+    can never double-greet; with no pending greeting nothing is consumed."""
+    session = make_session()
+    session._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
+    assert session.consume_pending_greeting() is True
+    assert session.consume_pending_greeting() is False  # already consumed
+
+    fresh = make_session()
+    assert fresh.consume_pending_greeting() is False  # nothing pending
+
+
+@pytest.mark.asyncio
+async def test_greeting_fallback_closes_gate_and_is_single_shot() -> None:
+    """The silent-answerer fallback protects its greeting with the input gate
+    and refuses to fire once the caller has spoken."""
+    session = _make_session_with_connection()
+    session.connection.input_audio_buffer.clear = AsyncMock()
+    session._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
+
+    assert await session.trigger_initial_greeting() is True
+    assert session._input_gate_open is False  # noqa: SLF001 - greeting playing
+    session.connection.response.create.assert_awaited_once()
+
+    assert await session.trigger_initial_greeting() is False  # single shot
+
+    spoken_first = _make_session_with_connection()
+    spoken_first._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
+    spoken_first.consume_pending_greeting()
+    assert await spoken_first.trigger_initial_greeting() is False
+    assert spoken_first._input_gate_open is True  # noqa: SLF001 - never closed

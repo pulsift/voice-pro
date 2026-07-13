@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     # Optional input noise reduction ("near_field" | "far_field"). Filters audio
     # before VAD and the model — cuts phantom turns from line noise on PSTN.
     REALTIME_INPUT_NOISE_REDUCTION: str | None = None
+    # Callee-speaks-first greeting: how long to wait for the answerer's "hello?"
+    # before the agent greets a silent line anyway.
+    REALTIME_GREETING_FALLBACK_SECONDS: float = 5.0
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 

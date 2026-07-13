@@ -386,15 +386,17 @@ class GPTRealtimeSession:
                 tool_count=len(tools),
             )
 
-            # Store initial greeting for later - triggered after event loop starts
-            # to avoid race condition where audio events arrive before listener is ready
+            # Callee-speaks-first design: the agent stays QUIET on connect and the
+            # caller's own "hello?" triggers the model's first response (the prompt
+            # supplies the greeting line). The stored greeting is only a FALLBACK
+            # for silent answerers, fired by a timer in the telephony loop - so the
+            # inbound gate stays OPEN here (there is no greeting response to protect
+            # yet; the fallback closes it itself when it fires).
             initial_greeting = self.agent_config.get("initial_greeting")
             if initial_greeting:
                 self._pending_initial_greeting = initial_greeting
-                # Close the inbound-audio gate until the greeting finishes.
-                self._input_gate_open = False
                 self.logger.info(
-                    "initial_greeting_pending",
+                    "initial_greeting_pending_callee_first",
                     greeting=initial_greeting[:50],
                 )
         except Exception as e:
@@ -546,11 +548,24 @@ class GPTRealtimeSession:
 
         return result
 
-    async def trigger_initial_greeting(self) -> bool:
-        """Trigger the initial greeting if one is pending.
+    def consume_pending_greeting(self) -> bool:
+        """The caller spoke first - the prompt supplies the greeting organically.
 
-        This should be called AFTER the event listener has started to avoid
-        race conditions where audio events arrive before the listener is ready.
+        Disarms the silent-answerer fallback so it can never double-greet.
+        Returns True if a pending greeting was consumed.
+        """
+        if self._pending_initial_greeting and not self._greeting_triggered:
+            self._greeting_triggered = True
+            self.logger.info("greeting_fallback_disarmed_caller_spoke_first")
+            return True
+        return False
+
+    async def trigger_initial_greeting(self) -> bool:
+        """FALLBACK ONLY: greet a silent answerer (or voicemail) after a timer.
+
+        The normal path is callee-speaks-first - the caller's own "hello?"
+        triggers the model's first response and the prompt supplies the
+        greeting line. This fires only when nobody has spoken.
 
         Returns:
             True if greeting was triggered, False if no greeting pending or already triggered
@@ -565,9 +580,13 @@ class GPTRealtimeSession:
         self._greeting_triggered = True
         greeting = self._pending_initial_greeting
 
-        self.logger.info("triggering_initial_greeting", greeting=greeting[:50])
+        self.logger.info("triggering_initial_greeting_fallback", greeting=greeting[:50])
 
         try:
+            # Protect the greeting while it plays: drop caller audio until its
+            # response.done (or an error) reopens the gate - same mechanism as
+            # before, now scoped to the fallback path only.
+            self._input_gate_open = False
             # Clear any buffered input audio to prevent line noise from
             # triggering VAD and cancelling the greeting response
             await self.connection.input_audio_buffer.clear()
@@ -593,6 +612,7 @@ class GPTRealtimeSession:
             return True
         except Exception as e:
             self.logger.exception("initial_greeting_failed", error=str(e))
+            self.open_input_gate()  # fail-open: never leave the caller unheard
             return False
 
     def open_input_gate(self) -> None:
