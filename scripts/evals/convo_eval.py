@@ -1,5 +1,8 @@
 """Two-AI conversational eval for the voice agent - no phone, no human.
 
+ruff: noqa: T201, PLR0912
+(CLI eval tool: prints ARE the interface; the event-drain switch is one loop.)
+
 Plays the CALLER by text against the production prompt + model + the REAL
 booking gate (CRMTools with a faked Cal.com calendar and neutralized
 fulfilment webhook). Runs scripted caller scenarios and asserts hard
@@ -127,7 +130,7 @@ def install_fakes() -> None:
                 return_value={"success": False, "category": "not_found", "status_code": 200}
             )
         if hasattr(module, "schedule_fulfilment_webhook"):
-            module.schedule_fulfilment_webhook = lambda payload: None
+            module.schedule_fulfilment_webhook = lambda _payload: None
 
 
 def load_instructions(prompt_file: Path) -> str:
@@ -425,7 +428,7 @@ async def run_scenario(
                     mid(convo, violations)
                 if convo.ended:
                     break
-        except Exception as e:  # noqa: BLE001 - a broken run is a scenario failure
+        except Exception as e:  # a broken run is a scenario failure, not a crash
             violations.append(f"run error: {e}")
     check_common(convo, violations)
     spec["final"](convo, violations)
