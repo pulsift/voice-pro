@@ -309,6 +309,13 @@ def check_not_booked(convo: Conversation, violations: list[str]) -> None:
         violations.append("call not ended with end_call")
 
 
+def check_booked_no_wednesday(convo: Conversation, violations: list[str]) -> None:
+    check_booked(convo, violations)
+    for text in convo.assistant_texts:
+        if re.search(r"\bwednesday at\b", text.lower()):
+            violations.append(f"invented a Wednesday time: {text[:100]!r}")
+
+
 def check_garbled_line(convo: Conversation, violations: list[str]) -> None:
     categories = [a.get("category") for a in convo.crm.get_booking_attempts()]
     if "selected" in categories or "created" in categories:
@@ -358,27 +365,42 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         },
     },
     "wednesday_probe": {
+        # Rules-mode: the caller answers whatever the agent actually asked, so
+        # legitimate question re-ordering between prompt versions can't desync
+        # the conversation. Rules are checked in order; each reply used once.
+        "rules": [
+            (r"ten.*\bone\b|\bone\b.*ten|which (suits|works|one)", [
+                "Have you got anything on Wednesday instead?",
+                "Alright then let's do the Tuesday at one.",
+                "The Tuesday at one in the afternoon.",
+            ]),
+            (r"timezone|which city", ["Damascus time."]),
+            (r"audit|includ", ["Sure, include it."]),
+            (r"okay time|caught you|good time|okay moment", ["Yes, fine."]),
+            (r"solar work|smallest|mainly|kind of work", ["Ground mount, fifty kilowatts and up."]),
+            (r"states|areas|cover", ["Nevada."]),
+            (r"you're set|invite|anything else", ["Perfect, thanks, bye."]),
+            (r".", ["Okay.", "Go ahead."]),
+        ],
+        "final": check_booked_no_wednesday,
+    },
+    "recovering_pick": {
+        # Live call 7: a cut-off answer followed by a CLEAR one must select and
+        # book - the bad-line bailout must not fire (clear answers reset it,
+        # and the caller's Wednesday question is engagement, not failure).
         "turns": [
             "Hello?",
-            "Yes, speaking.",
-            "Fine, sure.",
-            "Damascus time.",
-            "Have you got anything on Wednesday instead?",
-            "Alright then let's do the Tuesday at one.",
-            "Ground mount, fifty kilowatts and up.",
-            "Nevada.",
-            "Thanks, bye.",
+            "Yeah, now works.",
+            "Sure, include it.",
+            "I'm in the Syrian time zone.",
+            "Do you have anything on Wednesday?",
+            "Let's go for Tuesday on",
+            "Tuesday at one.",
+            "Rooftop residential, fifty kilowatts minimum.",
+            "Texas.",
+            "Perfect, bye!",
         ],
         "final": check_booked,
-        "mid_checks": {
-            4: lambda convo, violations: (
-                violations.append("invented a Wednesday time")
-                if re.search(
-                    r"wednesday at|on wednesday we (have|do)", convo.assistant_texts[-1].lower()
-                )
-                else None
-            ),
-        },
     },
     "garbled_line": {
         # Live call 6: side-conversation / Whisper noise-hallucinations commit
@@ -443,6 +465,37 @@ def get_api_key() -> str:
     return value
 
 
+MAX_RULES_STEPS = 20
+
+
+async def drive_rules_caller(convo: Conversation, spec: dict[str, Any]) -> None:
+    """Adaptive caller: answer whatever the agent actually asked (rules-mode)."""
+    await convo.caller_says(spec.get("opening", "Hello?"))
+    rules = [
+        {"pattern": re.compile(pattern, re.IGNORECASE), "replies": list(replies)}
+        for pattern, replies in spec["rules"]
+    ]
+    for _ in range(MAX_RULES_STEPS):
+        if convo.ended:
+            return
+        said_since_caller: list[str] = []
+        for event in reversed(convo.events):
+            if event[0] == "caller":
+                break
+            if event[0] == "assistant":
+                said_since_caller.append(event[1])
+        agent_said = " ".join(reversed(said_since_caller))
+        reply = None
+        for rule in rules:
+            if rule["replies"] and rule["pattern"].search(agent_said):
+                reply = rule["replies"].pop(0)
+                break
+        if reply is None:
+            return
+        await asyncio.sleep(INTER_TURN_SLEEP_SECONDS)
+        await convo.caller_says(reply)
+
+
 async def run_scenario(
     client: AsyncOpenAI, instructions: str, name: str, spec: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -461,14 +514,17 @@ async def run_scenario(
         )
         convo = Conversation(connection, crm)
         try:
-            for index, turn in enumerate(spec["turns"]):
-                await asyncio.sleep(INTER_TURN_SLEEP_SECONDS)  # keep under the TPM limit
-                await convo.caller_says(turn)
-                mid = spec.get("mid_checks", {}).get(index)
-                if mid:
-                    mid(convo, violations)
-                if convo.ended:
-                    break
+            if "rules" in spec:
+                await drive_rules_caller(convo, spec)
+            else:
+                for index, turn in enumerate(spec["turns"]):
+                    await asyncio.sleep(INTER_TURN_SLEEP_SECONDS)  # keep under the TPM limit
+                    await convo.caller_says(turn)
+                    mid = spec.get("mid_checks", {}).get(index)
+                    if mid:
+                        mid(convo, violations)
+                    if convo.ended:
+                        break
         except Exception as e:  # a broken run is a scenario failure, not a crash
             violations.append(f"run error: {e}")
     check_common(convo, violations)
