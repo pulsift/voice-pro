@@ -32,6 +32,10 @@ logger = structlog.get_logger()
 # Constants for event logging
 EVENT_LOG_THRESHOLD = 20  # Log first N events, then every 100th
 
+# Twilio sends connected + start immediately after the stream opens; if start never
+# arrives the call is dead — don't hold the socket (and a DB session) open forever.
+TWILIO_START_EVENT_TIMEOUT_SECONDS = 15.0
+
 _TERMINAL_CALL_STATUSES = {
     CallStatus.COMPLETED.value,
     CallStatus.FAILED.value,
@@ -317,7 +321,7 @@ async def _run_bridge_tasks(
 
 
 @router.websocket("/twilio/{agent_id}")
-async def twilio_media_stream(  # noqa: PLR0915
+async def twilio_media_stream(  # noqa: PLR0912, PLR0915
     websocket: WebSocket,
     agent_id: str,
     db: AsyncSession = Depends(get_db),
@@ -347,6 +351,39 @@ async def twilio_media_stream(  # noqa: PLR0915
     call_sid: str = ""
 
     try:
+        # Twilio strips query strings from <Stream> URLs, so per-call context (cv,
+        # workspace_id) arrives as TwiML <Parameter> values inside the start event's
+        # customParameters. Consume frames up to and including start BEFORE building
+        # the session; media frames buffer in the socket meanwhile (same as before,
+        # when session setup also preceded the read loop).
+        custom_params: dict[str, str] = {}
+        while True:
+            pre_start_raw = await asyncio.wait_for(
+                websocket.receive_text(), timeout=TWILIO_START_EVENT_TIMEOUT_SECONDS
+            )
+            pre_start = json.loads(pre_start_raw)
+            pre_event = pre_start.get("event", "")
+            if pre_event == "start":
+                start_data = pre_start.get("start", {})
+                stream_sid = start_data.get("streamSid", "")
+                call_sid = start_data.get("callSid", "")
+                raw_params = start_data.get("customParameters") or {}
+                if isinstance(raw_params, dict):
+                    custom_params = {str(k): str(v) for k, v in raw_params.items()}
+                log.info(
+                    "twilio_stream_started",
+                    stream_sid=stream_sid,
+                    call_sid=call_sid,
+                    custom_param_keys=list(custom_params.keys()),
+                )
+                break
+            if pre_event == "connected":
+                log.info("twilio_stream_connected")
+            elif pre_event == "stop":
+                log.info("twilio_stream_stopped_before_start")
+                return
+            # anything else pre-start (unexpected) is ignored
+
         # Load agent configuration
         result = await db.execute(select(Agent).where(Agent.id == uuid.UUID(agent_id)))
         agent = result.scalar_one_or_none()
@@ -371,7 +408,7 @@ async def twilio_media_stream(  # noqa: PLR0915
         try:
             workspace_id = await resolve_media_workspace_id(
                 agent.id,
-                websocket.query_params.get("workspace_id"),
+                custom_params.get("workspace_id") or websocket.query_params.get("workspace_id"),
                 db,
             )
         except ValueError as exc:
@@ -389,10 +426,12 @@ async def twilio_media_stream(  # noqa: PLR0915
             "initial_greeting": agent.initial_greeting,
         }
 
-        # Per-call lead/offer variables (base64 JSON in ?cv=) — personalize the prompt +
-        # fill the Cal.com booking attendee. Mirrors the Telnyx media stream.
+        # Per-call lead/offer variables (base64 JSON) — personalize the prompt + fill
+        # the Cal.com booking attendee. Primary channel: start-event customParameters
+        # (<Parameter> survives Twilio's query-string stripping); query param kept as
+        # fallback for inbound/legacy streams. Telnyx keeps its query-param path.
         call_variables: dict[str, Any] = {}
-        cv = websocket.query_params.get("cv")
+        cv = custom_params.get("cv") or websocket.query_params.get("cv")
         if cv:
             try:
                 padded = cv + "=" * (-len(cv) % 4)  # tolerate unpadded base64url
@@ -422,12 +461,14 @@ async def twilio_media_stream(  # noqa: PLR0915
             workspace_id=workspace_id,
             variables=call_variables,
         ) as realtime_session:
-            # Handle Twilio media stream and capture call_sid
+            # Handle Twilio media stream (start already consumed above — seed its ids)
             call_sid = await _handle_twilio_stream(
                 websocket=websocket,
                 realtime_session=realtime_session,
                 log=log,
                 enable_transcript=agent.enable_transcript,
+                stream_sid=stream_sid,
+                call_sid=call_sid,
             )
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
@@ -458,6 +499,8 @@ async def _handle_twilio_stream(  # noqa: PLR0915
     realtime_session: GPTRealtimeSession,
     log: Any,
     enable_transcript: bool = False,
+    stream_sid: str = "",
+    call_sid: str = "",
 ) -> str:
     """Handle Twilio Media Stream messages.
 
@@ -466,12 +509,12 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         realtime_session: GPT Realtime session
         log: Logger instance
         enable_transcript: Whether to capture transcript
+        stream_sid: Stream SID when the start event was already consumed by the caller
+        call_sid: Call SID when the start event was already consumed by the caller
 
     Returns:
         The call_sid for transcript saving
     """
-    stream_sid = ""
-    call_sid = ""
     should_end_call = False  # Flag to signal call should end
 
     async def twilio_to_realtime() -> None:

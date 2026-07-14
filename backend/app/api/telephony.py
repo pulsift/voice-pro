@@ -1207,8 +1207,15 @@ async def twilio_answer_webhook(
     if query_parts:
         stream_url = f"{stream_url}?{'&'.join(query_parts)}"
 
+    # Twilio strips the query string off <Stream> URLs, so cv/workspace_id must ALSO
+    # travel as TwiML <Parameter> values (arrive in the start event's customParameters).
+    # The query params above stay as a harmless fallback for older in-flight calls.
     twilio_service = TwilioService("", "")
-    twiml = twilio_service.generate_answer_response(stream_url, agent_id)
+    twiml = twilio_service.generate_answer_response(
+        stream_url,
+        agent_id,
+        custom_parameters={"cv": cv, "workspace_id": workspace_id},
+    )
 
     return Response(content=twiml, media_type="application/xml")
 
