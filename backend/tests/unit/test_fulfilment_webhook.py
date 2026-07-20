@@ -1,8 +1,11 @@
-"""Focused contracts for fulfilment webhook dispatch idempotency."""
+"""Focused contracts for fulfilment webhook dispatch idempotency and signing."""
 
 # ruff: noqa: SLF001 - these tests intentionally verify module-private dispatch state.
 
 import asyncio
+import hashlib
+import hmac
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +26,8 @@ def make_http_context(*statuses: int) -> tuple[MagicMock, MagicMock]:
 @pytest.fixture(autouse=True)
 def reset_dispatch_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "FULFIL_WEBHOOK_URL", "https://fulfilment.test")
+    monkeypatch.setattr(settings, "FULFIL_WEBHOOK_SECRET", None)
+    monkeypatch.setattr(fulfilment_webhook, "_warned_unsigned", False)
     fulfilment_webhook._scheduled_booking_ids.clear()
     fulfilment_webhook._background_tasks.clear()
 
@@ -96,6 +101,51 @@ async def test_retryable_status_can_recover(retryable_status: int) -> None:
 
     assert result is True
     assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_signature_header_covers_the_exact_bytes_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "FULFIL_WEBHOOK_SECRET", "webhook-secret")
+    context, client = make_http_context(200)
+    payload = {"booking_id": "signed-1", "email": "lead@example.com"}
+
+    with patch("app.services.fulfilment_webhook.httpx.AsyncClient", return_value=context):
+        result = await fulfilment_webhook._post_with_retries(
+            "https://fulfilment.test/fulfil", payload
+        )
+
+    assert result is True
+    _, kwargs = client.post.await_args
+    body = kwargs["content"]
+    expected = hmac.new(b"webhook-secret", body, hashlib.sha256).hexdigest()
+    assert kwargs["headers"]["X-Fulfil-Signature"] == f"sha256={expected}"
+    assert kwargs["headers"]["Content-Type"] == "application/json"
+    assert json.loads(body) == payload
+
+
+@pytest.mark.asyncio
+async def test_unset_secret_sends_unsigned_and_warns_once() -> None:
+    context, client = make_http_context(200, 200)
+
+    with (
+        patch("app.services.fulfilment_webhook.httpx.AsyncClient", return_value=context),
+        patch.object(fulfilment_webhook.logger, "warning") as warning,
+    ):
+        await fulfilment_webhook._post_with_retries(
+            "https://fulfilment.test/fulfil", {"booking_id": "unsigned-1"}
+        )
+        await fulfilment_webhook._post_with_retries(
+            "https://fulfilment.test/fulfil", {"booking_id": "unsigned-2"}
+        )
+
+    for call in client.post.await_args_list:
+        assert "X-Fulfil-Signature" not in call.kwargs["headers"]
+    unsigned_warnings = [
+        call for call in warning.call_args_list if call.args[0] == "fulfil_webhook_unsigned"
+    ]
+    assert len(unsigned_warnings) == 1
 
 
 @pytest.mark.asyncio

@@ -8,9 +8,17 @@ wanted for this environment) this is a silent no-op.
 Idempotency is the RECEIVER's responsibility, keyed on `booking_id` (the Cal.com
 booking uid, globally unique) which is always present in the payload — a retried
 or duplicated delivery carries the same booking_id so the receiver can dedupe.
+
+Authenticity: when FULFIL_WEBHOOK_SECRET is configured, every POST carries
+`X-Fulfil-Signature: sha256=<hex>` — an HMAC-SHA256 over the raw JSON body bytes —
+so the fulfilment service can reject forged requests (S1). Unset secret = send
+unsigned as before, with a one-time warning.
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import time
 from typing import Any
 
@@ -41,6 +49,31 @@ _background_tasks: set[asyncio.Task[bool]] = set()
 # idempotency authority.
 _scheduled_booking_ids: dict[str, float] = {}
 
+# Warn only once per process when the outbound webhook goes out unsigned.
+_warned_unsigned = False
+
+
+def _signed_request_parts(payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
+    """Serialize the payload once and sign those exact bytes (raw-bytes HMAC).
+
+    The signature must cover the bytes actually sent, so the body is serialized
+    here rather than delegated to httpx's `json=` re-serialization.
+    """
+    global _warned_unsigned
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    secret = settings.FULFIL_WEBHOOK_SECRET
+    if secret:
+        digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        headers["X-Fulfil-Signature"] = f"sha256={digest}"
+    elif not _warned_unsigned:
+        _warned_unsigned = True
+        logger.warning(
+            "fulfil_webhook_unsigned",
+            reason="FULFIL_WEBHOOK_SECRET unset - sending without X-Fulfil-Signature",
+        )
+    return body, headers
+
 
 async def _post_with_retries(url: str, payload: dict[str, Any]) -> bool:
     """POST payload, returning whether delivery reached a terminal outcome.
@@ -49,11 +82,12 @@ async def _post_with_retries(url: str, payload: dict[str, Any]) -> bool:
     5xx, and transport failures are retried and return False when exhausted.
     """
     log = logger.bind(component="fulfilment_webhook", booking_id=payload.get("booking_id"))
+    body, headers = _signed_request_parts(payload)
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, content=body, headers=headers)
             if _HTTP_SUCCESS_MIN <= resp.status_code < _HTTP_SUCCESS_MAX:
                 log.info("fulfil_webhook_delivered", status=resp.status_code, attempt=attempt)
                 return True

@@ -149,7 +149,12 @@ class Settings(BaseSettings):
     # fire-and-forget POST to f"{FULFIL_WEBHOOK_URL}/fulfil" with the booking + ICP
     # payload so the fulfilment service can build the lead-magnet list. Unset = skip
     # silently (no fulfilment service deployed yet / not wanted for this environment).
+    # When FULFIL_WEBHOOK_SECRET is set, the POST body is signed with
+    # X-Fulfil-Signature: sha256=<HMAC-SHA256 hex over the raw JSON bytes> so the
+    # fulfilment service can reject forged requests. Unset = send unsigned (legacy)
+    # with a one-time warning.
     FULFIL_WEBHOOK_URL: str | None = None
+    FULFIL_WEBHOOK_SECRET: str | None = None
 
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls
