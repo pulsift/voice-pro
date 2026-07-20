@@ -119,6 +119,11 @@ class CallRecord(Base):
         nullable=True,
         comment="Sanitized Cal.com booking-attempt diagnostics captured during the call",
     )
+    variables: Mapped[dict[str, object] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Per-call lead/offer variables supplied at dial time (outbound calls)",
+    )
 
     # Timestamps
     started_at: Mapped[datetime] = mapped_column(

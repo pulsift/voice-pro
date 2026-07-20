@@ -156,6 +156,15 @@ class Settings(BaseSettings):
     FULFIL_WEBHOOK_URL: str | None = None
     FULFIL_WEBHOOK_SECRET: str | None = None
 
+    # Call-ended event sink (optional; B4). When CALL_EVENTS_URL is set, every call
+    # that reaches a terminal state POSTs a signed JSON event to
+    # f"{CALL_EVENTS_URL}/webhooks/call-ended" so the reply-router can advance the
+    # lead's post-call status machine. Signed with X-VoicePro-Signature:
+    # sha256=<HMAC-SHA256 hex over the raw JSON bytes> keyed by CALL_EVENTS_SECRET.
+    # Unset URL = disabled.
+    CALL_EVENTS_URL: str | None = None
+    CALL_EVENTS_SECRET: str | None = None
+
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls
     OPENAI_TIMEOUT: float = 30.0  # LLM inference can be slow

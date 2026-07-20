@@ -30,6 +30,7 @@ from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
 from app.models.workspace import AgentWorkspace, Workspace
+from app.services.call_events import schedule_call_ended_event
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import TwilioService
 
@@ -915,6 +916,9 @@ async def initiate_call(  # noqa: PLR0915
         status=CallStatus.INITIATED.value,
         from_number=call_request.from_number,
         to_number=call_request.to_number,
+        # Persisted so the terminal call-ended event can echo the lead context back
+        # to the reply-router even from the bare status-callback path.
+        variables=call_request.variables or None,
     )
     db.add(call_record)
     await db.commit()
@@ -1164,6 +1168,14 @@ async def twilio_status_callback(
 
         await db.commit()
         log.info("call_record_updated", record_id=str(call_record.id), status=call_status)
+
+        # B4: a terminal carrier status is the authoritative "what happened after
+        # the call" moment — emit the (guarded, single-shot) call-ended event.
+        if (
+            call_record.direction == CallDirection.OUTBOUND.value
+            and call_record.status in _TERMINAL_CALL_STATUSES
+        ):
+            schedule_call_ended_event(call_record)
     else:
         log.warning("call_record_not_found", call_sid=call_sid)
 
@@ -1464,6 +1476,14 @@ async def telnyx_status_callback(
             record_id=str(call_record.id),
             lifecycle_event=event_type,
         )
+
+        # B4: a terminal carrier status is the authoritative "what happened after
+        # the call" moment — emit the (guarded, single-shot) call-ended event.
+        if (
+            call_record.direction == CallDirection.OUTBOUND.value
+            and call_record.status in _TERMINAL_CALL_STATUSES
+        ):
+            schedule_call_ended_event(call_record)
     else:
         log.warning(
             "call_record_not_found_or_ambiguous",

@@ -35,6 +35,7 @@ for _m in pkgutil.iter_modules(app.models.__path__):
 # nullable so it is safe to run on every deploy.
 COLUMN_RECONCILE = (
     ("call_records", "booking_attempts", "JSON"),
+    ("call_records", "variables", "JSON"),
 )
 
 

@@ -22,8 +22,9 @@ from app.core.auth import user_id_to_uuid
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.call_record import CallRecord, CallStatus
+from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.workspace import AgentWorkspace
+from app.services.call_events import FALLBACK_DELAY_SECONDS, schedule_call_ended_event
 from app.services.gpt_realtime import GPTRealtimeSession
 
 router = APIRouter(prefix="/ws/telephony", tags=["telephony-ws"])
@@ -177,7 +178,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
     workspace_id: uuid.UUID | None = None,
     provider: str | None = None,
     expected_to_number: str | None = None,
-) -> None:
+) -> CallRecord | None:
     """Save transcript and sanitized booking diagnostics to the call record.
 
     Args:
@@ -191,10 +192,14 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
         workspace_id: Workspace UUID required to scope fallback matching
         provider: Telephony provider required to scope fallback matching
         expected_to_number: Destination number, when known, for fallback matching
+
+    Returns:
+        The matched call record (artifacts now merged), or None when no
+        unambiguous record was found.
     """
     if not transcript.strip() and booking_attempts is None:
         log.debug("empty_call_artifacts_skipped")
-        return
+        return None
 
     call_record: CallRecord | None = None
     exact_match_ambiguous = False
@@ -282,6 +287,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
         )
     else:
         log.warning("call_record_not_found_for_artifacts", call_sid=call_sid)
+    return call_record
 
 
 async def _run_bridge_tasks(
@@ -474,7 +480,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_sid:
                 transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
-                await save_transcript_to_call_record(
+                call_record = await save_transcript_to_call_record(
                     call_sid,
                     transcript,
                     db,
@@ -485,6 +491,13 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                     workspace_id=workspace_id,
                     provider="twilio",
                 )
+                # B4 fallback: if the terminal status callback never arrives, still
+                # emit one call-ended event after a grace period (the callback path
+                # wins the single-shot guard when it does arrive).
+                if call_record is not None and call_record.direction == (
+                    CallDirection.OUTBOUND.value
+                ):
+                    schedule_call_ended_event(call_record, delay_seconds=FALLBACK_DELAY_SECONDS)
 
     except WebSocketDisconnect:
         log.info("twilio_websocket_disconnected")
@@ -732,7 +745,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
 
 @router.websocket("/telnyx/{agent_id}")
-async def telnyx_media_stream(  # noqa: PLR0915
+async def telnyx_media_stream(  # noqa: PLR0912, PLR0915
     websocket: WebSocket,
     agent_id: str,
     db: AsyncSession = Depends(get_db),
@@ -879,7 +892,7 @@ async def telnyx_media_stream(  # noqa: PLR0915
             if call_control_id:
                 await update_media_lifecycle_safely(call_control_id, ended=True)
                 transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
-                await save_transcript_to_call_record(
+                call_record = await save_transcript_to_call_record(
                     call_control_id,
                     transcript,
                     db,
@@ -891,6 +904,13 @@ async def telnyx_media_stream(  # noqa: PLR0915
                     provider="telnyx",
                     expected_to_number=expected_to_number,
                 )
+                # B4 fallback: if the terminal status callback never arrives, still
+                # emit one call-ended event after a grace period (the callback path
+                # wins the single-shot guard when it does arrive).
+                if call_record is not None and call_record.direction == (
+                    CallDirection.OUTBOUND.value
+                ):
+                    schedule_call_ended_event(call_record, delay_seconds=FALLBACK_DELAY_SECONDS)
 
     except WebSocketDisconnect:
         log.info("telnyx_websocket_disconnected")
