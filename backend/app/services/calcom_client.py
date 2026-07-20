@@ -148,8 +148,10 @@ async def get_business_slots(
 
     Pulls Cal.com availability for the configured event type starting tomorrow,
     then filters to weekdays inside [BOOKING_HOUR_START, BOOKING_HOUR_END) in the
-    TEAM timezone (so we never offer out-of-hours slots even if the Cal.com schedule
-    is permissive), and returns one slot per day for variety.
+    LEAD's timezone (so a US lead is never offered middle-of-the-night times just
+    because they fall inside the team's day), and returns one slot per day for
+    variety. Only when no valid lead timezone is known does the window fall back
+    to the team timezone.
 
     Each item: {"start": <original ISO for booking>, "label": <human label in lead tz>}.
     """
@@ -159,14 +161,14 @@ async def get_business_slots(
     end = (now + timedelta(days=days)).strftime("%Y-%m-%d")
 
     # Validate the lead timezone up front; fall back to the team tz so an invalid
-    # tzName can't 400 the slots request.
-    team_tz = ZoneInfo(settings.BOOKING_TEAM_TIMEZONE)
+    # tzName can't 400 the slots request (and the business-hours window below then
+    # evaluates in the team timezone as the only remaining anchor).
     try:
         lead_zone = ZoneInfo(lead_tz)
     except Exception:
         log.warning("invalid_lead_tz_falling_back", lead_tz=lead_tz)
         lead_tz = settings.BOOKING_TEAM_TIMEZONE
-        lead_zone = team_tz
+        lead_zone = ZoneInfo(lead_tz)
 
     headers = {
         "Authorization": f"Bearer {settings.CALCOM_API_KEY}",
@@ -199,16 +201,18 @@ async def get_business_slots(
             if not iso:
                 continue
             dt = _parse_iso(iso)
-            team_dt = dt.astimezone(team_tz)
-            if team_dt.weekday() >= SATURDAY_INDEX:  # Sat/Sun
+            # Evaluate the business-hours window in the LEAD's local time — the same
+            # clock the slot is spoken in — never the team's (B3).
+            local_dt = dt.astimezone(lead_zone)
+            if local_dt.weekday() >= SATURDAY_INDEX:  # Sat/Sun
                 continue
-            h = team_dt.hour
+            h = local_dt.hour
             if not (settings.BOOKING_HOUR_START <= h < settings.BOOKING_HOUR_END):
                 continue
             entry = {
                 "start": iso,
                 # Day + time only — no date (the caller found the spoken date pointless).
-                "label": dt.astimezone(lead_zone).strftime("%A %I:%M %p").replace(" 0", " "),
+                "label": local_dt.strftime("%A %I:%M %p").replace(" 0", " "),
             }
             if MORNING_START_HOUR <= h < NOON_HOUR and morning is None:
                 morning = entry

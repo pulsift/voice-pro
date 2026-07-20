@@ -137,8 +137,10 @@ class Settings(BaseSettings):
     # when configured; otherwise the agent falls back to the internal calendar).
     CALCOM_API_KEY: str | None = None
     CALCOM_EVENT_TYPE_ID: int | None = None
-    # Business-hours guardrail for offered slots (team-local), applied in-tool so we
-    # never offer out-of-hours times even if the Cal.com schedule is permissive.
+    # Business-hours guardrail for offered slots: the allowed LOCAL-hours window for
+    # the lead, applied in-tool so we never offer out-of-hours times even if the
+    # Cal.com schedule is permissive. Evaluated in the caller's timezone; the team
+    # timezone is only the fallback anchor when no valid lead timezone is known.
     BOOKING_TEAM_TIMEZONE: str = "Europe/Stockholm"
     BOOKING_HOUR_START: int = 8
     BOOKING_HOUR_END: int = 20
