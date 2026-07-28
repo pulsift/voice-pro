@@ -1,11 +1,19 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   Dialog,
@@ -39,6 +47,17 @@ interface SmsMessage {
   received_at: string | null;
   created_at: string;
 }
+
+interface SendablePhoneNumber {
+  id: string;
+  phone_number: string;
+  friendly_name: string | null;
+  provider: string;
+  can_send_sms: boolean;
+  status: string;
+}
+
+const FROM_NUMBER_KEY = "sms-from-number";
 
 function formatPhone(n: string | null): string {
   if (!n) return "—";
@@ -79,6 +98,46 @@ export default function MessagesPage() {
   const [composeOpen, setComposeOpen] = useState(false);
   const [newTo, setNewTo] = useState("");
   const [newBody, setNewBody] = useState("");
+  const [fromNumber, setFromNumber] = useState<string>("");
+  const draftRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const { data: sendableNumbers = [] } = useQuery<SendablePhoneNumber[]>({
+    queryKey: ["sms-from-numbers"],
+    queryFn: async () => {
+      const res = (await api.get("/api/v1/phone-numbers?page_size=100")).data;
+      const nums: SendablePhoneNumber[] = res.phone_numbers ?? [];
+      // SMS sending currently runs through Telnyx only (backend TelnyxSMSTools) —
+      // offering a non-Telnyx number here would 502 at send time.
+      return nums.filter(
+        (n) => n.can_send_sms && n.status === "active" && n.provider === "telnyx"
+      );
+    },
+  });
+
+  // Default the from-number: last used (localStorage), else first sendable.
+  useEffect(() => {
+    if (fromNumber || sendableNumbers.length === 0) return;
+    const saved = localStorage.getItem(FROM_NUMBER_KEY);
+    const match = sendableNumbers.find((n) => n.phone_number === saved);
+    const fallback = sendableNumbers[0]?.phone_number ?? "";
+    setFromNumber(match ? match.phone_number : fallback);
+  }, [sendableNumbers, fromNumber]);
+
+  const pickFromNumber = (value: string) => {
+    setFromNumber(value);
+    localStorage.setItem(FROM_NUMBER_KEY, value);
+  };
+
+  const numberLabel = (n: SendablePhoneNumber) =>
+    n.friendly_name && n.friendly_name !== n.phone_number
+      ? `${formatPhone(n.phone_number)} · ${n.friendly_name}`
+      : `${formatPhone(n.phone_number)} · ${n.provider}`;
+
+  const autoGrow = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
 
   const { data: conversations = [], isLoading: convLoading } = useQuery<Conversation[]>({
     queryKey: ["sms-conversations"],
@@ -98,7 +157,7 @@ export default function MessagesPage() {
   });
 
   const sendMutation = useMutation({
-    mutationFn: async (vars: { to: string; body: string }) =>
+    mutationFn: async (vars: { to: string; body: string; from_number?: string }) =>
       (await api.post("/api/v1/sms/send", vars)).data,
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["sms-thread", selected] });
@@ -123,15 +182,20 @@ export default function MessagesPage() {
 
   const handleSend = () => {
     if (!selected || !draft.trim()) return;
-    sendMutation.mutate({ to: selected, body: draft.trim() });
+    sendMutation.mutate({
+      to: selected,
+      body: draft.trim(),
+      from_number: fromNumber || undefined,
+    });
     setDraft("");
+    autoGrow(draftRef.current);
   };
 
   const handleCompose = () => {
     const to = newTo.trim();
     if (!to || !newBody.trim()) return;
     sendMutation.mutate(
-      { to, body: newBody.trim() },
+      { to, body: newBody.trim(), from_number: fromNumber || undefined },
       {
         onSuccess: () => {
           setComposeOpen(false);
@@ -229,6 +293,9 @@ export default function MessagesPage() {
                   <div className="truncate text-sm font-semibold">{titleFor(activeConvo)}</div>
                   <div className="text-xs text-muted-foreground">
                     {formatPhone(activeConvo.contact_number)}
+                    {activeConvo.our_number && (
+                      <span> · via {formatPhone(activeConvo.our_number)}</span>
+                    )}
                   </div>
                 </div>
                 <Button
@@ -290,29 +357,53 @@ export default function MessagesPage() {
               </div>
 
               {/* Composer */}
-              <div className="flex items-center gap-2 border-t p-3">
-                <Input
-                  placeholder="Type a message…"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSend();
-                    }
-                  }}
-                />
-                <Button
-                  size="icon"
-                  onClick={handleSend}
-                  disabled={!draft.trim() || sendMutation.isPending}
-                >
-                  {sendMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Send className="h-4 w-4" />
-                  )}
-                </Button>
+              <div className="space-y-2 border-t p-3">
+                <div className="flex items-center gap-2">
+                  <span className="shrink-0 text-xs text-muted-foreground">From</span>
+                  <Select value={fromNumber} onValueChange={pickFromNumber}>
+                    <SelectTrigger className="h-8 w-auto min-w-[220px] text-xs">
+                      <SelectValue placeholder="Pick a number…" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {sendableNumbers.map((n) => (
+                        <SelectItem key={n.id} value={n.phone_number} className="text-xs">
+                          {numberLabel(n)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex items-end gap-2">
+                  <Textarea
+                    ref={draftRef}
+                    rows={1}
+                    placeholder="Type a message… (Shift+Enter for a new line)"
+                    className="max-h-40 min-h-9 resize-none overflow-y-auto"
+                    value={draft}
+                    onChange={(e) => {
+                      setDraft(e.target.value);
+                      autoGrow(e.currentTarget);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSend();
+                      }
+                    }}
+                  />
+                  <Button
+                    size="icon"
+                    className="shrink-0"
+                    onClick={handleSend}
+                    disabled={!draft.trim() || sendMutation.isPending}
+                  >
+                    {sendMutation.isPending ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
               </div>
             </>
           )}
@@ -383,6 +474,21 @@ export default function MessagesPage() {
           </DialogHeader>
           <div className="space-y-3 py-2">
             <div className="space-y-1">
+              <Label>From</Label>
+              <Select value={fromNumber} onValueChange={pickFromNumber}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Pick a number…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {sendableNumbers.map((n) => (
+                    <SelectItem key={n.id} value={n.phone_number}>
+                      {numberLabel(n)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
               <Label htmlFor="to">To (E.164)</Label>
               <Input
                 id="to"
@@ -393,11 +499,16 @@ export default function MessagesPage() {
             </div>
             <div className="space-y-1">
               <Label htmlFor="body">Message</Label>
-              <Input
+              <Textarea
                 id="body"
+                rows={4}
+                className="max-h-60 resize-none overflow-y-auto"
                 value={newBody}
-                onChange={(e) => setNewBody(e.target.value)}
-                placeholder="Type a message…"
+                onChange={(e) => {
+                  setNewBody(e.target.value);
+                  autoGrow(e.currentTarget);
+                }}
+                placeholder="Type a message… (Shift+Enter for a new line)"
               />
             </div>
           </div>
