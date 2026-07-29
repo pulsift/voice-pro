@@ -31,6 +31,7 @@ from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
 from app.models.workspace import AgentWorkspace, Workspace
 from app.services.call_events import schedule_call_ended_event
+from app.services.telephony import recording_policy
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import TwilioService
 
@@ -368,6 +369,23 @@ def select_outbound_provider(
     if pref == "telnyx":
         return "telnyx" if has_telnyx else ("twilio" if has_twilio else None)
     return "twilio" if has_twilio else ("telnyx" if has_telnyx else None)
+
+
+def resolve_recording_flag(*, agent_enabled: bool, to_number: str) -> tuple[bool, str | None, str]:
+    """Decide whether this outbound call may be recorded.
+
+    Three independent gates, ALL of which must agree:
+      1. `settings.CALL_RECORDING_ENABLED` — the platform-wide kill switch.
+      2. `agent_enabled` (Agent.enable_recording) — the operator's intent.
+      3. The legal-consent policy — one-party-consent US states only, fail-safe OFF
+         for unknown area codes, US territories and non-US numbers.
+
+    Returns `(record, consent_state, consent_reason)` so the caller can log WHY a
+    recording was or wasn't made without re-deriving the state.
+    """
+    consent_allowed, consent_state, consent_reason = recording_policy.recording_decision(to_number)
+    record = bool(settings.CALL_RECORDING_ENABLED) and agent_enabled and consent_allowed
+    return record, consent_state, consent_reason
 
 
 async def get_agent_by_phone_number(phone_number: str, db: AsyncSession) -> Agent | None:
@@ -903,6 +921,28 @@ async def initiate_call(  # noqa: PLR0915
         cv = base64.urlsafe_b64encode(_json.dumps(call_request.variables).encode()).decode()
         webhook_url = f"{webhook_url}&cv={cv}"
 
+    # Recording gate: the (previously dead) per-agent toggle ANDed with the legal
+    # consent policy, under a platform-wide kill switch. All three must agree.
+    # getattr keeps the safe default (no recording) if the attribute is ever absent.
+    agent_wants_recording = bool(getattr(agent, "enable_recording", False))
+    record_flag, consent_state, consent_reason = resolve_recording_flag(
+        agent_enabled=agent_wants_recording, to_number=call_request.to_number
+    )
+    log.info(
+        "call_recording_decision",
+        record=record_flag,
+        agent_enabled=agent_wants_recording,
+        platform_enabled=bool(settings.CALL_RECORDING_ENABLED),
+        consent_state=consent_state,
+        consent_reason=consent_reason,
+    )
+    if agent_wants_recording and not record_flag:
+        log.warning(
+            "call_recording_denied_by_policy",
+            consent_state=consent_state,
+            consent_reason=consent_reason,
+        )
+
     # Commit a correlation row BEFORE dialing (both providers). An immediate status
     # callback can then reconcile by the unique pending From/To record instead of
     # being lost in the POST-before-record race.
@@ -923,14 +963,27 @@ async def initiate_call(  # noqa: PLR0915
     db.add(call_record)
     await db.commit()
 
-    service = telnyx_service if provider == "telnyx" else twilio_service
+    # Recording is a Twilio-only capability, so it is passed on the concrete Twilio
+    # branch rather than through the abstract provider contract.
+    recording_callback_url = f"{base_url}/webhooks/twilio/recording" if record_flag else None
     try:
-        call_info = await service.initiate_call(
-            to_number=call_request.to_number,
-            from_number=call_request.from_number,
-            webhook_url=webhook_url,
-            agent_id=call_request.agent_id,
-        )
+        if provider == "twilio" and twilio_service is not None:
+            call_info = await twilio_service.initiate_call(
+                to_number=call_request.to_number,
+                from_number=call_request.from_number,
+                webhook_url=webhook_url,
+                agent_id=call_request.agent_id,
+                record=record_flag,
+                recording_callback_url=recording_callback_url,
+            )
+        else:
+            service = telnyx_service if provider == "telnyx" else twilio_service
+            call_info = await service.initiate_call(  # type: ignore[union-attr]
+                to_number=call_request.to_number,
+                from_number=call_request.from_number,
+                webhook_url=webhook_url,
+                agent_id=call_request.agent_id,
+            )
     except Exception as exc:
         # Telnyx-only: an unknown dial outcome must NOT be marked failed (the call may
         # still be live); surface it and let reconciliation settle the record.
@@ -1230,6 +1283,57 @@ async def twilio_answer_webhook(
     )
 
     return Response(content=twiml, media_type="application/xml")
+
+
+@webhook_router.post("/twilio/recording")
+async def twilio_recording_callback(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    recording_sid: str = Form(default="", alias="RecordingSid"),
+    recording_url: str = Form(default="", alias="RecordingUrl"),
+    recording_status: str = Form(default="", alias="RecordingStatus"),
+    call_sid: str = Form(default="", alias="CallSid"),
+) -> dict[str, str]:
+    """Persist the recording URL once Twilio finishes writing the file.
+
+    Fired by ``recording_status_callback`` (event: completed). This is the only
+    moment the recording URL becomes knowable, so it is the only place
+    ``CallRecord.recording_url`` is written.
+
+    Always answers 200 -- an unknown CallSid is logged, not raised, because a 4xx/5xx
+    here makes Twilio retry the same dead callback repeatedly for no gain.
+    """
+    # Validate Twilio signature
+    await verify_twilio_webhook(request)
+
+    log = logger.bind(
+        webhook="twilio_recording",
+        call_sid=call_sid,
+        recording_sid=recording_sid,
+        recording_status=recording_status,
+    )
+    log.info("twilio_recording_callback")
+
+    if not call_sid or not recording_url:
+        log.warning("twilio_recording_callback_incomplete")
+        return {"status": "ignored"}
+
+    result = await db.execute(select(CallRecord).where(CallRecord.provider_call_id == call_sid))
+    call_record = result.scalar_one_or_none()
+
+    if not call_record:
+        # Never make Twilio retry-spam: acknowledge, log, move on.
+        log.warning("call_record_not_found_for_recording", call_sid=call_sid)
+        return {"status": "ignored"}
+
+    # Twilio's RecordingUrl is extension-less; appending ".mp3" is the documented way
+    # to request the compressed audio rather than raw WAV.
+    call_record.recording_url = f"{recording_url}.mp3"
+    await db.commit()
+
+    log.info("call_recording_saved", record_id=str(call_record.id))
+
+    return {"status": "received"}
 
 
 # =============================================================================

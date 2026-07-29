@@ -36,6 +36,10 @@ class TwilioService(TelephonyProvider):
         from_number: str,
         webhook_url: str,
         agent_id: str | None = None,
+        *,
+        record: bool = False,
+        recording_callback_url: str | None = None,
+        **_kwargs: object,
     ) -> CallInfo:
         """Initiate an outbound call via Twilio.
 
@@ -44,6 +48,13 @@ class TwilioService(TelephonyProvider):
             from_number: Source phone number (E.164 format)
             webhook_url: URL for TwiML instructions when call connects
             agent_id: Optional agent ID for context
+            record: Record the call. The caller is responsible for having already
+                cleared this against the per-agent toggle AND the legal-consent
+                policy (see services.telephony.recording_policy) -- this layer
+                does not second-guess it, it only wires the Twilio parameters.
+            recording_callback_url: URL Twilio POSTs to when the recording is
+                ready (the only place the recording URL becomes knowable).
+            **_kwargs: Ignored; keeps the provider contract forward-compatible.
 
         Returns:
             CallInfo with call details
@@ -54,19 +65,30 @@ class TwilioService(TelephonyProvider):
             from_=from_number,
             webhook_url=webhook_url,
             agent_id=agent_id,
+            record=record,
         )
 
         # Build callback URLs
         status_callback = webhook_url.replace("/answer", "/status")
 
-        call = self.client.calls.create(
-            to=to_number,
-            from_=from_number,
-            url=webhook_url,
-            status_callback=status_callback,
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-            status_callback_method="POST",
-        )
+        create_params: dict[str, object] = {
+            "to": to_number,
+            "from_": from_number,
+            "url": webhook_url,
+            "status_callback": status_callback,
+            "status_callback_event": ["initiated", "ringing", "answered", "completed"],
+            "status_callback_method": "POST",
+        }
+
+        if record:
+            # Dual channel keeps the agent and the lead on separate tracks, which is
+            # what makes the recording usable for review/QA rather than a mono blur.
+            create_params["record"] = True
+            create_params["recording_channels"] = "dual"
+            create_params["recording_status_callback"] = recording_callback_url
+            create_params["recording_status_callback_event"] = ["completed"]
+
+        call = self.client.calls.create(**create_params)
 
         self.logger.info("call_initiated", call_sid=call.sid)
 

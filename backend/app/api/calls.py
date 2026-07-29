@@ -43,6 +43,9 @@ class CallRecordResponse(BaseModel):
     recording_url: str | None
     transcript: str | None
     booking_attempts: list[dict[str, object]]
+    # Per-call lead/offer variables (outbound dials) - lets the dashboard show who
+    # the call was for, and carries the AMD verdict under "amd".
+    variables: dict[str, object]
     started_at: datetime
     answered_at: datetime | None
     ended_at: datetime | None
@@ -171,6 +174,7 @@ async def list_calls(
                 recording_url=record.recording_url,
                 transcript=record.transcript,
                 booking_attempts=record.booking_attempts or [],
+                variables=record.variables if isinstance(record.variables, dict) else {},
                 started_at=record.started_at,
                 answered_at=record.answered_at,
                 ended_at=record.ended_at,
@@ -248,6 +252,7 @@ async def get_call(
         recording_url=record.recording_url,
         transcript=record.transcript,
         booking_attempts=record.booking_attempts or [],
+        variables=record.variables if isinstance(record.variables, dict) else {},
         started_at=record.started_at,
         answered_at=record.answered_at,
         ended_at=record.ended_at,

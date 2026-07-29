@@ -66,6 +66,13 @@ class TelephonyProvider(ABC):
     ) -> CallInfo:
         """Initiate an outbound call.
 
+        This is the LOWEST COMMON DENOMINATOR every provider must support.
+        Implementations may accept additional keyword-only parameters with
+        defaults (a widening, so the contract still holds) for provider-specific
+        capabilities -- e.g. TwilioService adds ``record`` /
+        ``recording_callback_url``. Callers that use those extras must do so on a
+        concrete provider branch, never through this abstract type.
+
         Args:
             to_number: Destination phone number (E.164 format)
             from_number: Source phone number (E.164 format)

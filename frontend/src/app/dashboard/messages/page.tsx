@@ -106,10 +106,13 @@ export default function MessagesPage() {
     queryFn: async () => {
       const res = (await api.get("/api/v1/phone-numbers?page_size=100")).data;
       const nums: SendablePhoneNumber[] = res.phone_numbers ?? [];
-      // SMS sending currently runs through Telnyx only (backend TelnyxSMSTools) —
-      // offering a non-Telnyx number here would 502 at send time.
+      // The backend routes the send by the from-number's provider (Telnyx REST
+      // or the Twilio SDK), so both are offerable here.
       return nums.filter(
-        (n) => n.can_send_sms && n.status === "active" && n.provider === "telnyx"
+        (n) =>
+          n.can_send_sms &&
+          n.status === "active" &&
+          (n.provider === "telnyx" || n.provider === "twilio")
       );
     },
   });

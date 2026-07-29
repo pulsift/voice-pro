@@ -3,8 +3,13 @@
 Telnyx delivers inbound SMS by webhook only (no native inbox). This stores both
 inbound (`message.received`) and outbound (sent here) messages, groups them into
 per-number conversations, lets you send replies, and name numbers via contacts.
+
+Outbound sends are routed by the *from* number's provider: Telnyx numbers go out
+over the Telnyx REST API, Twilio numbers over the Twilio REST SDK. Both persist
+into the same `sms_messages` table so the thread view stays provider-agnostic.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -13,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from twilio.base.exceptions import TwilioException, TwilioRestException
+from twilio.rest import Client
 
 from app.api.settings import get_user_api_keys
 from app.core.auth import CurrentUser, user_id_to_uuid
@@ -27,6 +34,11 @@ from app.services.tools.sms_tools import TelnyxSMSTools
 router = APIRouter(prefix="/api/v1/sms", tags=["sms"])
 webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 logger = structlog.get_logger()
+
+# Providers this API can actually send through. Anything else on a phone-number
+# row is a config error and is rejected with a 400 (never a 500 at send time).
+SMS_SEND_PROVIDERS = ("telnyx", "twilio")
+DEFAULT_SMS_PROVIDER = "telnyx"
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -46,14 +58,103 @@ async def _resolve_telnyx_api_key(user_id: int, db: AsyncSession) -> str | None:
     return key
 
 
+async def _resolve_twilio_credentials(
+    user_id: int, db: AsyncSession
+) -> tuple[str | None, str | None]:
+    """Resolve Twilio creds: user-level settings, else the platform env creds."""
+    user_uuid = user_id_to_uuid(user_id)
+    user_settings = await get_user_api_keys(user_uuid, db, workspace_id=None)
+    account_sid = (
+        user_settings.twilio_account_sid if user_settings else None
+    ) or settings.TWILIO_ACCOUNT_SID
+    auth_token = (
+        user_settings.twilio_auth_token if user_settings else None
+    ) or settings.TWILIO_AUTH_TOKEN
+    return account_sid, auth_token
+
+
 async def _default_from_number(db: AsyncSession) -> str | None:
-    """Pick a default 'from' number (a registered Telnyx number that can send SMS)."""
-    row = await db.scalar(
-        select(PhoneNumber)
-        .where(PhoneNumber.provider == "telnyx", PhoneNumber.can_send_sms.is_(True))
-        .order_by(desc(PhoneNumber.created_at))
-    )
-    return row.phone_number if row else None
+    """Pick a default 'from' number (a registered number that can send SMS).
+
+    Telnyx is preferred (historical default); Twilio is used when no SMS-capable
+    Telnyx number is registered.
+    """
+    for provider in SMS_SEND_PROVIDERS:
+        row = await db.scalar(
+            select(PhoneNumber)
+            .where(PhoneNumber.provider == provider, PhoneNumber.can_send_sms.is_(True))
+            .order_by(desc(PhoneNumber.created_at))
+        )
+        if row:
+            return row.phone_number
+    return None
+
+
+async def _provider_for_number(from_number: str, db: AsyncSession) -> str:
+    """Which provider owns this 'from' number (defaults to Telnyx if unregistered)."""
+    row = await db.scalar(select(PhoneNumber).where(PhoneNumber.phone_number == from_number))
+    provider = (row.provider if row else None) or DEFAULT_SMS_PROVIDER
+    provider = provider.lower()
+    if provider not in SMS_SEND_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported SMS provider '{provider}' for number {from_number}",
+        )
+    return provider
+
+
+async def _send_via_telnyx(
+    user_id: int, db: AsyncSession, from_number: str, to: str, body: str
+) -> dict[str, Any]:
+    """Send over Telnyx. Returns the tools' {success, message_id, error} shape."""
+    api_key = await _resolve_telnyx_api_key(user_id, db)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No Telnyx API key configured")
+
+    tools = TelnyxSMSTools(api_key=api_key, from_number=from_number)
+    try:
+        return await tools.send_sms(to=to, body=body)
+    finally:
+        await tools.close()
+
+
+async def _send_via_twilio(
+    user_id: int, db: AsyncSession, from_number: str, to: str, body: str
+) -> dict[str, Any]:
+    """Send over the Twilio REST SDK, mirroring the Telnyx result shape.
+
+    The Twilio SDK is synchronous, so the network call runs in a worker thread.
+    REST errors are folded into {"success": False, "error": ...} so the caller
+    returns the same HTTP error the Telnyx path does (never a bare 500).
+    """
+    account_sid, auth_token = await _resolve_twilio_credentials(user_id, db)
+    if not (account_sid and auth_token):
+        raise HTTPException(status_code=400, detail="No Twilio credentials configured")
+
+    client = Client(account_sid, auth_token)
+    try:
+        message = await asyncio.to_thread(
+            client.messages.create, to=to, from_=from_number, body=body
+        )
+    except TwilioRestException as e:
+        logger.warning(
+            "sms_twilio_send_failed", status=e.status, code=e.code, error=e.msg or str(e)
+        )
+        detail = e.msg or str(e)
+        if e.code:
+            detail = f"{detail} (Twilio error {e.code})"
+        return {"success": False, "error": detail}
+    except TwilioException as e:
+        logger.warning("sms_twilio_send_failed", error=str(e))
+        return {"success": False, "error": str(e)}
+
+    return {
+        "success": True,
+        "message_id": message.sid,
+        "to": to,
+        "from": from_number,
+        "status": getattr(message, "status", None),
+    }
 
 
 # =============================================================================
@@ -251,26 +352,23 @@ async def send_sms(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> SmsMessageResponse:
-    """Send an SMS via Telnyx and store it as an outbound message in the thread."""
-    api_key = await _resolve_telnyx_api_key(current_user.id, db)
-    if not api_key:
-        raise HTTPException(status_code=400, detail="No Telnyx API key configured")
-
+    """Send an SMS (Telnyx or Twilio, by the from-number's provider) and store it."""
     from_number = payload.from_number or await _default_from_number(db)
     if not from_number:
-        raise HTTPException(status_code=400, detail="No SMS-capable Telnyx number available")
+        raise HTTPException(status_code=400, detail="No SMS-capable phone number available")
 
-    tools = TelnyxSMSTools(api_key=api_key, from_number=from_number)
-    try:
-        result = await tools.send_sms(to=payload.to, body=payload.body)
-    finally:
-        await tools.close()
+    provider = await _provider_for_number(from_number, db)
+
+    if provider == "twilio":
+        result = await _send_via_twilio(current_user.id, db, from_number, payload.to, payload.body)
+    else:
+        result = await _send_via_telnyx(current_user.id, db, from_number, payload.to, payload.body)
 
     if not result.get("success"):
         raise HTTPException(status_code=502, detail=result.get("error", "Send failed"))
 
     msg = SmsMessage(
-        provider="telnyx",
+        provider=provider,
         provider_message_id=result.get("message_id"),
         direction="outbound",
         from_number=from_number,
@@ -280,7 +378,7 @@ async def send_sms(
     )
     db.add(msg)
     await db.commit()
-    logger.info("sms_outbound_sent", to=payload.to, from_number=from_number)
+    logger.info("sms_outbound_sent", to=payload.to, from_number=from_number, provider=provider)
     return _to_message_response(msg)
 
 

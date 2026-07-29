@@ -133,6 +133,14 @@ class Settings(BaseSettings):
     TWILIO_FROM_NUMBER: str | None = None
     TELEPHONY_OUTBOUND_PROVIDER: str = "twilio"
 
+    # Call recording. Three gates must ALL be true before a call is recorded:
+    #   1. CALL_RECORDING_ENABLED (this platform-wide kill switch)
+    #   2. Agent.enable_recording (the per-agent operator toggle)
+    #   3. recording_policy.recording_allowed(to_number) (the legal-consent gate:
+    #      one-party-consent US states only, fail-safe OFF on anything unknown)
+    # Flip this to False to stop all recording immediately without touching agents.
+    CALL_RECORDING_ENABLED: bool = True
+
     # Cal.com booking (used by the voice agent's check_availability / book_appointment
     # when configured; otherwise the agent falls back to the internal calendar).
     CALCOM_API_KEY: str | None = None
@@ -164,6 +172,23 @@ class Settings(BaseSettings):
     # Unset URL = disabled.
     CALL_EVENTS_URL: str | None = None
     CALL_EVENTS_SECRET: str | None = None
+
+    # Public transcript share links (B2). The backend's own public origin, used to
+    # build the shareable transcript URL carried in the call-ended event
+    # (f"{base}/api/public/transcripts/{share_token}"). Falls back to PUBLIC_URL —
+    # the same origin the telephony webhooks already point at — so production needs
+    # no new env var. With neither set the transcript URL is simply None.
+    PUBLIC_BASE_URL: str | None = None
+    # How long a transcript (and its share token + recording URL) survives before
+    # the daily retention sweep nulls it. Share links die with the data.
+    TRANSCRIPT_RETENTION_DAYS: int = 30
+
+    # Answering-machine detection (C2). The callee's FIRST utterance on a call is
+    # classified by a cheap chat model; a voicemail/IVR verdict hangs up instead of
+    # pitching a recording. Biased toward "human" on purpose: a false machine hangs
+    # up on a real prospect, a false human only wastes a few seconds.
+    AMD_ENABLED: bool = True
+    AMD_MODEL: str = "gpt-4o-mini"
 
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls

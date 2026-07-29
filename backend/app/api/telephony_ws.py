@@ -20,10 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import user_id_to_uuid
 from app.core.config import settings
+from app.core.public_id import generate_public_id
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.workspace import AgentWorkspace
+from app.services.amd import MACHINE_VERDICTS, classify_greeting
 from app.services.call_events import FALLBACK_DELAY_SECONDS, schedule_call_ended_event
 from app.services.gpt_realtime import GPTRealtimeSession
 
@@ -44,6 +46,9 @@ _TERMINAL_CALL_STATUSES = {
     CallStatus.NO_ANSWER.value,
     CallStatus.CANCELED.value,
 }
+
+# Length of the base62 secret behind a public transcript link (B2).
+SHARE_TOKEN_LENGTH = 16
 
 
 async def get_agent_workspace_id(agent_id: uuid.UUID, db: AsyncSession) -> uuid.UUID | None:
@@ -167,6 +172,55 @@ async def update_telnyx_media_lifecycle(
     )
 
 
+def _merge_call_artifacts(
+    call_record: CallRecord,
+    transcript: str,
+    booking_attempts: list[dict[str, Any]] | None,
+    amd_verdict: str | None,
+) -> bool:
+    """Merge call artifacts onto the record in place; return whether anything changed.
+
+    Also mints the transcript's share token (B2): a transcript with no share link
+    is a transcript nobody reads. Minted once and never rotated — the link stays
+    stable until the retention sweep nulls it along with the transcript itself.
+    """
+    changed = False
+
+    existing_transcript = (call_record.transcript or "").strip()
+    incoming_transcript = transcript.strip()
+    if incoming_transcript and len(incoming_transcript) > len(existing_transcript):
+        call_record.transcript = transcript
+        changed = True
+
+    if booking_attempts is not None:
+        existing_attempts = list(call_record.booking_attempts or [])
+        merged_attempts = [dict(attempt) for attempt in existing_attempts]
+        for attempt in booking_attempts:
+            if attempt not in merged_attempts:
+                merged_attempts.append(dict(attempt))
+        # An empty incoming list on a record that never had attempts is NOT a
+        # change — writing [] over NULL would dirty the row (and trigger a
+        # commit) on every call that made no booking attempt.
+        if merged_attempts != existing_attempts or (
+            merged_attempts and call_record.booking_attempts != merged_attempts
+        ):
+            call_record.booking_attempts = merged_attempts
+            changed = True
+
+    if amd_verdict:
+        # Rebind (never mutate) so SQLAlchemy sees the JSON column change.
+        existing_variables = call_record.variables if isinstance(call_record.variables, dict) else {}
+        if existing_variables.get("amd") != amd_verdict:
+            call_record.variables = {**existing_variables, "amd": amd_verdict}
+            changed = True
+
+    if (call_record.transcript or "").strip() and not call_record.share_token:
+        call_record.share_token = generate_public_id(prefix="tr", length=SHARE_TOKEN_LENGTH)
+        changed = True
+
+    return changed
+
+
 async def save_transcript_to_call_record(  # noqa: PLR0912
     call_sid: str,
     transcript: str,
@@ -178,6 +232,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
     workspace_id: uuid.UUID | None = None,
     provider: str | None = None,
     expected_to_number: str | None = None,
+    amd_verdict: str | None = None,
 ) -> CallRecord | None:
     """Save transcript and sanitized booking diagnostics to the call record.
 
@@ -192,6 +247,8 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
         workspace_id: Workspace UUID required to scope fallback matching
         provider: Telephony provider required to scope fallback matching
         expected_to_number: Destination number, when known, for fallback matching
+        amd_verdict: Answering-machine verdict for this call (C2), stored under
+            variables["amd"] so downstream consumers can see it was a machine
 
     Returns:
         The matched call record (artifacts now merged), or None when no
@@ -261,21 +318,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
             log.warning("call_record_fallback_not_found")
 
     if call_record:
-        changed = False
-        existing_transcript = (call_record.transcript or "").strip()
-        incoming_transcript = transcript.strip()
-        if incoming_transcript and len(incoming_transcript) > len(existing_transcript):
-            call_record.transcript = transcript
-            changed = True
-        if booking_attempts is not None:
-            existing_attempts = list(call_record.booking_attempts or [])
-            merged_attempts = [dict(attempt) for attempt in existing_attempts]
-            for attempt in booking_attempts:
-                if attempt not in merged_attempts:
-                    merged_attempts.append(dict(attempt))
-            if call_record.booking_attempts != merged_attempts:
-                call_record.booking_attempts = merged_attempts
-                changed = True
+        changed = _merge_call_artifacts(call_record, transcript, booking_attempts, amd_verdict)
         if changed:
             await db.commit()
         log.info(
@@ -468,6 +511,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
             variables=call_variables,
         ) as realtime_session:
             # Handle Twilio media stream (start already consumed above — seed its ids)
+            amd_state: dict[str, str] = {}
             call_sid = await _handle_twilio_stream(
                 websocket=websocket,
                 realtime_session=realtime_session,
@@ -475,6 +519,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                 enable_transcript=agent.enable_transcript,
                 stream_sid=stream_sid,
                 call_sid=call_sid,
+                amd_state=amd_state,
             )
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
@@ -490,6 +535,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                     owner_user_id=user_id_to_uuid(agent.user_id),
                     workspace_id=workspace_id,
                     provider="twilio",
+                    amd_verdict=amd_state.get("verdict"),
                 )
                 # B4 fallback: if the terminal status callback never arrives, still
                 # emit one call-ended event after a grace period (the callback path
@@ -514,6 +560,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
     enable_transcript: bool = False,
     stream_sid: str = "",
     call_sid: str = "",
+    amd_state: dict[str, str] | None = None,
 ) -> str:
     """Handle Twilio Media Stream messages.
 
@@ -524,11 +571,14 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         enable_transcript: Whether to capture transcript
         stream_sid: Stream SID when the start event was already consumed by the caller
         call_sid: Call SID when the start event was already consumed by the caller
+        amd_state: Optional dict the answering-machine verdict is written into
+            (key "verdict") so the caller can persist it after teardown
 
     Returns:
         The call_sid for transcript saving
     """
     should_end_call = False  # Flag to signal call should end
+    amd_result: dict[str, str] = amd_state if amd_state is not None else {}
 
     async def twilio_to_realtime() -> None:
         """Forward audio from Twilio to GPT Realtime."""
@@ -578,6 +628,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         """Forward audio from GPT Realtime to Twilio."""
         nonlocal should_end_call
         greeting_fallback_task: asyncio.Task[None] | None = None
+        amd_task: asyncio.Task[None] | None = None
 
         try:
             if not realtime_session.connection:
@@ -593,6 +644,21 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 await asyncio.sleep(settings.REALTIME_GREETING_FALLBACK_SECONDS)
                 if await realtime_session.trigger_initial_greeting():
                     log.info("initial_greeting_triggered_by_silence_fallback")
+
+            async def _classify_answerer(first_utterance: str) -> None:
+                # C2: the callee's first words say whether a person picked up. On a
+                # machine, hang up via the SAME flag the end_call tool sets — the
+                # media loop sees it on its next frame (~20ms), which ends the
+                # bridge and closes the socket. Never raises: classify_greeting
+                # degrades to "uncertain", which keeps the call alive.
+                nonlocal should_end_call
+                verdict = await classify_greeting(first_utterance)
+                amd_result["verdict"] = verdict
+                if verdict in MACHINE_VERDICTS:
+                    log.info("amd_machine_detected", verdict=verdict)
+                    should_end_call = True
+                else:
+                    log.info("amd_human_verdict", verdict=verdict)
 
             async for event in realtime_session.connection:
                 event_type = event.type
@@ -684,6 +750,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     if hasattr(event, "transcript") and event.transcript:
                         realtime_session.observe_user_transcript(event.transcript)
                         log.debug("user_utterance_observed", length=len(event.transcript))
+                        # C2: only the FIRST completed utterance is the AMD signal.
+                        # Classified in the background so it never stalls the audio.
+                        if settings.AMD_ENABLED and amd_task is None:
+                            amd_task = asyncio.create_task(_classify_answerer(event.transcript))
 
                 elif enable_transcript and event_type in (
                     "response.audio_transcript.delta",
@@ -742,6 +812,8 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         finally:
             if greeting_fallback_task and not greeting_fallback_task.done():
                 greeting_fallback_task.cancel()
+            if amd_task and not amd_task.done():
+                amd_task.cancel()
 
     await _run_bridge_tasks(
         twilio_to_realtime,

@@ -27,6 +27,16 @@ export interface CallRecord {
   duration_seconds: number;
   recording_url: string | null;
   transcript: string | null;
+  /**
+   * Per-call lead variables injected into the agent prompt.
+   * Optional: older backend builds omit the field entirely.
+   */
+  variables?: Record<string, unknown> | null;
+  /**
+   * Sanitized Cal.com booking attempts recorded during the call.
+   * Shape is intentionally loose — render defensively.
+   */
+  booking_attempts?: unknown[] | null;
   started_at: string;
   answered_at: string | null;
   ended_at: string | null;

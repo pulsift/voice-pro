@@ -50,6 +50,12 @@ FALLBACK_DELAY_SECONDS = 20.0
 # create success, or a transient POST later reconciled as landed).
 _BOOKED_CATEGORIES = {"success", "reconciled_success"}
 
+# Public transcript page served by app/api/transcripts.py (B2).
+_TRANSCRIPT_PATH_PREFIX = "/api/public/transcripts"
+
+# AMD verdicts (C2) that mean no human ever heard the pitch.
+_MACHINE_AMD_VERDICTS = {"machine-vm", "machine-ivr"}
+
 # Keep references to in-flight background tasks so they aren't garbage-collected
 # mid-flight (asyncio only holds a weak reference to a bare create_task() result).
 _background_tasks: set[asyncio.Task[None]] = set()
@@ -80,9 +86,25 @@ def extract_booking_outcome(
     return False, None
 
 
+def build_transcript_url(share_token: str | None) -> str | None:
+    """Public, no-auth transcript link for this call - None when there's nothing to link.
+
+    The origin comes from PUBLIC_BASE_URL, falling back to PUBLIC_URL (the origin
+    telephony webhooks already use). With neither configured we send None rather
+    than a broken relative link.
+    """
+    if not share_token:
+        return None
+    base = settings.PUBLIC_BASE_URL or settings.PUBLIC_URL
+    if not base:
+        return None
+    return f"{base.rstrip('/')}{_TRANSCRIPT_PATH_PREFIX}/{share_token}"
+
+
 def build_call_ended_payload(record: CallRecord) -> dict[str, Any]:
     """Build the call-ended event body from the record's in-memory state."""
     booked, booking_uid = extract_booking_outcome(record.booking_attempts)
+    variables = record.variables if isinstance(record.variables, dict) else {}
     return {
         "call_id": str(record.id),
         "provider_call_id": record.provider_call_id,
@@ -92,7 +114,11 @@ def build_call_ended_payload(record: CallRecord) -> dict[str, Any]:
         "duration_seconds": record.duration_seconds or 0,
         "booked": booked,
         "booking_uid": booking_uid,
-        "variables": record.variables or {},
+        "variables": variables,
+        # A voicemail/IVR pickup is "answered" to the carrier but nobody heard the
+        # pitch - the receiver needs that distinction to decide on a retry.
+        "voicemail": str(variables.get("amd") or "") in _MACHINE_AMD_VERDICTS,
+        "transcript_url": build_transcript_url(getattr(record, "share_token", None)),
     }
 
 

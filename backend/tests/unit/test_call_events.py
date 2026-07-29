@@ -92,6 +92,11 @@ def test_payload_reports_booking_from_successful_create_attempt() -> None:
         "booked": True,
         "booking_uid": "calcom-uid-1",
         "variables": {"leadName": "Ada", "tzName": "America/Los_Angeles"},
+        # Transparency stack (B2/C2): a public transcript link when one has been
+        # minted, plus the AMD voicemail verdict. The router treats both as
+        # optional, so an older receiver is unaffected.
+        "transcript_url": None,
+        "voicemail": False,
     }
 
 

@@ -114,6 +114,13 @@ class CallRecord(Base):
         Text, nullable=True, comment="URL to call recording"
     )
     transcript: Mapped[str | None] = mapped_column(Text, nullable=True, comment="Call transcript")
+    share_token: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        unique=True,
+        index=True,
+        comment="Capability token for the public read-only transcript page (B2)",
+    )
     booking_attempts: Mapped[list[dict[str, object]] | None] = mapped_column(
         JSON,
         nullable=True,

@@ -37,10 +37,15 @@ from app.api import (
     telephony,
     telephony_ws,
     tools,
+    transcripts,
     workspaces,
 )
 from app.api import settings as settings_api
 from app.api.auth import get_password_hash
+from app.api.transcripts import (
+    start_transcript_retention_worker,
+    stop_transcript_retention_worker,
+)
 from app.core.config import settings
 from app.core.limiter import limiter
 from app.db.redis import close_redis, get_redis
@@ -136,6 +141,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
     except Exception:
         logger.exception("Failed to start campaign worker - campaigns will not process")
 
+    # Start transcript retention sweep (non-fatal)
+    try:
+        await start_transcript_retention_worker()
+        logger.info(
+            "Transcript retention worker started",
+            retention_days=settings.TRANSCRIPT_RETENTION_DAYS,
+        )
+    except Exception:
+        logger.exception("Failed to start transcript retention worker - transcripts will persist")
+
     yield
 
     # Shutdown
@@ -147,6 +162,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
         logger.info("Campaign worker stopped")
     except Exception:
         logger.exception("Error stopping campaign worker")
+
+    # Stop transcript retention sweep
+    try:
+        await stop_transcript_retention_worker()
+        logger.info("Transcript retention worker stopped")
+    except Exception:
+        logger.exception("Error stopping transcript retention worker")
 
     # Close Redis connection
     try:
@@ -215,6 +237,7 @@ app.include_router(compliance.router)  # Compliance API (GDPR/CCPA)
 app.include_router(integrations.router)  # Integrations API (external tools)
 app.include_router(embed.router)  # Public embed API (unauthenticated)
 app.include_router(embed.ws_router)  # Public embed WebSocket
+app.include_router(transcripts.router)  # Public transcript share pages (unauthenticated)
 
 
 @app.get("/")
