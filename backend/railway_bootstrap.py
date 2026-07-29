@@ -36,6 +36,18 @@ for _m in pkgutil.iter_modules(app.models.__path__):
 COLUMN_RECONCILE = (
     ("call_records", "booking_attempts", "JSON"),
     ("call_records", "variables", "JSON"),
+    # B2 transparency stack: the secret behind a public transcript link.
+    # Alembic migration d4b2f7c1a903 adds it for local/dev; PRODUCTION goes
+    # through create_all + this list, so it must be here too — otherwise every
+    # transcript save would fail on a column that does not exist.
+    ("call_records", "share_token", "VARCHAR(32)"),
+)
+
+# Indexes on reconciled columns (create_all only builds indexes for tables it
+# creates). UNIQUE so one token can never point at two calls.
+INDEX_RECONCILE = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_call_records_share_token "
+    "ON call_records (share_token)",
 )
 
 
@@ -47,10 +59,13 @@ async def main() -> None:
             await conn.exec_driver_sql(
                 f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coltype}'
             )
+        for statement in INDEX_RECONCILE:
+            await conn.exec_driver_sql(statement)
     await engine.dispose()
     print(
         f"voice-pro bootstrap: create_all complete ({len(Base.metadata.tables)} tables); "
-        f"reconciled {len(COLUMN_RECONCILE)} column(s)"
+        f"reconciled {len(COLUMN_RECONCILE)} column(s), "
+        f"{len(INDEX_RECONCILE)} index(es)"
     )
 
 
