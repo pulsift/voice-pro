@@ -613,6 +613,21 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         log.info("caller_spoke_first_prompt_greeting_active")
                     if greeting_fallback_task and not greeting_fallback_task.done():
                         greeting_fallback_task.cancel()
+                    # BARGE-IN FLUSH (phase 2, 2026-07-29): when the caller
+                    # starts speaking, OpenAI cancels its response server-side
+                    # but every audio chunk already pushed into Twilio's playout
+                    # buffer KEEPS PLAYING — the agent talks over the caller for
+                    # the length of the buffer. Twilio's "clear" message flushes
+                    # it (LiveKit's bridge does the equivalent; ours never did).
+                    # Harmless no-op when nothing is buffered.
+                    if stream_sid:
+                        try:
+                            await websocket.send_text(json.dumps(
+                                {"event": "clear", "streamSid": stream_sid}))
+                            log.info("twilio_buffer_cleared_on_barge_in",
+                                     stream_sid=stream_sid)
+                        except Exception as clear_err:
+                            log.warning("twilio_clear_failed", error=str(clear_err))
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
