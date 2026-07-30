@@ -377,3 +377,25 @@ async def test_call_api_exposes_per_call_variables() -> None:
     response = await get_call(str(call_id), MagicMock(id=1), db)
 
     assert response.variables == {"leadName": "Ada", "amd": "human"}
+
+
+# --- Codex review 2026-07-30: outbound-only AMD + transcript privacy -----------
+
+
+def test_amd_is_opt_in_and_defaults_off() -> None:
+    """An inbound stream must never be AMD-classified: a human answering
+    'you've reached Acme' would be hung up on mid-sentence."""
+    import inspect
+
+    from app.api.telephony_ws import _handle_twilio_stream
+
+    sig = inspect.signature(_handle_twilio_stream)
+    assert sig.parameters["amd_allowed"].default is False
+
+
+def test_transcript_page_carries_privacy_headers() -> None:
+    from app.api.transcripts import _PRIVACY_HEADERS
+
+    assert _PRIVACY_HEADERS["cache-control"] == "private, no-store, max-age=0"
+    assert "noindex" in _PRIVACY_HEADERS["x-robots-tag"]
+    assert _PRIVACY_HEADERS["referrer-policy"] == "no-referrer"

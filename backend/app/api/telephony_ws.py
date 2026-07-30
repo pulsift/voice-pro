@@ -512,6 +512,15 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
         ) as realtime_session:
             # Handle Twilio media stream (start already consumed above — seed its ids)
             amd_state: dict[str, str] = {}
+            # AMD IS OUTBOUND-ONLY (Codex review blocker, 2026-07-30). Inbound
+            # calls share this same bridge, and an inbound HUMAN who answers
+            # with "Hi, you've reached Acme..." would be classified machine-vm
+            # and hung up on mid-sentence. Our outbound dials always carry
+            # per-call variables (that is how leadName reaches the greeting);
+            # an inbound stream never does, so their presence is the gate.
+            amd_allowed = bool(call_variables)
+            if not amd_allowed:
+                log.info("amd_skipped_no_call_variables_probably_inbound")
             call_sid = await _handle_twilio_stream(
                 websocket=websocket,
                 realtime_session=realtime_session,
@@ -520,6 +529,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                 stream_sid=stream_sid,
                 call_sid=call_sid,
                 amd_state=amd_state,
+                amd_allowed=amd_allowed,
             )
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
@@ -561,6 +571,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
     stream_sid: str = "",
     call_sid: str = "",
     amd_state: dict[str, str] | None = None,
+    amd_allowed: bool = False,
 ) -> str:
     """Handle Twilio Media Stream messages.
 
@@ -573,6 +584,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         call_sid: Call SID when the start event was already consumed by the caller
         amd_state: Optional dict the answering-machine verdict is written into
             (key "verdict") so the caller can persist it after teardown
+        amd_allowed: Whether this call is eligible for answering-machine
+            detection. OUTBOUND ONLY — hanging up on an inbound human who
+            answers "you've reached Acme" is the failure mode this gate exists
+            to prevent. Defaults False: a caller must opt a call in.
 
     Returns:
         The call_sid for transcript saving
@@ -752,7 +767,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         log.debug("user_utterance_observed", length=len(event.transcript))
                         # C2: only the FIRST completed utterance is the AMD signal.
                         # Classified in the background so it never stalls the audio.
-                        if settings.AMD_ENABLED and amd_task is None:
+                        if settings.AMD_ENABLED and amd_allowed and amd_task is None:
                             amd_task = asyncio.create_task(_classify_answerer(event.transcript))
 
                 elif enable_transcript and event_type in (

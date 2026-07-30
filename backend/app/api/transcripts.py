@@ -46,6 +46,15 @@ RETENTION_INTERVAL_SECONDS: Final = 24 * 60 * 60
 _SECONDS_PER_MINUTE: Final = 60
 _PHONE_SUFFIX_LENGTH: Final = 4
 
+# The URL is the capability, so the page must not be cached, indexed, or leaked
+# through a Referer header on any link the reader clicks.
+_PRIVACY_HEADERS: Final = {
+    "cache-control": "private, no-store, max-age=0",
+    "pragma": "no-cache",
+    "referrer-policy": "no-referrer",
+    "x-robots-tag": "noindex, nofollow, noarchive",
+}
+
 # The stored transcript is flat text: "[User]: ..." / "[Assistant]: ..." paragraphs.
 _SPEAKER_RE: Final = re.compile(r"^\[(user|assistant)\]\s*:\s*(.*)$", re.IGNORECASE)
 
@@ -197,16 +206,30 @@ async def public_transcript_page(
     share_token: str,
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
-    """Serve one call transcript as a public read-only page. The token is the key."""
-    result = await db.execute(select(CallRecord).where(CallRecord.share_token == share_token))
+    """Serve one call transcript as a public read-only page. The token is the key.
+
+    Expiry is enforced HERE, not only by the nightly sweep (Codex review
+    2026-07-30): the worker ticks once a day, so a token could otherwise outlive
+    its advertised retention by up to a day — or indefinitely if the worker is
+    down.
+    """
+    cutoff = datetime.now(UTC) - timedelta(days=settings.TRANSCRIPT_RETENTION_DAYS)
+    result = await db.execute(
+        select(CallRecord).where(
+            CallRecord.share_token == share_token,
+            CallRecord.transcript.is_not(None),
+            or_(CallRecord.ended_at.is_(None), CallRecord.ended_at >= cutoff),
+        )
+    )
     record = result.scalar_one_or_none()
 
     if record is None:
-        logger.info("public_transcript_not_found")
-        return HTMLResponse(render_not_found(), status_code=404)
+        logger.info("public_transcript_not_found_or_expired")
+        return HTMLResponse(render_not_found(), status_code=404,
+                            headers=_PRIVACY_HEADERS)
 
     logger.info("public_transcript_served", call_id=str(record.id))
-    return HTMLResponse(render_transcript_page(record))
+    return HTMLResponse(render_transcript_page(record), headers=_PRIVACY_HEADERS)
 
 
 # ---------------------------------------------------------------------------
