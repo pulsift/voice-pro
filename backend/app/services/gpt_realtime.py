@@ -74,12 +74,33 @@ _DEFAULT_VARS: dict[str, str] = {
 # says hello and then STOPS, exactly like a person who has just been picked up on.
 DEFAULT_HELLO_LINE = "Hello?"
 
-# Response ordinals in a normal outbound call: 1 = the bare hello, 2 = the opener.
-_HELLO_RESPONSE_INDEX = 1
+# The stored greeting may be overridden per agent, but it may not quietly become a
+# pitch: an agent row still holding the OLD full greeting ("Heyy {{leadName}}, this
+# is Dave from Pulsift!") would be forced out as turn 1 and the entire hello-first
+# design would silently not apply — with turn 2 then repeating the introduction.
+_MAX_HELLO_WORDS = 4
+
+
+def _usable_hello(configured: str, log: Any) -> str:
+    """The greeting to speak first: the configured one only if it is still a greeting."""
+    candidate = configured.strip()
+    if not candidate:
+        return DEFAULT_HELLO_LINE
+    if len(candidate.split()) > _MAX_HELLO_WORDS:
+        log.warning(
+            "configured_greeting_too_long_using_bare_hello",
+            configured_words=len(candidate.split()),
+        )
+        return DEFAULT_HELLO_LINE
+    return candidate
+
+# The earliest response that can be the opener: 1 is the bare hello.
 _OPENER_RESPONSE_INDEX = 2
 
-# Cap on audio held back while the opener plays (mu-law 8kHz = 8000 bytes/second).
+# Caps on audio held back while the opener plays (mu-law 8kHz = 8000 bytes/second).
+# Only the last few seconds are ever forwarded — see release_input_hold.
 _HELD_AUDIO_MAX_BYTES = 8000 * 15
+_HELD_FLUSH_TAIL_BYTES = 8000 * 3
 
 
 def render_template(template: str, variables: dict[str, Any] | None) -> str:
@@ -224,13 +245,9 @@ class GPTRealtimeSession:
         self._hello_sent: bool = False
         self._caller_has_spoken: bool = False
         self._response_count: int = 0
-        self._opener_protected: bool = False
-        # Inbound-audio gate. Open by default; closed while an initial greeting is
-        # pending so the caller's early "hello" can't trigger VAD and cancel the
-        # greeting mid-birth. Re-opened when the greeting response completes (or on
-        # error, fail-open). Covers both the Telnyx and Twilio bridges since both
-        # feed audio through send_audio().
-        self._input_gate_open: bool = True
+        self._opener_delivered: bool = False
+        self._held_response_id: str | None = None
+        self._held_response_spoke: bool = False
         # Opener protection: while the opener is being spoken, caller audio is HELD
         # (buffered) rather than forwarded, so a "yeah?" or "hello?" landing on top
         # of it cannot make the server cancel the turn half-way. Sami's ask was that
@@ -427,9 +444,10 @@ class GPTRealtimeSession:
             # spoken by send_hello() as soon as the telephony loop is running (the
             # bridge owns the timing so the response can never be created before
             # the event loop is ready to stream its audio).
-            configured_hello = str(self.agent_config.get("initial_greeting") or "").strip()
-            self._hello_line = configured_hello or DEFAULT_HELLO_LINE
-            self.logger.info("hello_line_ready", hello=self._hello_line[:60])
+            self._hello_line = _usable_hello(
+                str(self.agent_config.get("initial_greeting") or ""), self.logger
+            )
+            self.logger.info("hello_line_ready", hello=self._hello_line)
         except Exception as e:
             self.logger.exception(
                 "session_config_failed", error=str(e), error_type=type(e).__name__
@@ -614,6 +632,11 @@ class GPTRealtimeSession:
             lead_tz, tz_source = lead_timezone.resolve(self.variables)
             self.variables["tzName"] = lead_tz
             self.variables["tz_spoken"] = lead_timezone.spoken_zone_name(lead_tz)
+            # The wrapper's CONTEXT/RULES block must agree with the offered labels.
+            # Leaving it on the workspace timezone told the agent that times are
+            # team-local while every time it could see was lead-local — and it also
+            # makes "now" the caller's clock, which is the one that matters on a call.
+            self._instructions_timezone = lead_tz
             self.logger.info(
                 "lead_timezone_resolved", timezone=lead_tz, source=tz_source
             )
@@ -705,40 +728,104 @@ class GPTRealtimeSession:
         """Whether caller audio is currently being buffered instead of forwarded."""
         return self._input_hold
 
-    def note_response_created(self) -> None:
-        """Count assistant turns and protect the opener from being cut in half."""
-        self._response_count += 1
-        if self._response_count == _OPENER_RESPONSE_INDEX and not self._opener_protected:
-            self._opener_protected = True
-            self._input_hold = True
-            self.logger.info("opener_protection_engaged")
+    def note_response_created(self, response_id: str | None = None) -> None:
+        """Protect the opener from being cut in half, tied to ITS response id.
 
-    async def release_input_hold(self, *, reason: str) -> None:
-        """Stop holding caller audio and forward everything held, in order.
+        Held ONLY once the caller has actually spoken, and that condition is
+        load-bearing, not cosmetic: while input is held no audio reaches OpenAI, so
+        `input_audio_buffer.speech_started` cannot fire — and that event is what
+        disarms the dead-air watchdog. A hold engaged before anyone has spoken would
+        therefore make a talking human look like silence and get them hung up on.
+        The opener is always a reply to their first sound, so this costs nothing.
+
+        The hold remembers WHICH response it is protecting, so a late `response.done`
+        belonging to the hello (or to a cancelled turn) cannot release the opener's
+        hold early. When the API gives us no id we fall back to releasing on any
+        completion, which is the old behaviour and still bounded by the ceiling timer.
+        """
+        self._response_count += 1
+        if (
+            self._response_count >= _OPENER_RESPONSE_INDEX
+            and self._caller_has_spoken
+            and not self._opener_delivered
+        ):
+            self._input_hold = True
+            self._held_response_id = response_id
+            self._held_response_spoke = False
+            self.logger.info(
+                "opener_protection_engaged",
+                response_index=self._response_count,
+                response_id=response_id,
+            )
+
+    def note_assistant_audio(self) -> None:
+        """The response currently being protected actually produced speech.
+
+        This is what distinguishes the opener from a response that only carried a
+        function call: a tool-call turn emits `response.created` too, so protecting
+        "the second response" blindly let a tool call absorb the protection and left
+        the real opener — the one the caller can talk over — unguarded.
+        """
+        if self._input_hold:
+            self._held_response_spoke = True
+
+    async def release_input_hold(
+        self, *, reason: str, response_id: str | None = None, flush: bool = True
+    ) -> None:
+        """Stop holding caller audio; forward the tail of what was held.
 
         Called on the opener's response.done, on error, and by a hard timeout, so
         there is no path where the caller stays unheard because a response never
         completed.
+
+        A completion for a DIFFERENT response is ignored: only the turn we are
+        actually protecting (or an unconditional release — error, ceiling, teardown)
+        may end the hold.
+
+        Only the TAIL is forwarded (`_HELD_FLUSH_TAIL_BYTES`). Replaying ten seconds
+        of held audio in one append hands server VAD a timeline it will split into
+        several turns, and the caller then hears the agent answer three things they
+        said ten seconds ago, in a row. The last thing they said is the thing that
+        needs answering.
+
+        `flush=False` discards the buffer instead: used by the ceiling timer, because
+        appending audio while the protected response is still generating is exactly
+        what cancels it — the mechanism would otherwise cut off the very sentence it
+        exists to protect.
         """
         if not self._input_hold:
             return
+        if (
+            response_id is not None
+            and self._held_response_id is not None
+            and response_id != self._held_response_id
+        ):
+            self.logger.info(
+                "opener_hold_kept_for_other_response",
+                completed=response_id,
+                protecting=self._held_response_id,
+            )
+            return
+        self._held_response_id = None
         self._input_hold = False
         held, self._held_audio = bytes(self._held_audio), bytearray()
         dropped, self._held_audio_dropped = self._held_audio_dropped, 0
+        # A turn that produced no speech was not the opener (a tool call, or a
+        # cancelled response), so the protection has not been used up yet.
+        if self._held_response_spoke:
+            self._opener_delivered = True
+        self._held_response_spoke = False
+        tail = held[-_HELD_FLUSH_TAIL_BYTES:] if flush else b""
         self.logger.info(
             "opener_protection_released",
             reason=reason,
             held_bytes=len(held),
+            forwarded_bytes=len(tail),
             dropped_bytes=dropped,
+            opener_delivered=self._opener_delivered,
         )
-        if held:
-            await self.send_audio(held)
-
-    def open_input_gate(self) -> None:
-        """Allow caller audio through again (fail-open on error)."""
-        if not self._input_gate_open:
-            self._input_gate_open = True
-            self.logger.info("input_gate_opened")
+        if tail:
+            await self.send_audio(tail)
 
     async def send_audio(self, audio_data: bytes) -> None:
         """Send audio input to GPT Realtime using SDK.
@@ -750,13 +837,10 @@ class GPTRealtimeSession:
             self.logger.error("send_audio_failed_no_connection")
             return
 
-        # Drop caller audio while a protected line is playing (fail-open gate).
-        if not self._input_gate_open:
-            return
-
-        # Opener protection: hold, don't drop. Everything captured here is
-        # forwarded the moment the opener finishes, so an interruption during the
-        # opener is answered a second late instead of being lost.
+        # Opener protection: hold, don't drop. The tail is forwarded the moment the
+        # opener finishes, so an interruption during it is answered a second late
+        # rather than lost. (The old drop-everything gate is gone: nothing could
+        # close it any more once the timed fallback greeting was removed.)
         if self._input_hold:
             room = _HELD_AUDIO_MAX_BYTES - len(self._held_audio)
             if room > 0:

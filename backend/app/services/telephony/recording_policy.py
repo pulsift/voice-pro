@@ -226,8 +226,8 @@ REASON_UNKNOWN_AREA_CODE = "unknown_area_code"
 REASON_UNPARSEABLE = "unparseable_number"
 REASON_EXPLICIT_CONSENT = "explicit_consent_allowlist"
 
-# A consent entry must carry at least a full national number, so a short or
-# malformed entry can never match a broad set of real phones by suffix.
+# A consent entry must carry at least a full national number, so a truncated or
+# malformed entry cannot be mistaken for a real one.
 _MIN_CONSENT_MATCH_DIGITS = 9
 
 # Cosmetic separators we tolerate inside a number. Anything else (a letter, a
@@ -302,23 +302,34 @@ def has_explicit_consent(to_number: str | None) -> bool:
     override for numbers whose owner has actually said yes — in practice our own
     test handsets, which is how the agent gets listened to and diagnosed.
 
-    Compared on the LAST 9 digits — the subscriber part — because the same phone is
-    written several ways and the prefixes are exactly what differ: +46700171894 and
-    the Swedish national form 0700171894 must be recognised as one number (note the
-    national trunk "0" REPLACES the country code, so aligning on longer suffixes
-    fails). Nine digits is specific enough that two real numbers cannot collide, and
-    the list itself is a handful of operator-entered entries.
+    **Matching is EXACT on the full digit string**, and that is deliberate. Suffix
+    matching looks convenient and is wrong here: +1 415 555 0123 and
+    +1 515 555 0123 are different people's phones that share their last nine digits
+    (the leading digit of the area code falls off), so a suffix rule would let one
+    consenting number authorise recording a stranger. This function decides whether
+    recording a call is LEGAL, so a false positive is the expensive direction and it
+    gets no tolerance at all.
+
+    Entries must therefore be written as the E.164 number we actually dial —
+    "+14155550123" — which is the only form `to_number` ever carries on an outbound
+    call. Cosmetic separators and a leading "00" international prefix are forgiven;
+    nothing else is.
     """
-    target = "".join(char for char in (to_number or "") if char.isdigit())
+    target = _consent_digits(to_number)
     if len(target) < _MIN_CONSENT_MATCH_DIGITS:
         return False
-    for entry in (settings.RECORDING_CONSENT_NUMBERS or "").split(","):
-        allowed = "".join(char for char in entry if char.isdigit())
-        if len(allowed) < _MIN_CONSENT_MATCH_DIGITS:
-            continue
-        if allowed[-_MIN_CONSENT_MATCH_DIGITS:] == target[-_MIN_CONSENT_MATCH_DIGITS:]:
-            return True
-    return False
+    return any(
+        _consent_digits(entry) == target
+        for entry in (settings.RECORDING_CONSENT_NUMBERS or "").split(",")
+    )
+
+
+def _consent_digits(value: str | None) -> str:
+    """Digits only, with a leading "00" international prefix normalised away."""
+    digits = "".join(char for char in (value or "") if char.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    return digits
 
 
 def recording_decision(to_number: str | None) -> tuple[bool, str | None, str]:

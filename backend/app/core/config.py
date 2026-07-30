@@ -124,9 +124,14 @@ class Settings(BaseSettings):
     #   GIVEUP: further silence after that before hanging up (dead air / mute box).
     #   OPENER_HOLD: hard ceiling on holding caller audio while the opener plays,
     #     so a response that never completes can never leave the caller unheard.
+    #   SESSION_READY: how long to wait for `session.updated` before greeting anyway.
+    #     Everything (hello AND the dead-air hangup) hangs off that one event; if the
+    #     session config were rejected the callee would otherwise hear pure silence
+    #     on a billed leg until the 300s bridge timeout.
     REALTIME_POST_HELLO_NUDGE_SECONDS: float = 12.0
     REALTIME_POST_HELLO_GIVEUP_SECONDS: float = 12.0
-    REALTIME_OPENER_HOLD_MAX_SECONDS: float = 14.0
+    REALTIME_OPENER_HOLD_MAX_SECONDS: float = 12.0
+    REALTIME_SESSION_READY_TIMEOUT_SECONDS: float = 3.0
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 

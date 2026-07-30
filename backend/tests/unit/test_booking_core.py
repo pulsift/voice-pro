@@ -490,12 +490,12 @@ def test_spoken_part_hours_are_understood(utterance: str, expected: set) -> None
 def test_a_part_hour_does_not_also_claim_the_bare_hour() -> None:
     """"half past four" must not match a 4:00 slot as well — two matches on one
     clear answer would be reported as ambiguous and re-asked."""
-    assert (4, 0) not in CRMTools._extract_time_matches("half past four")
-    assert (5, 0) not in CRMTools._extract_time_matches("quarter to five")
+    assert (4, 0) not in CRMTools._extract_time_matches("half past four")  # noqa: SLF001
+    assert (5, 0) not in CRMTools._extract_time_matches("quarter to five")  # noqa: SLF001
 
 
 def test_plain_hours_and_pronouns_are_unchanged() -> None:
-    assert CRMTools._extract_time_matches("ten in the morning") == {(10, 0), (22, 0)}
-    assert CRMTools._extract_time_matches("the morning one") == set()  # pronoun
-    assert CRMTools._extract_time_matches("yeah sure") == set()
-    assert CRMTools._extract_time_matches("5 pm") == {(17, 0)}
+    assert CRMTools._extract_time_matches("ten in the morning") == {(10, 0), (22, 0)}  # noqa: SLF001
+    assert CRMTools._extract_time_matches("the morning one") == set()  # pronoun  # noqa: SLF001
+    assert CRMTools._extract_time_matches("yeah sure") == set()  # noqa: SLF001
+    assert CRMTools._extract_time_matches("5 pm") == {(17, 0)}  # noqa: SLF001

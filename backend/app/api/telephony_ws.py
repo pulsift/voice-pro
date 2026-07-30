@@ -51,6 +51,16 @@ _TERMINAL_CALL_STATUSES = {
 SHARE_TOKEN_LENGTH = 16
 
 
+def _response_id(event: Any) -> str | None:
+    """The id of the response an event belongs to, when the payload carries one."""
+    direct = getattr(event, "response_id", None)
+    if direct:
+        return str(direct)
+    response = getattr(event, "response", None)
+    identifier = getattr(response, "id", None) if response is not None else None
+    return str(identifier) if identifier else None
+
+
 class OpeningSequence:
     """Hello-first opening, and the watchdog that keeps a silent line from hanging.
 
@@ -83,6 +93,7 @@ class OpeningSequence:
         self._on_giveup = on_giveup
         self._silence_task: asyncio.Task[None] | None = None
         self._hold_task: asyncio.Task[None] | None = None
+        self._fallback_task: asyncio.Task[None] | None = None
         self.started = False
 
     async def start(self) -> None:
@@ -92,6 +103,23 @@ class OpeningSequence:
         self.started = True
         await self._session.send_hello()
         self._silence_task = asyncio.create_task(self._watch_silence())
+
+    def arm_fallback_start(self) -> None:
+        """Start the opening anyway if `session.updated` never arrives.
+
+        The whole opening — hello AND the dead-air hangup — normally hangs off that
+        one event. If the session config is rejected the server sends `error`
+        instead, and without this the callee would hear pure silence and we would
+        hold the (billed) leg open until the 300-second bridge timeout. Late is
+        better than never: worst case the hello is spoken against a default session.
+        """
+        self._fallback_task = asyncio.create_task(self._fallback_start())
+
+    async def _fallback_start(self) -> None:
+        await asyncio.sleep(settings.REALTIME_SESSION_READY_TIMEOUT_SECONDS)
+        if not self.started:
+            self._log.warning("session_updated_never_arrived_starting_opening_anyway")
+            await self.start()
 
     async def _watch_silence(self) -> None:
         await asyncio.sleep(settings.REALTIME_POST_HELLO_NUDGE_SECONDS)
@@ -110,24 +138,41 @@ class OpeningSequence:
         if self._silence_task and not self._silence_task.done():
             self._silence_task.cancel()
 
-    def response_created(self) -> None:
-        """Count the assistant turn; arm the hold ceiling if the opener started."""
-        self._session.note_response_created()
-        if self._session.input_held and self._hold_task is None:
+    def response_created(self, response_id: str | None = None) -> None:
+        """Note the assistant turn; arm the hold ceiling if a hold just engaged.
+
+        Re-armable: a turn that carried only a function call does not consume the
+        opener's protection, so the next turn can be held and needs its own ceiling.
+        """
+        self._session.note_response_created(response_id)
+        if self._session.input_held and (self._hold_task is None or self._hold_task.done()):
             self._hold_task = asyncio.create_task(self._hold_ceiling())
 
     async def _hold_ceiling(self) -> None:
         # Belt and braces: if the opener's response.done never arrives (error,
         # disconnect, model stall), the caller must still be heard.
+        #
+        # It releases WITHOUT flushing, deliberately. The protected response may
+        # still be generating, and appending audio is exactly what makes the server
+        # cancel it — so flushing here would let the protection cut off the very
+        # sentence it exists to protect. Live audio flows normally from this moment,
+        # so the caller can still interrupt for real; only the stale buffer is
+        # dropped.
         await asyncio.sleep(settings.REALTIME_OPENER_HOLD_MAX_SECONDS)
-        await self._session.release_input_hold(reason="hold_ceiling")
+        await self._session.release_input_hold(reason="hold_ceiling", flush=False)
 
-    async def response_finished(self) -> None:
-        """A response completed — release any held caller audio."""
-        await self._session.release_input_hold(reason="response_complete")
+    async def response_finished(self, response_id: str | None = None) -> None:
+        """A response completed — release the hold if it was THIS response's.
+
+        Pass no id to release unconditionally (an error, or teardown), which is the
+        fail-open direction: a caller must never be left unheard.
+        """
+        await self._session.release_input_hold(
+            reason="response_complete", response_id=response_id
+        )
 
     def cancel(self) -> None:
-        for task in (self._silence_task, self._hold_task):
+        for task in (self._silence_task, self._hold_task, self._fallback_task):
             if task and not task.done():
                 task.cancel()
 
@@ -738,6 +783,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 return
 
             log.info("realtime_to_twilio_started", waiting_for_events=True)
+            opening.arm_fallback_start()
             event_count = 0
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
 
@@ -774,7 +820,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     )
 
                 elif event_type == "response.created":
-                    opening.response_created()
+                    opening.response_created(_response_id(event))
 
                 elif event_type == "input_audio_buffer.speech_started":
                     opening.caller_spoke()
@@ -796,6 +842,9 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
+                    # This turn is actually SPEAKING, which is how the opener is told
+                    # apart from a turn that only carried a function call.
+                    realtime_session.note_assistant_audio()
                     # Get audio delta and send to Twilio
                     # Check various possible attribute names for the audio data
                     delta_data = getattr(event, "delta", None)
@@ -871,10 +920,9 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
-                    realtime_session.open_input_gate()
                     # Release any caller audio held while this response played
                     # (the opener). Held audio is forwarded, never discarded.
-                    await opening.response_finished()
+                    await opening.response_finished(_response_id(event))
                     # Log full response details for debugging
                     response_data = getattr(event, "response", None)
                     if response_data:
@@ -900,7 +948,6 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 # the caller unheard.
                 elif event_type == "error":
                     log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
-                    realtime_session.open_input_gate()
                     await opening.response_finished()
 
                 # Log other events
@@ -1190,6 +1237,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                 return
 
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
+            opening.arm_fallback_start()
 
             async for event in realtime_session.connection:
                 event_type = event.type
@@ -1203,13 +1251,16 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     )
 
                 elif event_type == "response.created":
-                    opening.response_created()
+                    opening.response_created(_response_id(event))
 
                 elif event_type == "input_audio_buffer.speech_started":
                     opening.caller_spoke()
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
+                    # This turn is actually SPEAKING, which is how the opener is told
+                    # apart from a turn that only carried a function call.
+                    realtime_session.note_assistant_audio()
                     if hasattr(event, "delta") and event.delta:
                         # event.delta is already base64 G.711 mu-law; forward as a
                         # Telnyx client media frame ({event, media:{payload}} — no stream_id).
@@ -1260,8 +1311,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
-                    realtime_session.open_input_gate()
-                    await opening.response_finished()
+                    await opening.response_finished(_response_id(event))
                     log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
                         log.info("ending_call_after_response_complete")
@@ -1273,7 +1323,6 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                 # caller's audio.
                 elif event_type == "error":
                     log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
-                    realtime_session.open_input_gate()
                     await opening.response_finished()
 
                 elif event_type in [

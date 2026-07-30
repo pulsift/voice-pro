@@ -26,25 +26,22 @@ def test_realtime_model_has_proven_safe_default() -> None:
     assert Settings.model_fields["OPENAI_REALTIME_REASONING_EFFORT"].default is None
 
 
-def test_input_gate_open_by_default() -> None:
-    # No greeting configured => gate must stay open, or caller audio would deadlock.
-    assert make_session()._input_gate_open is True  # noqa: SLF001
+def test_a_bare_session_forwards_caller_audio_immediately() -> None:
+    """There is no longer any gate that DROPS caller audio: the only mechanism that
+    withholds it is the opener hold, which buffers and then forwards the tail."""
+    session = make_session()
+    assert session.input_held is False
 
 
 @pytest.mark.asyncio
-async def test_send_audio_dropped_while_gate_closed_then_forwarded() -> None:
+async def test_audio_flows_straight_through_when_nothing_is_held() -> None:
     session = make_session()
-    session._input_gate_open = False  # noqa: SLF001 - greeting in progress
     session.connection = MagicMock()
     session.connection.input_audio_buffer.append = AsyncMock()
 
     await session.send_audio(b"\x00\x01")
-    session.connection.input_audio_buffer.append.assert_not_awaited()  # dropped mid-greeting
 
-    session.open_input_gate()  # greeting response.done
-    assert session._input_gate_open is True  # noqa: SLF001
-    await session.send_audio(b"\x00\x01")
-    session.connection.input_audio_buffer.append.assert_awaited_once()  # now forwarded
+    session.connection.input_audio_buffer.append.assert_awaited_once()
 
 
 def test_completed_utterance_reaches_tools_when_history_is_disabled() -> None:
@@ -282,6 +279,7 @@ async def test_opener_is_protected_by_holding_not_dropping_caller_audio() -> Non
 
     session.note_response_created()  # 1: the hello
     assert session.input_held is False
+    session.note_caller_spoke()  # they answered — the opener is the reply
     session.note_response_created()  # 2: the opener
     assert session.input_held is True
 
@@ -303,6 +301,7 @@ async def test_opener_is_protected_by_holding_not_dropping_caller_audio() -> Non
 async def test_held_audio_is_capped_so_a_stuck_response_cannot_grow_memory() -> None:
     session = _make_session_with_connection()
     session.connection.input_audio_buffer.append = AsyncMock()
+    session.note_caller_spoke()
     session.note_response_created()
     session.note_response_created()
 
@@ -319,3 +318,37 @@ async def test_presence_check_is_skipped_once_the_caller_has_spoken() -> None:
     assert session.caller_has_spoken is True
     assert await session.send_presence_check() is False
     session.connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_hold_never_engages_before_the_caller_has_spoken() -> None:
+    """Load-bearing: while input is held, speech_started cannot fire — and that
+    event is what disarms the dead-air watchdog. A hold engaged on silence would
+    make a talking human look silent and get them hung up on."""
+    session = _make_session_with_connection()
+    session.note_response_created()  # the hello
+    session.note_response_created()  # e.g. the "can you hear me?" nudge
+    session.note_response_created()
+    assert session.input_held is False  # nobody has spoken yet
+
+    session.note_caller_spoke()
+    session.note_response_created()  # now a reply to them: protect it
+    assert session.input_held is True
+
+
+def test_an_old_full_greeting_cannot_hijack_turn_one() -> None:
+    """The hello must stay a hello. An agent row still holding the old pitch-style
+    greeting would otherwise be forced out as turn 1 with tools disabled, silently
+    defeating the whole hello-first design and repeating the intro on turn 2."""
+    from app.services.gpt_realtime import DEFAULT_HELLO_LINE, _usable_hello
+
+    log = MagicMock()
+    assert _usable_hello("", log) == DEFAULT_HELLO_LINE
+    assert _usable_hello("   ", log) == DEFAULT_HELLO_LINE
+    assert (
+        _usable_hello("Heyy Sami, this is Dave from Pulsift!", log) == DEFAULT_HELLO_LINE
+    )
+    log.warning.assert_called_once()
+
+    # A genuinely short greeting is still honoured.
+    assert _usable_hello("Hi there?", MagicMock()) == "Hi there?"

@@ -71,6 +71,9 @@ class CRMTools:
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
+        # True once times have actually been said out loud (any tool-driven offer).
+        # A pre-loaded menu starts False — see seed_offered_slots.
+        self._menu_announced = True
 
     def seed_offered_slots(
         self,
@@ -86,16 +89,28 @@ class CRMTools:
         transcript-bound selection guard is untouched — a menu the agent can read is
         still not permission to pick on the caller's behalf.
 
-        `origin` decides which utterance can answer this menu, and the distinction
-        matters:
-          - "preloaded" (before the call): nobody has spoken yet, so the first thing
-            the caller says is a legitimate answer to it.
-          - "offered" (mid-call refresh, e.g. after a conflict): the menu is NEW, so
-            it takes a NEW utterance. Carrying turn 0 here would let a word said
-            before the refresh select one of the fresh times.
+        Whatever the origin, a selection must come from an utterance made AFTER this
+        menu existed — `_offer_user_turn` is stamped with the current turn, which is
+        naturally 0 when the pre-load wins the race against the caller's first word
+        and correctly non-zero when it does not. (An earlier version special-cased
+        "preloaded" to 0 unconditionally; because the pre-load is genuinely mid-call
+        — it awaits Cal.com while the line is already open — that permanently
+        disabled the guard whenever the calendar was slow, and a time the caller had
+        merely *asked about* before the menu landed could then be booked.)
+
+        `origin` still matters for `_menu_announced`: a pre-loaded menu has never been
+        read out, so selecting from it needs an unambiguous time of the caller's own
+        (see `_strong_time_signal`).
 
         Returns the number of slots adopted (0 leaves the tool path in charge).
         """
+        if origin == "preloaded" and self._selected_slot_id:
+            # The caller already picked something. A background pre-load is an
+            # optimisation and must never damage in-flight state: resetting the
+            # offered set here would drop their selection and make the agent
+            # re-ask for a time it had already been given.
+            self.logger.info("preloaded_menu_skipped_selection_in_flight")
+            return 0
         usable = [
             {"slot_id": str(s["slot_id"]), "start": str(s["start"]),
              "label": str(s.get("label") or ""), "timezone": timezone}
@@ -109,7 +124,12 @@ class CRMTools:
         self._selected_slot_id = None
         self._selected_start = None
         self._selection_user_turn = 0
-        self._offer_user_turn = 0 if origin == "preloaded" else self._user_turn
+        self._offer_user_turn = self._user_turn
+        # A pre-loaded menu was never READ OUT to the caller — it only exists in the
+        # agent's head. "The caller clearly chose one of the times I offered" is
+        # therefore not yet true of it, so selecting from it demands an unambiguous
+        # time of their own (see _strong_time_signal).
+        self._menu_announced = origin != "preloaded"
         self._booking_attempts.append(
             {
                 "operation": "availability",
@@ -154,6 +174,7 @@ class CRMTools:
         self._selected_start = None
         self._selection_user_turn = 0
         self._offer_user_turn = self._user_turn
+        self._menu_announced = True
         self._booking_attempts.append(
             {
                 "operation": "availability",
@@ -381,10 +402,36 @@ class CRMTools:
                 candidates.add(slot["slot_id"])
         return candidates
 
+    _STRONG_TIME_SIGNAL = re.compile(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow)\b"
+        r"|\b\d{1,2}\s*(am|pm)\b|\b[ap]\.?\s?m\.?\b|\bo'?clock\b"
+        r"|\b(noon|midday|morning|afternoon|evening)\b"
+        r"|\b(half|quarter)\s+(past|to)\b|\b\d{1,2}:\d{2}\b",
+        re.IGNORECASE,
+    )
+
+    def _strong_time_signal(self) -> bool:
+        """Whether the caller named a time in a way that cannot be something else.
+
+        Only required for a menu the caller was never read (see seed_offered_slots).
+        A bare number is not enough there: "give me two minutes" would otherwise
+        match a two o'clock opening and look like a choice.
+        """
+        return bool(self._STRONG_TIME_SIGNAL.search(self._latest_user_utterance))
+
     async def select_slot(self, slot_id: str) -> dict[str, Any]:
         """Pin one offered slot only when the latest post-offer transcript agrees."""
         if not self._offered_slots:
             return {"success": False, "error": "slots_not_offered"}
+        if not self._menu_announced and not self._strong_time_signal():
+            return {
+                "success": False,
+                "error": "ambiguous_slot_selection",
+                "message": (
+                    "They have not named a time clearly enough yet. Offer two of your "
+                    "times out loud, naturally, and wait for them to pick one."
+                ),
+            }
         if self._user_turn <= max(self._offer_user_turn, self._selection_user_turn):
             return {
                 "success": False,

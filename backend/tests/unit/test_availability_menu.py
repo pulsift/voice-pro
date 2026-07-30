@@ -177,3 +177,43 @@ def test_seeding_an_empty_menu_leaves_the_tool_path_in_charge() -> None:
     tools = make_tools()
     assert tools.seed_offered_slots([], "UTC") == 0
     assert tools._offered_slots == []  # noqa: SLF001
+
+
+# --- a menu the caller was never read demands a clearer answer -----------------
+# Codex review, 2026-07-30: the pre-call seed makes the offered set exist BEFORE
+# anything was said aloud, so "the caller chose one of the times I offered" is not
+# yet true of it. A bare number must not be able to select from it.
+
+
+@pytest.mark.asyncio
+async def test_a_bare_duration_cannot_select_from_a_never_spoken_menu() -> None:
+    tools = make_tools()
+    # 14:00 UTC is a two o'clock opening, which "two minutes" would otherwise match.
+    menu = availability.build_menu([{"start": iso(13, 14)}, {"start": iso(14, 9)}], "UTC")
+    tools.seed_offered_slots(menu["slots"], "UTC")
+
+    tools.observe_user_utterance("hang on, give me two minutes")
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_a_properly_named_time_still_selects_from_a_never_spoken_menu() -> None:
+    """The guard must not block the good case: they named a real day and time."""
+    tools = make_tools()
+    menu = availability.build_menu([{"start": iso(13, 14)}, {"start": iso(14, 9)}], "UTC")
+    tools.seed_offered_slots(menu["slots"], "UTC")
+
+    tools.observe_user_utterance("Monday at two in the afternoon is good")
+    assert (await tools.select_slot("slot_1"))["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_once_times_are_offered_aloud_the_ordinary_guard_applies() -> None:
+    """A tool-driven offer WAS spoken, so "the second one" is a valid answer to it."""
+    tools = make_tools()
+    menu = availability.build_menu([{"start": iso(13, 9)}, {"start": iso(13, 14)}], "UTC")
+    tools.observe_user_utterance("what have you got?")
+    tools.seed_offered_slots(menu["slots"], "UTC", origin="offered")
+
+    tools.observe_user_utterance("the second one")
+    assert (await tools.select_slot("slot_2"))["success"] is True

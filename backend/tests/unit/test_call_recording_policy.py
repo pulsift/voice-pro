@@ -385,20 +385,28 @@ def test_consenting_number_is_recordable_even_where_geography_refuses(
     assert recording_allowed(californian) is True
 
 
-def test_national_form_of_a_consenting_number_still_matches(
+def test_cosmetic_formatting_is_forgiven_but_the_number_must_be_the_same(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "+46 700 17 18 94")
-    assert recording_policy.has_explicit_consent("0700171894") is True
     assert recording_policy.has_explicit_consent("+46700171894") is True
+    assert recording_policy.has_explicit_consent("0046700171894") is True  # 00 prefix
+    # The national trunk form is NOT accepted: it is a different digit string, and
+    # guessing at country codes is how a legality gate starts saying yes by accident.
+    assert recording_policy.has_explicit_consent("0700171894") is False
 
 
-def test_a_different_number_never_matches_by_suffix(
+def test_two_real_numbers_sharing_their_last_digits_do_not_collide(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "+13466317855")
-    assert recording_policy.has_explicit_consent("+14155550123") is False
-    assert recording_policy.has_explicit_consent("+13466317856") is False  # near miss
+    """The bug this pins: +1 415 555 0123 and +1 515 555 0123 are DIFFERENT people's
+    phones that share their last nine digits — the leading area-code digit simply
+    falls off. A suffix rule would let one consenting number authorise recording a
+    stranger, inside the function that decides whether recording is legal."""
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "+14155550123")
+    assert recording_policy.has_explicit_consent("+14155550123") is True
+    assert recording_policy.has_explicit_consent("+15155550123") is False
+    assert recording_policy.has_explicit_consent("+13466317856") is False
 
 
 def test_short_or_empty_allowlist_entries_can_never_match_everything(
