@@ -360,3 +360,58 @@ async def test_recording_callback_requires_a_valid_twilio_signature():
 
     assert exc.value.status_code == 403
     db.execute.assert_not_awaited()
+
+
+# --- explicit consent outranks the geographic approximation -------------------
+# Geography is only ever a PROXY for consent, and it cannot express "this person
+# said yes" — which is what the law actually asks for. The allowlist can, and it is
+# how our own handsets get recorded so the agent can be listened to and diagnosed.
+
+
+def test_consenting_number_is_recordable_even_where_geography_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    swedish = "+46700171894"
+    californian = "+14155550123"
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", f"{swedish},{californian}")
+
+    allowed, state, reason = recording_decision(swedish)
+    assert (allowed, state, reason) == (
+        True,
+        None,
+        recording_policy.REASON_EXPLICIT_CONSENT,
+    )
+    # Even an all-party state yields to an actual consenting party.
+    assert recording_allowed(californian) is True
+
+
+def test_national_form_of_a_consenting_number_still_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "+46 700 17 18 94")
+    assert recording_policy.has_explicit_consent("0700171894") is True
+    assert recording_policy.has_explicit_consent("+46700171894") is True
+
+
+def test_a_different_number_never_matches_by_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "+13466317855")
+    assert recording_policy.has_explicit_consent("+14155550123") is False
+    assert recording_policy.has_explicit_consent("+13466317856") is False  # near miss
+
+
+def test_short_or_empty_allowlist_entries_can_never_match_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "7855, , 1, +")
+    assert recording_policy.has_explicit_consent("+13466317855") is False
+
+
+def test_unset_allowlist_leaves_the_policy_exactly_as_it_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "RECORDING_CONSENT_NUMBERS", "")
+    assert recording_allowed("+14155550123") is False  # CA, all-party
+    assert recording_allowed("+46700171894") is False  # non-NANP
+    assert recording_allowed("+12125550123") is True  # NY, one-party

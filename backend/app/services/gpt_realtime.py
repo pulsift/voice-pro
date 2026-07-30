@@ -60,7 +60,26 @@ _DEFAULT_VARS: dict[str, str] = {
     "book_reason_audit_no": "either way, let's grab a quick call so the team can get you set up",
     "brief": "",
     "tzName": "Europe/Stockholm",
+    # Overwritten per call by lead_timezone.resolve(); "Pacific time", not a slash.
+    "tz_spoken": "your local time",
+    # Filled in at answer time by GPTRealtimeSession.load_availability(); this
+    # default is what the agent sees if the calendar could not be pre-loaded.
+    "availability_block": (
+        "The calendar could not be pre-loaded for this call. Once you know their "
+        "timezone, call refresh_availability once and offer what it returns."
+    ),
 }
+
+# The whole first turn. One word, deliberately: Sami's design is that the agent
+# says hello and then STOPS, exactly like a person who has just been picked up on.
+DEFAULT_HELLO_LINE = "Hello?"
+
+# Response ordinals in a normal outbound call: 1 = the bare hello, 2 = the opener.
+_HELLO_RESPONSE_INDEX = 1
+_OPENER_RESPONSE_INDEX = 2
+
+# Cap on audio held back while the opener plays (mu-law 8kHz = 8000 bytes/second).
+_HELD_AUDIO_MAX_BYTES = 8000 * 15
 
 
 def render_template(template: str, variables: dict[str, Any] | None) -> str:
@@ -127,10 +146,9 @@ Current: {current_datetime}
 
 [RULES]
 - Speak ONLY in {language_name}
-- All times are in {tz_name} timezone
-- For booking tools, use ISO format with timezone offset (e.g., 2024-12-01T14:00:00-05:00)
+- Any time you are given without a timezone is in {tz_name}
 - Keep responses concise - this is voice, not text
-- Summarize tool results naturally
+- Never speak a tool name, an id, a timestamp or a field name out loud
 
 [YOUR ROLE]
 {system_prompt}"""
@@ -196,15 +214,37 @@ class GPTRealtimeSession:
         # Transcript accumulation
         self._transcript_entries: list[TranscriptEntry] = []
         self._current_assistant_text: str = ""
-        # Initial greeting (triggered after event loop starts to avoid race condition)
-        self._pending_initial_greeting: str | None = None
-        self._greeting_triggered: bool = False
+        # --- opening sequence (hello-first) -------------------------------------
+        # The agent's first turn is a bare "Hello?" spoken the moment the line is
+        # answered, then silence until the caller speaks. Both outcomes work: they
+        # hear it and answer (we flow into the opener), or the pickup was too early,
+        # they never heard it, and we are already in the position of waiting for
+        # them to speak first.
+        self._hello_line: str = DEFAULT_HELLO_LINE
+        self._hello_sent: bool = False
+        self._caller_has_spoken: bool = False
+        self._response_count: int = 0
+        self._opener_protected: bool = False
         # Inbound-audio gate. Open by default; closed while an initial greeting is
         # pending so the caller's early "hello" can't trigger VAD and cancel the
         # greeting mid-birth. Re-opened when the greeting response completes (or on
         # error, fail-open). Covers both the Telnyx and Twilio bridges since both
         # feed audio through send_audio().
         self._input_gate_open: bool = True
+        # Opener protection: while the opener is being spoken, caller audio is HELD
+        # (buffered) rather than forwarded, so a "yeah?" or "hello?" landing on top
+        # of it cannot make the server cancel the turn half-way. Sami's ask was that
+        # the opener runs all the way to "caught you at an okay time?" — and holding
+        # beats dropping, because nothing they said is lost: it is flushed the
+        # instant the opener finishes.
+        self._input_hold: bool = False
+        self._held_audio: bytearray = bytearray()
+        self._held_audio_dropped: int = 0
+        # Rendering inputs kept so instructions can be re-pushed mid-session once
+        # the availability menu arrives.
+        self._instructions_language: str = "en-US"
+        self._instructions_timezone: str = "UTC"
+        self._availability_loaded: bool = False
         self.realtime_model = settings.OPENAI_REALTIME_MODEL
         self.realtime_reasoning_effort = settings.OPENAI_REALTIME_REASONING_EFFORT
         self.logger = logger.bind(
@@ -327,15 +367,12 @@ class GPTRealtimeSession:
                 workspace_timezone = workspace.settings.get("timezone", "UTC")
 
         # Build instructions with language directive and timezone
-        system_prompt = self.agent_config.get("system_prompt", "You are a helpful voice assistant.")
-        # Fill per-call {{placeholders}} (lead name/company/offer/tz, etc.) before wrapping.
-        system_prompt = render_template(system_prompt, self.variables)
         language = self.agent_config.get("language", "en-US")
         # Default to marin for natural conversational tone
         voice = self.agent_config.get("voice", "marin")
-        instructions = build_instructions_with_language(
-            system_prompt, language, timezone=workspace_timezone
-        )
+        self._instructions_language = language
+        self._instructions_timezone = workspace_timezone
+        instructions = self._render_instructions()
 
         # GA Realtime session shape (nested audio config). Audio is G.711 mu-law 8kHz
         # both ways to match Telnyx PCMU media with no transcoding. (speed/temperature
@@ -386,19 +423,13 @@ class GPTRealtimeSession:
                 tool_count=len(tools),
             )
 
-            # Callee-speaks-first design: the agent stays QUIET on connect and the
-            # caller's own "hello?" triggers the model's first response (the prompt
-            # supplies the greeting line). The stored greeting is only a FALLBACK
-            # for silent answerers, fired by a timer in the telephony loop - so the
-            # inbound gate stays OPEN here (there is no greeting response to protect
-            # yet; the fallback closes it itself when it fires).
-            initial_greeting = self.agent_config.get("initial_greeting")
-            if initial_greeting:
-                self._pending_initial_greeting = initial_greeting
-                self.logger.info(
-                    "initial_greeting_pending_callee_first",
-                    greeting=initial_greeting[:50],
-                )
+            # Hello-first design: the agent's opening line is settled here and
+            # spoken by send_hello() as soon as the telephony loop is running (the
+            # bridge owns the timing so the response can never be created before
+            # the event loop is ready to stream its audio).
+            configured_hello = str(self.agent_config.get("initial_greeting") or "").strip()
+            self._hello_line = configured_hello or DEFAULT_HELLO_LINE
+            self.logger.info("hello_line_ready", hello=self._hello_line[:60])
         except Exception as e:
             self.logger.exception(
                 "session_config_failed", error=str(e), error_type=type(e).__name__
@@ -548,75 +579,163 @@ class GPTRealtimeSession:
 
         return result
 
-    def consume_pending_greeting(self) -> bool:
-        """The caller spoke first - the prompt supplies the greeting organically.
+    def _render_instructions(self) -> str:
+        """Render the full instruction text from the prompt template + variables."""
+        system_prompt = render_template(
+            self.agent_config.get("system_prompt", "You are a helpful voice assistant."),
+            self.variables,
+        )
+        return build_instructions_with_language(
+            system_prompt,
+            self._instructions_language,
+            timezone=self._instructions_timezone,
+        )
 
-        Disarms the silent-answerer fallback so it can never double-greet.
-        Returns True if a pending greeting was consumed.
+    async def load_availability(self) -> bool:
+        """Pre-load the calendar into the agent's head, not into a mid-call tool call.
+
+        Runs as a background task the moment the media stream opens, so the "Hello?"
+        never waits on Cal.com. When the menu lands (a few hundred ms later, while
+        the caller is still saying hello) the live session's instructions are
+        re-pushed with the real open times, and the booking tools adopt the very
+        same slot ids — so the times the agent can SAY are exactly the times
+        select_slot will accept.
+
+        Returns True when a non-empty menu was applied. Never raises.
         """
-        if self._pending_initial_greeting and not self._greeting_triggered:
-            self._greeting_triggered = True
-            self.logger.info("greeting_fallback_disarmed_caller_spoke_first")
-            return True
-        return False
-
-    async def trigger_initial_greeting(self) -> bool:
-        """FALLBACK ONLY: greet a silent answerer (or voicemail) after a timer.
-
-        The normal path is callee-speaks-first - the caller's own "hello?"
-        triggers the model's first response and the prompt supplies the
-        greeting line. This fires only when nobody has spoken.
-
-        Returns:
-            True if greeting was triggered, False if no greeting pending or already triggered
-        """
-        if not self._pending_initial_greeting or self._greeting_triggered:
+        if self._availability_loaded or not self.connection:
             return False
-
-        if not self.connection:
-            self.logger.warning("cannot_trigger_greeting_no_connection")
-            return False
-
-        self._greeting_triggered = True
-        greeting = self._pending_initial_greeting
-
-        self.logger.info("triggering_initial_greeting_fallback", greeting=greeting[:50])
-
         try:
-            # Protect the greeting while it plays: drop caller audio until its
-            # response.done (or an error) reopens the gate - same mechanism as
-            # before, now scoped to the fallback path only.
-            self._input_gate_open = False
-            # Clear any buffered input audio to prevent line noise from
-            # triggering VAD and cancelling the greeting response
-            await self.connection.input_audio_buffer.clear()
+            from app.services import lead_timezone
+            from app.services.availability import fetch_menu
 
-            # Standard OpenAI Realtime pattern:
-            # 1. Create a conversation item with the prompt
-            # 2. Call response.create() to trigger the response
-            # This follows the official OpenAI examples
-            await self.connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"[Call connected. Say this greeting now: {greeting}]",
-                        }
-                    ],
+            # Derived, not asked for: an explicit timezone on the record, else the
+            # lead's state, else the area code of the number we are calling.
+            lead_tz, tz_source = lead_timezone.resolve(self.variables)
+            self.variables["tzName"] = lead_tz
+            self.variables["tz_spoken"] = lead_timezone.spoken_zone_name(lead_tz)
+            self.logger.info(
+                "lead_timezone_resolved", timezone=lead_tz, source=tz_source
+            )
+
+            menu = await fetch_menu(lead_tz)
+            self._availability_loaded = True
+            adopted = 0
+            if self.tool_registry:
+                adopted = self.tool_registry.crm_tools.seed_offered_slots(
+                    menu["slots"], menu["timezone"]
+                )
+            self.variables["availability_block"] = menu["block"]
+            await self.connection.session.update(
+                session={"type": "realtime", "instructions": self._render_instructions()}
+            )
+            self.logger.info(
+                "availability_preloaded",
+                slot_count=adopted,
+                timezone=menu["timezone"],
+            )
+            return adopted > 0
+        except Exception as e:
+            # A calendar hiccup must never cost us the call: the agent keeps the
+            # default block, which tells it to call refresh_availability instead.
+            self.logger.warning("availability_preload_failed", error=str(e))
+            return False
+
+    async def send_hello(self) -> bool:
+        """Turn 1: say the bare hello, then stop.
+
+        Forced with a per-response instruction override rather than left to the
+        prompt, because this one line must be identical on every call — one word,
+        no pitch, nothing to interrupt. `tool_choice: none` keeps the model from
+        reaching for a tool before anyone has even spoken.
+        """
+        if self._hello_sent or not self.connection:
+            return False
+        self._hello_sent = True
+        try:
+            await self.connection.response.create(
+                response={
+                    "instructions": (
+                        "The call has just been answered. Say exactly this, warmly, "
+                        f'and nothing else: "{self._hello_line}" '
+                        "Then stop and wait for them."
+                    ),
+                    "output_modalities": ["audio"],
+                    "tool_choice": "none",
                 }
             )
-            # Trigger response generation (no parameters needed)
-            await self.connection.response.create()
+            self.logger.info("hello_sent", hello=self._hello_line[:60])
             return True
         except Exception as e:
-            self.logger.exception("initial_greeting_failed", error=str(e))
-            self.open_input_gate()  # fail-open: never leave the caller unheard
+            self.logger.exception("hello_failed", error=str(e))
             return False
 
+    async def send_presence_check(self) -> bool:
+        """Nobody spoke after the hello — ask once whether they can hear us."""
+        if not self.connection or self._caller_has_spoken:
+            return False
+        try:
+            await self.connection.response.create(
+                response={
+                    "instructions": (
+                        "There has been silence since you said hello. Say exactly: "
+                        '"Hello? Can you hear me?" Nothing else.'
+                    ),
+                    "output_modalities": ["audio"],
+                    "tool_choice": "none",
+                }
+            )
+            self.logger.info("presence_check_sent")
+            return True
+        except Exception as e:
+            self.logger.warning("presence_check_failed", error=str(e))
+            return False
+
+    def note_caller_spoke(self) -> None:
+        """Record that a human (or a machine greeting) has made a sound."""
+        self._caller_has_spoken = True
+
+    @property
+    def caller_has_spoken(self) -> bool:
+        """Whether anything has been heard from the far end yet."""
+        return self._caller_has_spoken
+
+    @property
+    def input_held(self) -> bool:
+        """Whether caller audio is currently being buffered instead of forwarded."""
+        return self._input_hold
+
+    def note_response_created(self) -> None:
+        """Count assistant turns and protect the opener from being cut in half."""
+        self._response_count += 1
+        if self._response_count == _OPENER_RESPONSE_INDEX and not self._opener_protected:
+            self._opener_protected = True
+            self._input_hold = True
+            self.logger.info("opener_protection_engaged")
+
+    async def release_input_hold(self, *, reason: str) -> None:
+        """Stop holding caller audio and forward everything held, in order.
+
+        Called on the opener's response.done, on error, and by a hard timeout, so
+        there is no path where the caller stays unheard because a response never
+        completed.
+        """
+        if not self._input_hold:
+            return
+        self._input_hold = False
+        held, self._held_audio = bytes(self._held_audio), bytearray()
+        dropped, self._held_audio_dropped = self._held_audio_dropped, 0
+        self.logger.info(
+            "opener_protection_released",
+            reason=reason,
+            held_bytes=len(held),
+            dropped_bytes=dropped,
+        )
+        if held:
+            await self.send_audio(held)
+
     def open_input_gate(self) -> None:
-        """Allow caller audio through again (greeting finished, or fail-open on error)."""
+        """Allow caller audio through again (fail-open on error)."""
         if not self._input_gate_open:
             self._input_gate_open = True
             self.logger.info("input_gate_opened")
@@ -631,8 +750,18 @@ class GPTRealtimeSession:
             self.logger.error("send_audio_failed_no_connection")
             return
 
-        # Drop caller audio while the greeting is playing so it can't cancel it.
+        # Drop caller audio while a protected line is playing (fail-open gate).
         if not self._input_gate_open:
+            return
+
+        # Opener protection: hold, don't drop. Everything captured here is
+        # forwarded the moment the opener finishes, so an interruption during the
+        # opener is answered a second late instead of being lost.
+        if self._input_hold:
+            room = _HELD_AUDIO_MAX_BYTES - len(self._held_audio)
+            if room > 0:
+                self._held_audio.extend(audio_data[:room])
+            self._held_audio_dropped += max(len(audio_data) - max(room, 0), 0)
             return
 
         try:

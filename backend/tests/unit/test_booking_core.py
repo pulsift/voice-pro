@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from app.core.config import settings
+from app.services.availability import LOOKAHEAD_DAYS
 from app.services.calcom_client import create_booking, normalize_timezone
 from app.services.tools.crm_tools import CRMTools
 
@@ -99,13 +100,15 @@ async def test_calcom_timeout_is_transient() -> None:
 async def test_selection_requires_new_unambiguous_post_offer_utterance() -> None:
     tools = make_tools()
     with patch(
-        "app.services.calcom_client.get_business_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
+        "app.services.calcom_client.get_open_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
     ) as get_slots:
         offered = await tools.check_availability(time_zone="Syrian time zone")
 
     assert offered["timezone"] == "Asia/Damascus"
     assert [slot["slot_id"] for slot in offered["slots"]] == ["slot_1", "slot_2"]
-    get_slots.assert_awaited_once_with(lead_tz="Asia/Damascus")
+    # ONE calendar read for the whole lookahead window: availability is a menu built
+    # once, not two slots re-fetched per question.
+    get_slots.assert_awaited_once_with(lead_tz="Asia/Damascus", days=LOOKAHEAD_DAYS)
     assert (await tools.select_slot("slot_2"))["error"] == "selection_not_heard"
 
     tools.observe_user_utterance("thank you")
@@ -113,11 +116,13 @@ async def test_selection_requires_new_unambiguous_post_offer_utterance() -> None
 
     tools.observe_user_utterance("the second one")
     selected = await tools.select_slot("slot_2")
+    # The spoken label is generated from the slot itself (13:00Z = 16:00 in Damascus),
+    # so what the agent says is always the lead's own clock, in words.
     assert selected == {
         "success": True,
         "slot_id": "slot_2",
         "start": SLOT_2["start"],
-        "when": SLOT_2["label"],
+        "when": "Monday at four in the afternoon",
     }
 
 
@@ -125,7 +130,7 @@ async def test_selection_requires_new_unambiguous_post_offer_utterance() -> None
 async def test_day_or_time_selection_must_identify_exactly_one_slot() -> None:
     tools = make_tools()
     with patch(
-        "app.services.calcom_client.get_business_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
+        "app.services.calcom_client.get_open_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
     ):
         await tools.check_availability(time_zone="Europe/Stockholm")
 
@@ -142,7 +147,7 @@ async def test_spoken_bare_hour_selects_the_only_matching_offered_slot() -> None
         {"start": "2026-07-13T10:00:00Z", "label": "Monday 10:00 AM"},
         {"start": "2026-07-13T15:00:00Z", "label": "Monday 3:00 PM"},
     ]
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="UTC")
 
     tools.observe_user_utterance("ten")
@@ -161,7 +166,7 @@ async def test_bare_digit_hour_and_dotted_meridiem_select_a_slot() -> None:
         {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},  # 10:00 +03
         {"start": "2026-07-14T10:00:00Z", "label": "Tuesday 1:00 PM"},  # 13:00 +03
     ]
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="Asia/Damascus")
 
     tools.observe_user_utterance("All right, let's just go for Tuesday at 1 my time.")
@@ -169,7 +174,7 @@ async def test_bare_digit_hour_and_dotted_meridiem_select_a_slot() -> None:
     assert selected["success"] is True
     assert selected["start"] == slots[1]["start"]
 
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="Asia/Damascus")
     tools.observe_user_utterance("Sorry, I want the Tuesday at 1 p.m.")
     selected = await tools.select_slot("slot_2")
@@ -185,13 +190,13 @@ async def test_day_part_answers_select_the_matching_slot() -> None:
         {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},  # 10:00 +03
         {"start": "2026-07-14T10:00:00Z", "label": "Tuesday 1:00 PM"},  # 13:00 +03
     ]
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="Asia/Damascus")
 
     tools.observe_user_utterance("Let's do the morning one.")
     assert (await tools.select_slot("slot_1"))["success"] is True
 
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="Asia/Damascus")
     tools.observe_user_utterance("The afternoon works better for me.")
     assert (await tools.select_slot("slot_2"))["success"] is True
@@ -202,7 +207,7 @@ async def test_day_part_answers_select_the_matching_slot() -> None:
         {"start": "2026-07-14T07:00:00Z", "label": "Tuesday 10:00 AM"},
     ]
     with patch(
-        "app.services.calcom_client.get_business_slots", AsyncMock(return_value=morning_slots)
+        "app.services.calcom_client.get_open_slots", AsyncMock(return_value=morning_slots)
     ):
         await tools.check_availability(time_zone="Asia/Damascus")
     tools.observe_user_utterance("the morning one")
@@ -216,7 +221,7 @@ async def test_bare_digit_still_ambiguous_when_it_matches_both_slots() -> None:
         {"start": "2026-07-14T01:00:00Z", "label": "Tuesday 1:00 AM"},
         {"start": "2026-07-14T13:00:00Z", "label": "Tuesday 1:00 PM"},
     ]
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=slots)):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="UTC")
 
     tools.observe_user_utterance("Tuesday at 1 works")
@@ -239,7 +244,7 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
     webhook = MagicMock()
     with (
         patch(
-            "app.services.calcom_client.get_business_slots",
+            "app.services.calcom_client.get_open_slots",
             AsyncMock(return_value=[SLOT_1, SLOT_2]),
         ),
         patch("app.services.calcom_client.create_booking", create_booking),
@@ -283,7 +288,7 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
 @pytest.mark.asyncio
 async def test_live_email_overrides_seed_and_missing_placeholder_is_rejected() -> None:
     tools = make_tools(leadEmail="{{leadEmail}}")
-    with patch("app.services.calcom_client.get_business_slots", AsyncMock(return_value=[SLOT_1])):
+    with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=[SLOT_1])):
         await tools.check_availability(time_zone="UTC")
     tools.observe_user_utterance("the first one")
     await tools.select_slot("slot_1")
@@ -343,7 +348,7 @@ async def test_retry_once_and_non_retryable_matrix(
     )
     with (
         patch(
-            "app.services.calcom_client.get_business_slots",
+            "app.services.calcom_client.get_open_slots",
             AsyncMock(return_value=[SLOT_1, SLOT_2]),
         ),
         patch("app.services.calcom_client.create_booking", create_booking),
@@ -385,7 +390,7 @@ async def test_transient_retry_success_fires_one_webhook() -> None:
     webhook = MagicMock()
     with (
         patch(
-            "app.services.calcom_client.get_business_slots",
+            "app.services.calcom_client.get_open_slots",
             AsyncMock(return_value=[SLOT_1, SLOT_2]),
         ),
         patch("app.services.calcom_client.create_booking", create_booking),
@@ -414,7 +419,7 @@ async def test_conflict_refreshes_without_substitute_booking() -> None:
         return_value={"success": False, "category": "conflict", "status_code": 409}
     )
     with (
-        patch("app.services.calcom_client.get_business_slots", get_slots),
+        patch("app.services.calcom_client.get_open_slots", get_slots),
         patch("app.services.calcom_client.create_booking", create_booking),
         patch(
             "app.services.calcom_client.find_existing_booking",
@@ -428,10 +433,17 @@ async def test_conflict_refreshes_without_substitute_booking() -> None:
 
     assert result["error"] == "slot_conflict"
     assert result["slots"] == [
-        {"slot_id": "slot_1", "when": "Tuesday 9:00 AM", "start": fresh[0]["start"]}
+        {
+            "slot_id": "slot_1",
+            "when": "Tuesday at nine in the morning",
+            "start": fresh[0]["start"],
+        }
     ]
     assert create_booking.await_count == 1
-    assert get_slots.await_args_list == [call(lead_tz="UTC"), call(lead_tz="UTC")]
+    assert get_slots.await_args_list == [
+        call(lead_tz="UTC", days=LOOKAHEAD_DAYS),
+        call(lead_tz="UTC", days=LOOKAHEAD_DAYS),
+    ]
     assert (await tools.select_slot("slot_1"))["error"] == "selection_not_heard"
 
 
@@ -440,7 +452,7 @@ async def test_new_availability_invalidates_selection_and_instances_are_isolated
     first = make_tools()
     second = make_tools()
     with patch(
-        "app.services.calcom_client.get_business_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
+        "app.services.calcom_client.get_open_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
     ):
         await first.check_availability(time_zone="UTC")
         first.observe_user_utterance("first")
@@ -451,3 +463,39 @@ async def test_new_availability_invalidates_selection_and_instances_are_isolated
         "slot_not_selected"
     )
     assert (await second.select_slot("slot_1"))["error"] == "slots_not_offered"
+
+
+# --- spoken part-hours ---------------------------------------------------------
+# The agent now offers times the way people say them ("half past four"), so the
+# caller repeats them back that way. A parser that only understood bare hours
+# refused the exact phrasing the agent had just used — caught by the two-AI eval
+# on 2026-07-30, one turn after the agent said "half past four in the afternoon".
+
+
+@pytest.mark.parametrize(
+    ("utterance", "expected"),
+    [
+        ("friday at half past four then", {(4, 30), (16, 30)}),
+        ("quarter to five works", {(4, 45), (16, 45)}),  # counts back an hour
+        ("quarter past two", {(2, 15), (14, 15)}),
+        ("four thirty is fine", {(4, 30), (16, 30)}),
+        ("twenty five past nine", {(9, 25), (21, 25)}),  # not "five past nine"
+        ("half past ten", {(10, 30), (22, 30)}),
+    ],
+)
+def test_spoken_part_hours_are_understood(utterance: str, expected: set) -> None:
+    assert CRMTools._extract_time_matches(utterance) == expected  # noqa: SLF001
+
+
+def test_a_part_hour_does_not_also_claim_the_bare_hour() -> None:
+    """"half past four" must not match a 4:00 slot as well — two matches on one
+    clear answer would be reported as ambiguous and re-asked."""
+    assert (4, 0) not in CRMTools._extract_time_matches("half past four")
+    assert (5, 0) not in CRMTools._extract_time_matches("quarter to five")
+
+
+def test_plain_hours_and_pronouns_are_unchanged() -> None:
+    assert CRMTools._extract_time_matches("ten in the morning") == {(10, 0), (22, 0)}
+    assert CRMTools._extract_time_matches("the morning one") == set()  # pronoun
+    assert CRMTools._extract_time_matches("yeah sure") == set()
+    assert CRMTools._extract_time_matches("5 pm") == {(17, 0)}

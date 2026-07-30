@@ -13,12 +13,19 @@ It is deliberately **fail-safe OFF**: unknown area code, non-US number, toll-fre
 US territory, or anything unparseable all return ``False``. Not recording a call
 costs us a nice-to-have artifact. Recording one we shouldn't have costs a lot more.
 
+One override sits ABOVE the geography: ``RECORDING_CONSENT_NUMBERS``, an allowlist
+of numbers whose owner has personally consented. Geography is only ever a proxy for
+consent, so an actual consenting party is the stronger permission — that is the
+supported way to record our own test handsets and listen to how the agent performs.
+
 The caller is still responsible for ANDing this with the per-agent
 ``Agent.enable_recording`` toggle — this module only speaks to legality, never to
 whether the operator actually wants a recording.
 """
 
 from __future__ import annotations
+
+from app.core.config import settings
 
 # ---------------------------------------------------------------------------
 # Consent classification
@@ -217,6 +224,11 @@ REASON_ONE_PARTY = "one_party_consent_state"
 REASON_ALL_PARTY = "all_party_consent_state"
 REASON_UNKNOWN_AREA_CODE = "unknown_area_code"
 REASON_UNPARSEABLE = "unparseable_number"
+REASON_EXPLICIT_CONSENT = "explicit_consent_allowlist"
+
+# A consent entry must carry at least a full national number, so a short or
+# malformed entry can never match a broad set of real phones by suffix.
+_MIN_CONSENT_MATCH_DIGITS = 9
 
 # Cosmetic separators we tolerate inside a number. Anything else (a letter, a
 # stray symbol) makes the input unparseable rather than silently salvageable.
@@ -281,12 +293,45 @@ def state_for_number(to_number: str | None) -> str | None:
     return AREA_CODE_TO_STATE.get(npa) if npa else None
 
 
+def has_explicit_consent(to_number: str | None) -> bool:
+    """True when this number's owner has personally consented to being recorded.
+
+    Consent is what the law actually asks for; the area-code map only ever
+    APPROXIMATES it from geography, and cannot know it for an international or
+    ported number. ``RECORDING_CONSENT_NUMBERS`` is the narrow, deliberate
+    override for numbers whose owner has actually said yes — in practice our own
+    test handsets, which is how the agent gets listened to and diagnosed.
+
+    Compared on the LAST 9 digits — the subscriber part — because the same phone is
+    written several ways and the prefixes are exactly what differ: +46700171894 and
+    the Swedish national form 0700171894 must be recognised as one number (note the
+    national trunk "0" REPLACES the country code, so aligning on longer suffixes
+    fails). Nine digits is specific enough that two real numbers cannot collide, and
+    the list itself is a handful of operator-entered entries.
+    """
+    target = "".join(char for char in (to_number or "") if char.isdigit())
+    if len(target) < _MIN_CONSENT_MATCH_DIGITS:
+        return False
+    for entry in (settings.RECORDING_CONSENT_NUMBERS or "").split(","):
+        allowed = "".join(char for char in entry if char.isdigit())
+        if len(allowed) < _MIN_CONSENT_MATCH_DIGITS:
+            continue
+        if allowed[-_MIN_CONSENT_MATCH_DIGITS:] == target[-_MIN_CONSENT_MATCH_DIGITS:]:
+            return True
+    return False
+
+
 def recording_decision(to_number: str | None) -> tuple[bool, str | None, str]:
     """Return ``(allowed, state, reason)`` for recording a call to ``to_number``.
 
     The tuple exists so the caller can log *why* a call was or wasn't recorded
     without re-deriving the state.
     """
+    # An explicitly consenting party outranks the geographic approximation — it is
+    # the stronger form of the same permission, not a loophole around it.
+    if has_explicit_consent(to_number):
+        return True, None, REASON_EXPLICIT_CONSENT
+
     npa = area_code(to_number)
     if npa is None:
         return False, None, REASON_UNPARSEABLE

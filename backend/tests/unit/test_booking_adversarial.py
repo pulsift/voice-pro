@@ -33,7 +33,7 @@ def make_tools() -> CRMTools:
 
 async def offer_and_select(tools: CRMTools) -> None:
     with patch(
-        "app.services.calcom_client.get_business_slots",
+        "app.services.calcom_client.get_open_slots",
         AsyncMock(return_value=[SLOT]),
     ):
         await tools.check_availability(time_zone="UTC")

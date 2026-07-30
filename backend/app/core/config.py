@@ -116,9 +116,17 @@ class Settings(BaseSettings):
     # Optional input noise reduction ("near_field" | "far_field"). Filters audio
     # before VAD and the model — cuts phantom turns from line noise on PSTN.
     REALTIME_INPUT_NOISE_REDUCTION: str | None = None
-    # Callee-speaks-first greeting: how long to wait for the answerer's "hello?"
-    # before the agent greets a silent line anyway.
-    REALTIME_GREETING_FALLBACK_SECONDS: float = 5.0
+    # Hello-first opening (services/gpt_realtime.py). The agent says a bare "Hello?"
+    # the instant the line is answered, then waits — which covers both real cases:
+    # they heard it and answer, or the pickup was too early and we are already
+    # waiting for them to speak first.
+    #   NUDGE:  silence after the hello before asking "can you hear me?" once.
+    #   GIVEUP: further silence after that before hanging up (dead air / mute box).
+    #   OPENER_HOLD: hard ceiling on holding caller audio while the opener plays,
+    #     so a response that never completes can never leave the caller unheard.
+    REALTIME_POST_HELLO_NUDGE_SECONDS: float = 12.0
+    REALTIME_POST_HELLO_GIVEUP_SECONDS: float = 12.0
+    REALTIME_OPENER_HOLD_MAX_SECONDS: float = 14.0
     DEEPGRAM_API_KEY: str | None = None
     ELEVENLABS_API_KEY: str | None = None
 
@@ -140,6 +148,13 @@ class Settings(BaseSettings):
     #      one-party-consent US states only, fail-safe OFF on anything unknown)
     # Flip this to False to stop all recording immediately without touching agents.
     CALL_RECORDING_ENABLED: bool = True
+    # Numbers whose owner has personally consented to being recorded (comma-separated
+    # E.164). Consent is the thing the law actually asks for, and the area-code map
+    # cannot know it — so an explicitly consenting party is allowed even when the
+    # geography check would refuse (international, unknown, or an all-party state).
+    # Intended for our OWN test handsets: this is how Sami gets audio of the agent to
+    # diagnose it. Never put a prospect's number here without their real consent.
+    RECORDING_CONSENT_NUMBERS: str = ""
 
     # Cal.com booking (used by the voice agent's check_availability / book_appointment
     # when configured; otherwise the agent falls back to the internal calendar).

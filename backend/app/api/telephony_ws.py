@@ -51,6 +51,87 @@ _TERMINAL_CALL_STATUSES = {
 SHARE_TOKEN_LENGTH = 16
 
 
+class OpeningSequence:
+    """Hello-first opening, and the watchdog that keeps a silent line from hanging.
+
+    Sami's design, in his words: "Make him say 'hello' first, just 'hello' and then
+    either the receiver hears it and responds and the VA proceeds with his opener /
+    or it kicks off too early and they dont hear it and in that case the VA is quiet
+    after he said 'hello' and hes waiting for them to speak first."
+
+    So the whole opening is three facts:
+      1. On answer, one word: the hello. Forced, identical every call.
+      2. Then silence. The caller's first sound is what triggers the opener — which
+         is the same code path whether they heard the hello or not.
+      3. The opener, once it starts, is PROTECTED: caller audio is held (not
+         dropped) until it finishes, so it always reaches "caught you at an okay
+         time?" instead of dying on a "yeah?".
+
+    Plus the case a phone call has and a chat does not: nobody there at all. One
+    "can you hear me?", then hang up, rather than holding a paid line open.
+    """
+
+    def __init__(
+        self,
+        session: GPTRealtimeSession,
+        log: Any,
+        *,
+        on_giveup: Callable[[], None],
+    ) -> None:
+        self._session = session
+        self._log = log
+        self._on_giveup = on_giveup
+        self._silence_task: asyncio.Task[None] | None = None
+        self._hold_task: asyncio.Task[None] | None = None
+        self.started = False
+
+    async def start(self) -> None:
+        """Say the hello and arm the dead-air watchdog (idempotent)."""
+        if self.started:
+            return
+        self.started = True
+        await self._session.send_hello()
+        self._silence_task = asyncio.create_task(self._watch_silence())
+
+    async def _watch_silence(self) -> None:
+        await asyncio.sleep(settings.REALTIME_POST_HELLO_NUDGE_SECONDS)
+        if self._session.caller_has_spoken:
+            return
+        await self._session.send_presence_check()
+        await asyncio.sleep(settings.REALTIME_POST_HELLO_GIVEUP_SECONDS)
+        if self._session.caller_has_spoken:
+            return
+        self._log.info("dead_air_after_hello_hanging_up")
+        self._on_giveup()
+
+    def caller_spoke(self) -> None:
+        """The far end made a sound — disarm the watchdog for good."""
+        self._session.note_caller_spoke()
+        if self._silence_task and not self._silence_task.done():
+            self._silence_task.cancel()
+
+    def response_created(self) -> None:
+        """Count the assistant turn; arm the hold ceiling if the opener started."""
+        self._session.note_response_created()
+        if self._session.input_held and self._hold_task is None:
+            self._hold_task = asyncio.create_task(self._hold_ceiling())
+
+    async def _hold_ceiling(self) -> None:
+        # Belt and braces: if the opener's response.done never arrives (error,
+        # disconnect, model stall), the caller must still be heard.
+        await asyncio.sleep(settings.REALTIME_OPENER_HOLD_MAX_SECONDS)
+        await self._session.release_input_hold(reason="hold_ceiling")
+
+    async def response_finished(self) -> None:
+        """A response completed — release any held caller audio."""
+        await self._session.release_input_hold(reason="response_complete")
+
+    def cancel(self) -> None:
+        for task in (self._silence_task, self._hold_task):
+            if task and not task.done():
+                task.cancel()
+
+
 async def get_agent_workspace_id(agent_id: uuid.UUID, db: AsyncSession) -> uuid.UUID | None:
     """Get workspace ID for an agent."""
     result = await db.execute(select(AgentWorkspace).where(AgentWorkspace.agent_id == agent_id))
@@ -642,8 +723,14 @@ async def _handle_twilio_stream(  # noqa: PLR0915
     async def realtime_to_twilio() -> None:  # noqa: PLR0912, PLR0915
         """Forward audio from GPT Realtime to Twilio."""
         nonlocal should_end_call
-        greeting_fallback_task: asyncio.Task[None] | None = None
         amd_task: asyncio.Task[None] | None = None
+
+        def _giveup() -> None:
+            nonlocal should_end_call
+            should_end_call = True
+
+        opening = OpeningSequence(realtime_session, log, on_giveup=_giveup)
+        availability_task: asyncio.Task[bool] | None = None
 
         try:
             if not realtime_session.connection:
@@ -653,12 +740,6 @@ async def _handle_twilio_stream(  # noqa: PLR0915
             log.info("realtime_to_twilio_started", waiting_for_events=True)
             event_count = 0
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
-
-            async def _greeting_fallback() -> None:
-                # Callee-speaks-first: only greet if the answerer stays silent.
-                await asyncio.sleep(settings.REALTIME_GREETING_FALLBACK_SECONDS)
-                if await realtime_session.trigger_initial_greeting():
-                    log.info("initial_greeting_triggered_by_silence_fallback")
 
             async def _classify_answerer(first_utterance: str) -> None:
                 # C2: the callee's first words say whether a person picked up. On a
@@ -683,17 +764,20 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                 if event_count <= EVENT_LOG_THRESHOLD or event_count % 100 == 0:
                     log.info("realtime_event_received", event_type=event_type, count=event_count)
 
-                # Callee-speaks-first: arm the silent-answerer fallback once the
-                # session is configured; the caller's own speech disarms it.
-                if event_type == "session.updated" and greeting_fallback_task is None:
-                    greeting_fallback_task = asyncio.create_task(_greeting_fallback())
-                    log.info("greeting_fallback_armed")
+                # The session is live: say hello, and start pulling the calendar in
+                # the background so the agent HAS the open times without ever
+                # spending a conversational turn asking for them.
+                if event_type == "session.updated" and not opening.started:
+                    await opening.start()
+                    availability_task = asyncio.create_task(
+                        realtime_session.load_availability()
+                    )
+
+                elif event_type == "response.created":
+                    opening.response_created()
 
                 elif event_type == "input_audio_buffer.speech_started":
-                    if realtime_session.consume_pending_greeting():
-                        log.info("caller_spoke_first_prompt_greeting_active")
-                    if greeting_fallback_task and not greeting_fallback_task.done():
-                        greeting_fallback_task.cancel()
+                    opening.caller_spoke()
                     # BARGE-IN FLUSH (phase 2, 2026-07-29): when the caller
                     # starts speaking, OpenAI cancels its response server-side
                     # but every audio chunk already pushed into Twilio's playout
@@ -787,8 +871,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
-                    # First response.done is the greeting's — reopen the inbound gate.
                     realtime_session.open_input_gate()
+                    # Release any caller audio held while this response played
+                    # (the opener). Held audio is forwarded, never discarded.
+                    await opening.response_finished()
                     # Log full response details for debugging
                     response_data = getattr(event, "response", None)
                     if response_data:
@@ -809,10 +895,13 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         should_end_call = True
                         break
 
-                # Surface Realtime API errors (previously silent) and fail-open the gate.
+                # Surface Realtime API errors (previously silent) and fail-open both
+                # the gate and the opener hold — an errored turn must never leave
+                # the caller unheard.
                 elif event_type == "error":
                     log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
                     realtime_session.open_input_gate()
+                    await opening.response_finished()
 
                 # Log other events
                 elif event_type in [
@@ -825,10 +914,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
         except Exception as e:
             log.exception("realtime_to_twilio_error", error=str(e))
         finally:
-            if greeting_fallback_task and not greeting_fallback_task.done():
-                greeting_fallback_task.cancel()
-            if amd_task and not amd_task.done():
-                amd_task.cancel()
+            opening.cancel()
+            for pending_task in (amd_task, availability_task):
+                if pending_task and not pending_task.done():
+                    pending_task.cancel()
 
     await _run_bridge_tasks(
         twilio_to_realtime,
@@ -1087,7 +1176,13 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
     async def realtime_to_telnyx() -> None:  # noqa: PLR0912, PLR0915
         """Forward audio from GPT Realtime to Telnyx."""
         nonlocal should_end_call
-        greeting_fallback_task: asyncio.Task[None] | None = None
+
+        def _giveup() -> None:
+            nonlocal should_end_call
+            should_end_call = True
+
+        opening = OpeningSequence(realtime_session, log, on_giveup=_giveup)
+        availability_task: asyncio.Task[bool] | None = None
 
         try:
             if not realtime_session.connection:
@@ -1096,26 +1191,22 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
 
-            async def _greeting_fallback() -> None:
-                # Callee-speaks-first: only greet if the answerer stays silent.
-                await asyncio.sleep(settings.REALTIME_GREETING_FALLBACK_SECONDS)
-                if await realtime_session.trigger_initial_greeting():
-                    log.info("initial_greeting_triggered_by_silence_fallback")
-
             async for event in realtime_session.connection:
                 event_type = event.type
 
-                # Callee-speaks-first: arm the silent-answerer fallback once the
-                # session is configured; the caller's own speech disarms it.
-                if event_type == "session.updated" and greeting_fallback_task is None:
-                    greeting_fallback_task = asyncio.create_task(_greeting_fallback())
-                    log.info("greeting_fallback_armed")
+                # Hello-first opening + background calendar pre-load (see
+                # OpeningSequence and GPTRealtimeSession.load_availability).
+                if event_type == "session.updated" and not opening.started:
+                    await opening.start()
+                    availability_task = asyncio.create_task(
+                        realtime_session.load_availability()
+                    )
+
+                elif event_type == "response.created":
+                    opening.response_created()
 
                 elif event_type == "input_audio_buffer.speech_started":
-                    if realtime_session.consume_pending_greeting():
-                        log.info("caller_spoke_first_prompt_greeting_active")
-                    if greeting_fallback_task and not greeting_fallback_task.done():
-                        greeting_fallback_task.cancel()
+                    opening.caller_spoke()
 
                 # Handle audio output (GA: response.output_audio.delta; beta: response.audio.delta)
                 elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -1169,9 +1260,8 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
                 # Handle response completion - check if we should end the call
                 elif event_type == "response.done":
-                    # First response.done is the greeting's — reopen the inbound gate
-                    # so the caller is heard from here on. Idempotent after the first.
                     realtime_session.open_input_gate()
+                    await opening.response_finished()
                     log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
                         log.info("ending_call_after_response_complete")
@@ -1179,10 +1269,12 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                         break
 
                 # Surface Realtime API errors (previously silent) and fail-open the
-                # gate so an errored greeting can never deadlock the caller's audio.
+                # gate + opener hold so an errored turn can never deadlock the
+                # caller's audio.
                 elif event_type == "error":
                     log.warning("realtime_api_error", error=str(getattr(event, "error", event)))
                     realtime_session.open_input_gate()
+                    await opening.response_finished()
 
                 elif event_type in [
                     "response.audio.done",
@@ -1194,8 +1286,9 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
         except Exception as e:
             log.exception("realtime_to_telnyx_error", error=str(e))
         finally:
-            if greeting_fallback_task and not greeting_fallback_task.done():
-                greeting_fallback_task.cancel()
+            opening.cancel()
+            if availability_task and not availability_task.done():
+                availability_task.cancel()
 
     await _run_bridge_tasks(
         telnyx_to_realtime,

@@ -139,6 +139,70 @@ def _parse_iso(value: str) -> datetime:
     return dt
 
 
+async def _fetch_raw_slots(lead_tz: str, days: int) -> dict[str, Any]:
+    """Ask Cal.com for this event type's openings, keyed by date."""
+    now = datetime.now(UTC)
+    start = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    end = (now + timedelta(days=days)).strftime("%Y-%m-%d")
+    headers = {
+        "Authorization": f"Bearer {settings.CALCOM_API_KEY}",
+        "cal-api-version": SLOTS_API_VERSION,
+    }
+    params = {
+        "eventTypeId": settings.CALCOM_EVENT_TYPE_ID,
+        "start": start,
+        "end": end,
+        "timeZone": lead_tz,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(f"{CALCOM_BASE}/slots", headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_lead_zone(lead_tz: str) -> tuple[str, ZoneInfo]:
+    """Validate the lead timezone, falling back to the team's so a bad tzName
+    can never 400 the slots request."""
+    try:
+        return lead_tz, ZoneInfo(lead_tz)
+    except Exception:
+        logger.warning("invalid_lead_tz_falling_back", lead_tz=lead_tz)
+        fallback = settings.BOOKING_TEAM_TIMEZONE
+        return fallback, ZoneInfo(fallback)
+
+
+async def get_open_slots(lead_tz: str, days: int = 12) -> list[dict[str, str]]:
+    """Every weekday business-hours opening, in order — the raw material for the
+    pre-call slot menu (services/availability.py).
+
+    Same filtering rules as get_business_slots (weekdays only, inside
+    [BOOKING_HOUR_START, BOOKING_HOUR_END) evaluated in the LEAD's local time),
+    but with no morning/afternoon reduction: the menu layer decides how many
+    times a human should actually be offered.
+    """
+    lead_tz, lead_zone = _resolve_lead_zone(lead_tz)
+    data = await _fetch_raw_slots(lead_tz, days)
+
+    picked: list[dict[str, str]] = []
+    for date_key in sorted(data.keys()):
+        slots = data[date_key]
+        if not isinstance(slots, list):
+            continue
+        for slot in slots:
+            iso = slot.get("start") if isinstance(slot, dict) else slot
+            if not iso:
+                continue
+            local_dt = _parse_iso(iso).astimezone(lead_zone)
+            if local_dt.weekday() >= SATURDAY_INDEX:
+                continue
+            if not (settings.BOOKING_HOUR_START <= local_dt.hour < settings.BOOKING_HOUR_END):
+                continue
+            picked.append({"start": iso})
+    logger.info("open_slots_fetched", lead_tz=lead_tz, count=len(picked))
+    return picked
+
+
 async def get_business_slots(
     lead_tz: str,
     days: int = 10,

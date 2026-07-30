@@ -242,6 +242,7 @@ class ToolRegistry:
             "search_customer",
             "create_contact",
             "check_availability",
+            "refresh_availability",
             "select_slot",
             "book_appointment",
             "list_appointments",

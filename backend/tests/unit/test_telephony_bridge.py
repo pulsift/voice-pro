@@ -56,7 +56,14 @@ def make_session(connection: object) -> MagicMock:
     session = MagicMock()
     session.connection = connection
     session.send_audio = AsyncMock()
-    session.trigger_initial_greeting = AsyncMock(return_value=False)
+    # Hello-first opening: the bridge speaks the hello, may nudge a silent line, and
+    # releases held caller audio when a response completes.
+    session.send_hello = AsyncMock(return_value=True)
+    session.send_presence_check = AsyncMock(return_value=True)
+    session.load_availability = AsyncMock(return_value=False)
+    session.release_input_hold = AsyncMock()
+    session.input_held = False
+    session.caller_has_spoken = False
     session.handle_function_call_event = AsyncMock(return_value={"success": True})
     return session
 

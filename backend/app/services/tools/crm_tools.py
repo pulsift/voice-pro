@@ -72,6 +72,60 @@ class CRMTools:
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
 
+    def seed_offered_slots(
+        self,
+        slots: list[dict[str, Any]],
+        timezone: str,
+        *,
+        origin: str = "preloaded",
+    ) -> int:
+        """Adopt a slot menu as the offered set (services/availability.py).
+
+        This is what lets the agent skip asking the calendar anything: the times it
+        can see in its prompt are already the times select_slot will accept. The
+        transcript-bound selection guard is untouched — a menu the agent can read is
+        still not permission to pick on the caller's behalf.
+
+        `origin` decides which utterance can answer this menu, and the distinction
+        matters:
+          - "preloaded" (before the call): nobody has spoken yet, so the first thing
+            the caller says is a legitimate answer to it.
+          - "offered" (mid-call refresh, e.g. after a conflict): the menu is NEW, so
+            it takes a NEW utterance. Carrying turn 0 here would let a word said
+            before the refresh select one of the fresh times.
+
+        Returns the number of slots adopted (0 leaves the tool path in charge).
+        """
+        usable = [
+            {"slot_id": str(s["slot_id"]), "start": str(s["start"]),
+             "label": str(s.get("label") or ""), "timezone": timezone}
+            for s in slots
+            if isinstance(s, dict) and s.get("slot_id") and s.get("start")
+        ]
+        if not usable:
+            return 0
+        self._offered_slots = usable
+        self._normalized_timezone = timezone
+        self._selected_slot_id = None
+        self._selected_start = None
+        self._selection_user_turn = 0
+        self._offer_user_turn = 0 if origin == "preloaded" else self._user_turn
+        self._booking_attempts.append(
+            {
+                "operation": "availability",
+                "attempt": len(self._booking_attempts) + 1,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "category": origin,
+                "timezone": timezone,
+                "turn": self._offer_user_turn,
+                "slot_ids": [slot["slot_id"] for slot in usable],
+            }
+        )
+        self.logger.info(
+            "offered_slots_seeded", origin=origin, count=len(usable), timezone=timezone
+        )
+        return len(usable)
+
     def _calcom_enabled(self) -> bool:
         """True when Cal.com is configured to back booking (else internal calendar)."""
         return bool(settings.CALCOM_API_KEY and settings.CALCOM_EVENT_TYPE_ID)
@@ -123,6 +177,85 @@ class CRMTools:
         return parsed.astimezone(UTC)
 
     @staticmethod
+    def _spoken_minute_matches(
+        text: str, word_hours: dict[str, int]
+    ) -> tuple[set[tuple[int, int]], set[int], str]:
+        """Parse spoken part-hours: "half past four", "quarter to five", "four thirty".
+
+        Returns `(time_matches, hours_consumed)`. Both halves of the day are produced
+        for each phrase, exactly like bare spoken hours: the caller says no am/pm, and
+        the offered-slot set is what must reduce it to one. A "to" phrase counts back
+        from the named hour ("quarter to five" is 4:45).
+
+        `hours_consumed` is the 12-hour values this phrase already accounts for, so
+        the bare-hour pass does NOT also read "half past four" as four o'clock — that
+        would match two slots at once and make a clear answer look ambiguous.
+
+        `residual` is the text with every matched phrase blanked out. Without it,
+        "twenty five past nine" would also be read as "five past nine" and as a bare
+        "five", inventing two times the caller never said.
+        """
+        matches: set[tuple[int, int]] = set()
+        consumed: set[int] = set()
+        hour_word = "|".join(word_hours)
+        past_minutes = {
+            "five past": 5, "ten past": 10, "quarter past": 15, "twenty past": 20,
+            "twenty five past": 25, "half past": 30,
+        }
+        to_minutes = {
+            "twenty five to": 35, "twenty to": 40, "quarter to": 45,
+            "ten to": 50, "five to": 55,
+        }
+        trailing_minutes = {
+            "fifteen": 15, "thirty": 30, "forty five": 45, "forty-five": 45,
+        }
+
+        def add(hour12: int, minute: int) -> None:
+            matches.add((hour12 % MAX_12_HOUR, minute))
+            matches.add((hour12 % MAX_12_HOUR + MAX_12_HOUR, minute))
+
+        def named_hour(token: str) -> int | None:
+            return word_hours.get(token) or (
+                int(token) if token.isdigit() and 1 <= int(token) <= MAX_12_HOUR else None
+            )
+
+        residual = text
+
+        def consume(span: tuple[int, int]) -> None:
+            nonlocal residual
+            start, end = span
+            residual = residual[:start] + " " * (end - start) + residual[end:]
+
+        # Longest phrases first, blanking each match as it is taken, so "twenty five
+        # past nine" is not ALSO read as "five past nine" or as a bare "five".
+        for phrase, minute in sorted(
+            {**past_minutes, **to_minutes}.items(), key=lambda kv: -len(kv[0])
+        ):
+            for match in list(
+                re.finditer(rf"\b{phrase}\s+({hour_word}|\d{{1,2}})\b", residual)
+            ):
+                named = named_hour(match.group(1))
+                if named is None:
+                    continue
+                consumed.add(named % MAX_12_HOUR)
+                # "quarter to five" = 4:45 — the hour BEFORE the one named.
+                hour = (named - 1 or MAX_12_HOUR) if phrase in to_minutes else named
+                consumed.add(hour % MAX_12_HOUR)
+                add(hour, minute)
+                consume(match.span())
+
+        for phrase, minute in trailing_minutes.items():
+            for match in list(
+                re.finditer(rf"\b({hour_word}|\d{{1,2}})\s+{phrase}\b", residual)
+            ):
+                named = named_hour(match.group(1))
+                if named is not None:
+                    consumed.add(named % MAX_12_HOUR)
+                    add(named, minute)
+                    consume(match.span())
+        return matches, consumed, residual
+
+    @staticmethod
     def _extract_time_matches(text: str) -> set[tuple[int, int]]:
         """Parse every (hour, minute) the utterance could be naming."""
         time_matches: set[tuple[int, int]] = set()
@@ -148,6 +281,12 @@ class CRMTools:
             "eleven": 11,
             "twelve": 12,
         }
+        # SPOKEN minutes. The agent offers times the way a person says them ("half
+        # past four", "quarter to five"), so the caller repeats them back that way -
+        # and a parser that only understood bare hours refused the very phrasing we
+        # had just used. Found by the conversational eval, 2026-07-30.
+        spoken, spoken_hours, residual = CRMTools._spoken_minute_matches(text, word_hours)
+        time_matches.update(spoken)
         # "one" doubles as a pronoun ("the morning one") - only count it as an
         # hour in a time context. Other number words are safe bare.
         one_as_hour = (
@@ -156,10 +295,12 @@ class CRMTools:
             r"|\bone\s+(?:in|at|pm|am)\b"
         )
         for word, hour in word_hours.items():
+            if hour % MAX_12_HOUR in spoken_hours:
+                continue  # already read as "half past four" / "quarter to five"
             if word == "one":
-                if not re.search(one_as_hour, text):
+                if not re.search(one_as_hour, residual):
                     continue
-            elif not re.search(rf"\b{word}\b", text):
+            elif not re.search(rf"\b{word}\b", residual):
                 continue
             # Spoken bare hours have no AM/PM. Match both halves of the day;
             # the offered-slot set must still reduce this to exactly one slot.
@@ -168,9 +309,11 @@ class CRMTools:
         # Bare DIGIT hours ("at 1", "around 10") - transcription often writes
         # digits, not words. Same both-halves treatment as spoken word hours.
         for match in re.finditer(
-            r"\b(?:at|around|about|for)\s+(\d{1,2})\b(?!\s*(?::|am|pm))", text
+            r"\b(?:at|around|about|for)\s+(\d{1,2})\b(?!\s*(?::|am|pm))", residual
         ):
             hour = int(match.group(1))
+            if hour % MAX_12_HOUR in spoken_hours:
+                continue
             if 1 <= hour <= MAX_12_HOUR:
                 time_matches.add((hour % MAX_12_HOUR, 0))
                 time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
@@ -345,14 +488,14 @@ class CRMTools:
             },
             {
                 "type": "function",
-                "name": "check_availability",
-                "description": "Get the next available appointment slots (already within business hours, on upcoming weekdays). Returns ready-to-offer openings - just offer two of them.",
+                "name": "refresh_availability",
+                "description": "Re-read the calendar. You normally do NOT need this: the open times are already listed in your instructions. Call it ONLY if (a) the lead's timezone turns out to be different from the one your listed times are in, or (b) a time you tried was already taken.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "time_zone": {
                             "type": "string",
-                            "description": "The lead's IANA timezone as they stated it (e.g. Europe/Stockholm, America/New_York). Slots are returned in this timezone.",
+                            "description": "The lead's IANA timezone as they stated it (e.g. Europe/Stockholm, America/New_York). The refreshed times come back in this timezone.",
                         },
                         "date": {
                             "type": "string",
@@ -369,13 +512,13 @@ class CRMTools:
             {
                 "type": "function",
                 "name": "select_slot",
-                "description": "Select one of the latest offered slots after the lead clearly chooses it.",
+                "description": "Lock in one of your listed times, after the lead clearly names it. Pass the id shown next to that time.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "slot_id": {
                             "type": "string",
-                            "description": "Opaque slot ID returned by check_availability, such as slot_1 or slot_2.",
+                            "description": "The id shown beside the time in your listed availability, such as slot_1 or slot_4.",
                         },
                     },
                     "required": ["slot_id"],
@@ -394,7 +537,7 @@ class CRMTools:
                     "properties": {
                         "scheduled_at": {
                             "type": "string",
-                            "description": "Chosen appointment start time in ISO 8601 format - use the exact 'start' value returned by check_availability.",
+                            "description": "Chosen appointment start time in ISO 8601 format - use the exact 'start' value select_slot returned.",
                         },
                         "email": {
                             "type": "string",
@@ -654,7 +797,7 @@ class CRMTools:
         """
         # --- Cal.com path (preferred) ---
         if self._calcom_enabled():
-            from app.services.calcom_client import get_business_slots, normalize_timezone
+            from app.services.calcom_client import normalize_timezone
 
             lead_tz = normalize_timezone(
                 spoken=time_zone,
@@ -672,9 +815,17 @@ class CRMTools:
                     "message": "Ask for their city once before checking the calendar.",
                 }
             try:
-                slots = await get_business_slots(lead_tz=lead_tz)
-                self._replace_offered_slots(slots, lead_tz)
-                if not slots:
+                # Same menu shape the pre-call load produces, so a refresh mid-call
+                # (their timezone differed, or a slot was taken) replaces the menu
+                # like-for-like instead of shrinking it to two times.
+                from app.services.availability import fetch_menu
+
+                menu = await fetch_menu(lead_tz)
+                adopted = self.seed_offered_slots(
+                    menu["slots"], menu["timezone"], origin="offered"
+                )
+                if not adopted:
+                    self._replace_offered_slots([], lead_tz)
                     return {
                         "success": True,
                         "slots": [],
@@ -682,12 +833,13 @@ class CRMTools:
                     }
                 return {
                     "success": True,
-                    "timezone": lead_tz,
+                    "timezone": menu["timezone"],
                     "slots": [
                         {"slot_id": s["slot_id"], "when": s["label"], "start": s["start"]}
                         for s in self._offered_slots
                     ],
-                    "message": "Offer these times, hear a clear choice, then call select_slot with its slot_id.",
+                    "menu": menu["block"],
+                    "message": "This is the calendar now. Answer whatever they asked for from it, hear a clear choice, then call select_slot with its slot_id.",
                 }
             except Exception as e:
                 self._offered_slots = []
@@ -998,16 +1150,18 @@ class CRMTools:
                 }
                 return deepcopy(self._booking_completed)
             if booking_result.get("category") == "conflict":
-                from app.services.calcom_client import get_business_slots
+                from app.services.availability import fetch_menu
 
                 try:
-                    fresh_slots = await get_business_slots(lead_tz=lead_tz)
+                    fresh_menu = await fetch_menu(lead_tz)
                 except Exception as e:
                     self._replace_offered_slots([], lead_tz)
                     self.logger.exception("calcom_conflict_refresh_failed", error=str(e))
                     return {"success": False, "error": "calendar_unavailable"}
-                self._replace_offered_slots(fresh_slots, lead_tz)
-                if not fresh_slots:
+                if not self.seed_offered_slots(
+                    fresh_menu["slots"], fresh_menu["timezone"], origin="offered"
+                ):
+                    self._replace_offered_slots([], lead_tz)
                     return {
                         "success": False,
                         "error": "calendar_unavailable",
@@ -1323,7 +1477,11 @@ class CRMTools:
             return await self.search_customer(**arguments)
         if tool_name == "create_contact":
             return await self.create_contact(**arguments)
-        if tool_name == "check_availability":
+        # Two names, one handler: "refresh_availability" is what the agent is now
+        # offered (the menu is pre-loaded, so re-reading the calendar is the
+        # exception), while "check_availability" stays routed for older agent
+        # configs and saved transcripts.
+        if tool_name in ("refresh_availability", "check_availability"):
             return await self.check_availability(**arguments)
         if tool_name == "select_slot":
             return await self.select_slot(**arguments)

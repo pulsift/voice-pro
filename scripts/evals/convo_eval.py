@@ -69,6 +69,7 @@ FORBIDDEN_SPOKEN = (
     "slot_1",
     "slot_2",
     "check_availability",
+    "refresh_availability",
     "select_slot",
     "book_appointment",
     "wait_for_user",
@@ -92,26 +93,61 @@ FORBIDDEN_SPOKEN = (
     "i'll go with",
 )
 
+# "The agent has just offered times." Deliberately broad: every scenario keys off
+# this, so it must survive rewording of the offer itself.
+OFFER_PATTERN = (
+    r"which (suits|works|one|should)|work better|would you like|half past|quarter"
+    r"|in the (morning|afternoon|evening)|o'clock|midday|prefer"
+)
+
 BOOKED_CLAIMS = ("booked", "you're set", "you are set", "locked in")
+
+# The opener must reach its closing time-check inside the SAME turn.
+OPENER_END_MARKERS = ("okay time", "ok time", "good time", "bad time", "caught you")
+
+# Questions the agent can always answer from its own pre-loaded calendar. Asking
+# them back is the exact behaviour Sami heard and called out.
+BOUNCED_QUESTIONS = (
+    "what day works",
+    "which day works",
+    "what day would work",
+    "what timezone are you",
+    "which timezone",
+    "what time zone are you",
+)
 
 
 def fake_slots() -> list[dict[str, str]]:
-    """Two future Tuesday openings: 10:00 and 13:00 Damascus time (+03)."""
+    """Openings on the next Tuesday and Friday, in the lead's own timezone.
+
+    Deliberately NOT every weekday: the agent must be able to say "nothing
+    Wednesday, but I have Thursday" from data rather than lob the question back.
+    Times are 10:00 and 13:00 Damascus (+03) on Tuesday, 16:30 and 18:00 on Friday.
+    """
     now = datetime.now(UTC)
-    days_ahead = (1 - now.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    tue = now + timedelta(days=days_ahead)
-    s1 = tue.replace(hour=7, minute=0, second=0, microsecond=0)
-    s2 = tue.replace(hour=10, minute=0, second=0, microsecond=0)
 
-    def fmt(d: datetime) -> str:
-        return d.isoformat().replace("+00:00", "Z")
+    def next_weekday(target: int) -> datetime:
+        ahead = (target - now.weekday()) % 7 or 7
+        return now + timedelta(days=ahead)
 
+    def fmt(moment: datetime) -> str:
+        return moment.isoformat().replace("+00:00", "Z")
+
+    tue = next_weekday(1)
+    fri = next_weekday(4)
     return [
-        {"start": fmt(s1), "label": "Tuesday 10:00 AM"},
-        {"start": fmt(s2), "label": "Tuesday 1:00 PM"},
+        {"start": fmt(tue.replace(hour=7, minute=0, second=0, microsecond=0))},
+        {"start": fmt(tue.replace(hour=10, minute=0, second=0, microsecond=0))},
+        {"start": fmt(fri.replace(hour=13, minute=30, second=0, microsecond=0))},
+        {"start": fmt(fri.replace(hour=15, minute=0, second=0, microsecond=0))},
     ]
+
+
+def eval_menu() -> dict[str, Any]:
+    """The pre-loaded menu the production bridge builds before the call starts."""
+    from app.services.availability import build_menu
+
+    return build_menu(fake_slots(), VARS["tzName"])
 
 
 def install_fakes() -> None:
@@ -129,8 +165,8 @@ def install_fakes() -> None:
         "raw_body": "",
     }
     for module in (calcom_client, crm_module):
-        if hasattr(module, "get_business_slots"):
-            module.get_business_slots = AsyncMock(return_value=slots)
+        if hasattr(module, "get_open_slots"):
+            module.get_open_slots = AsyncMock(return_value=slots)
         if hasattr(module, "create_booking"):
             module.create_booking = AsyncMock(return_value=booked)
         if hasattr(module, "find_existing_booking"):
@@ -141,9 +177,15 @@ def install_fakes() -> None:
             module.schedule_fulfilment_webhook = lambda _payload: None
 
 
-def load_instructions(prompt_file: Path) -> str:
+def load_instructions(prompt_file: Path, menu: dict[str, Any]) -> str:
+    """Render the prompt exactly as the live session does, menu included."""
+    from app.services.lead_timezone import spoken_zone_name
+
+    variables = dict(VARS)
+    variables["availability_block"] = menu["block"]
+    variables["tz_spoken"] = spoken_zone_name(str(VARS["tzName"]))
     raw = prompt_file.read_text(encoding="utf-8")
-    rendered = render_template(raw, VARS)
+    rendered = render_template(raw, variables)
     return build_instructions_with_language(rendered, "en-US", timezone="UTC")
 
 
@@ -265,15 +307,59 @@ class Conversation:
                 raise RuntimeError("scenario exceeded response budget")
 
 
+def normalize_spoken(text: str) -> str:
+    """Lowercase and flatten smart punctuation.
+
+    The model writes typographic apostrophes, so every substring check against a
+    hand-written ASCII phrase silently missed. Found on 2026-07-30, when a perfectly
+    correct "I don't have anything on Wednesday" was reported as a violation because
+    its apostrophe was U+2019.
+    """
+    lowered = text.lower()
+    for fancy, plain in (
+        ("’", "'"), ("‘", "'"), ("“", '"'),  # noqa: RUF001
+        ("”", '"'), ("—", "-"), ("–", "-"),  # noqa: RUF001
+    ):
+        lowered = lowered.replace(fancy, plain)
+    return lowered
+
+
+INTENT_MARKERS = ("i'll ", "i will ", "let me ", "i'm going to ", "i am going to ",
+                  "going to ", "shall i", "want me to")
+
+
+def strip_intent(text: str) -> str:
+    """Drop sentences that state an INTENT rather than a completed fact.
+
+    "I'll get that locked in" is a promise; "you're locked in" is a claim. Only the
+    second one can lie about a booking that never happened, so only the second is a
+    violation. Without this the eval failed honest turns.
+    """
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        if not any(marker in sentence for marker in INTENT_MARKERS):
+            kept.append(sentence)
+    return " ".join(kept)
+
+
 def check_common(convo: Conversation, violations: list[str]) -> None:
-    texts = convo.assistant_texts
+    texts = [normalize_spoken(t) for t in convo.assistant_texts]
     if not texts:
         violations.append("agent never spoke")
         return
-    if not texts[0].lower().startswith("heyy sami"):
+    if not texts[0].startswith("heyy sami"):
         violations.append(f"first line is not the greeting: {texts[0][:80]!r}")
+    # Sami's ask: the opener keeps going past the name, all the way to the
+    # time-check. Splitting it across turns is the failure this pins.
+    if not any(marker in texts[0] for marker in OPENER_END_MARKERS):
+        violations.append(f"opener stopped before the time check: {texts[0][:160]!r}")
+    # The calendar is already in hand, so bouncing "what day works for you?" back
+    # at the caller is never the right move.
     for text in texts:
-        low = text.lower()
+        if any(phrase in text for phrase in BOUNCED_QUESTIONS):
+            violations.append(f"asked for a day it could have offered: {text[:120]!r}")
+    for text in texts:
+        low = text
         for phrase in FORBIDDEN_SPOKEN:
             if phrase in low:
                 violations.append(f"tech leakage {phrase!r} in: {text[:100]!r}")
@@ -283,7 +369,7 @@ def check_common(convo: Conversation, violations: list[str]) -> None:
         if e[0] == "tool" and e[1] == "book_appointment" and e[2]:
             create_seen = True
         if e[0] == "assistant" and not create_seen:
-            low = e[1].lower()
+            low = strip_intent(normalize_spoken(e[1]))
             if any(claim in low for claim in BOOKED_CLAIMS):
                 violations.append(f"claimed booked before tool success: {e[1][:100]!r}")
 
@@ -316,6 +402,44 @@ def check_booked_no_wednesday(convo: Conversation, violations: list[str]) -> Non
             violations.append(f"invented a Wednesday time: {text[:100]!r}")
 
 
+def check_day_probe(convo: Conversation, violations: list[str]) -> None:
+    """A named day must be ANSWERED from the calendar, both ways round."""
+    check_booked(convo, violations)
+    texts = [normalize_spoken(t) for t in convo.assistant_texts]
+    joined = " ".join(texts)
+    # Asked about Friday, which the calendar has: real Friday times must appear.
+    friday_reply = next((t for t in texts if "friday" in t), "")
+    if not friday_reply:
+        violations.append("never answered the Friday question with Friday times")
+    elif not any(word in friday_reply for word in ("four", "three", "half past", "quarter")):
+        violations.append(f"named Friday but no actual time: {friday_reply[:120]!r}")
+    # Asked about Wednesday, which it does not have: it must say so rather than
+    # invent one or go quiet about it.
+    if "wednesday at" in joined:
+        violations.append("invented a Wednesday time that is not on the calendar")
+    if "wednesday" in joined and not any(
+        marker in joined
+        for marker in ("nothing", "not got", "haven't got", "don't have", "no wednesday",
+                       "afraid", "nothing on wednesday", "isn't", "not free", "no openings")
+    ):
+        violations.append("did not say plainly that Wednesday is unavailable")
+
+
+def check_vague_then_pick(convo: Conversation, violations: list[str]) -> None:
+    """A vague "yeah" must not select; a named time afterwards must."""
+    check_booked(convo, violations)
+    for index, event in enumerate(convo.events):
+        if event[0] != "caller" or event[1] != "Yeah.":
+            continue
+        # Nothing may have been selected as of the turn right after the vague yes.
+        selected_before = [
+            e for e in convo.events[: index + 2]
+            if e[0] == "tool" and e[1] == "select_slot" and e[2]
+        ]
+        if selected_before:
+            violations.append("accepted a vague 'yeah' as a slot pick")
+
+
 def check_garbled_line(convo: Conversation, violations: list[str]) -> None:
     categories = [a.get("category") for a in convo.crm.get_booking_attempts()]
     if "selected" in categories or "created" in categories:
@@ -333,7 +457,6 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "Yeah hi, who's this?",
             "Oh right, yeah now's fine.",
             "No that's fine, include it.",
-            "I'm in Damascus.",
             "Tuesday at 1 works for me.",
             "Mostly rooftop residential, nothing under 50 kilowatts.",
             "Texas and Arizona.",
@@ -342,44 +465,36 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "final": check_booked,
     },
     "vague_then_first": {
-        "turns": [
-            "Hello?",
-            "Hey. Sure, I have a minute.",
-            "Go ahead, why not.",
-            "Damascus.",
-            "Yeah.",
-            "The morning one.",
-            "Commercial solar mainly, hundred kilowatts minimum.",
-            "Just Texas.",
-            "Great, sounds good, bye.",
+        "rules": [
+            (r"okay time|caught you|good time", ["Hey. Sure, I have a minute."]),
+            (r"audit|includ|shouldn't", ["Go ahead, why not."]),
+            (OFFER_PATTERN, [
+                "Yeah.",  # a vague yes is NOT a pick - the agent must ask which
+                "The later one on Friday then.",
+                "Friday at six in the evening.",
+            ]),
+            (r"solar work|smallest|mainly|kind of work", ["Commercial solar, hundred kilowatts minimum."]),
+            (r"states|areas|cover", ["Just Texas."]),
+            (r"you're set|invite|anything else|booked", ["Great, sounds good, bye."]),
+            (r".", ["Okay."]),
         ],
-        "final": check_booked,
-        "mid_checks": {
-            # After the vague "yeah" (turn index 4) the agent must ask which,
-            # and selection must NOT have been accepted yet.
-            4: lambda convo, violations: (
-                violations.append("accepted a vague 'yeah' as a slot pick")
-                if "selected" in [a.get("category") for a in convo.crm.get_booking_attempts()]
-                else None
-            ),
-        },
+        "final": check_vague_then_pick,
     },
     "wednesday_probe": {
         # Rules-mode: the caller answers whatever the agent actually asked, so
-        # legitimate question re-ordering between prompt versions can't desync
-        # the conversation. Rules are checked in order; each reply used once.
+        # legitimate question re-ordering between prompt versions can't desync the
+        # conversation. Rules are checked in order; each reply is used once.
         "rules": [
-            (r"ten.*\bone\b|\bone\b.*ten|which (suits|works|one)", [
+            (r"okay time|caught you|good time", ["Yes, fine."]),
+            (r"audit|includ|shouldn't", ["Sure, include it."]),
+            (OFFER_PATTERN, [
                 "Have you got anything on Wednesday instead?",
-                "Alright then let's do the Tuesday at one.",
-                "The Tuesday at one in the afternoon.",
+                "Alright then, Friday at half past four in the afternoon.",
+                "The Friday at half past four.",
             ]),
-            (r"timezone|which city", ["Damascus time."]),
-            (r"audit|includ", ["Sure, include it."]),
-            (r"okay time|caught you|good time|okay moment", ["Yes, fine."]),
             (r"solar work|smallest|mainly|kind of work", ["Ground mount, fifty kilowatts and up."]),
             (r"states|areas|cover", ["Nevada."]),
-            (r"you're set|invite|anything else", ["Perfect, thanks, bye."]),
+            (r"you're set|invite|anything else|booked", ["Perfect, thanks, bye."]),
             (r".", ["Okay.", "Go ahead."]),
         ],
         "final": check_booked_no_wednesday,
@@ -392,7 +507,6 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             "Hello?",
             "Yeah, now works.",
             "Sure, include it.",
-            "I'm in the Syrian time zone.",
             "Do you have anything on Wednesday?",
             "Let's go for Tuesday on",
             "Tuesday at one.",
@@ -418,12 +532,34 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         ],
         "final": check_garbled_line,
         "mid_checks": {
-            4: lambda convo, violations: (
-                violations.append("ran the calendar without a real timezone answer")
-                if convo.crm.get_booking_attempts()
+            3: lambda convo, violations: (
+                violations.append("selected a time off Whisper noise")
+                if "selected"
+                in [a.get("category") for a in convo.crm.get_booking_attempts()]
                 else None
             ),
         },
+    },
+    "day_probe": {
+        # THE regression this whole change exists for. Sami named a day and the
+        # agent asked "what day works for you?" back. The calendar holds Tuesday
+        # and Friday only, so: a Friday ask must get Friday TIMES, and a
+        # Wednesday ask must get an honest "nothing Wednesday" plus real
+        # alternatives - never the question bounced back.
+        "rules": [
+            (r"okay time|caught you|good time", ["Yeah, go ahead."]),
+            (r"audit|includ|shouldn't", ["Sure, include it."]),
+            (r"tuesday|friday|which (suits|works|one)|got", [
+                "What have you got on Friday?",
+                "Hmm, what about Wednesday?",
+                "Fine, Friday at half past four then.",
+            ]),
+            (r"solar work|smallest|mainly|kind of work", ["Carports, hundred kilowatts up."]),
+            (r"states|areas|cover", ["California."]),
+            (r"you're set|invite|anything else", ["Great, thanks, bye."]),
+            (r".", ["Okay."]),
+        ],
+        "final": check_day_probe,
     },
     "not_interested": {
         "turns": [
@@ -497,9 +633,16 @@ async def drive_rules_caller(convo: Conversation, spec: dict[str, Any]) -> None:
 
 
 async def run_scenario(
-    client: AsyncOpenAI, instructions: str, name: str, spec: dict[str, Any]
+    client: AsyncOpenAI,
+    instructions: str,
+    name: str,
+    spec: dict[str, Any],
+    menu: dict[str, Any],
 ) -> tuple[bool, str]:
     crm = CRMTools(db=MagicMock(), user_id=1, variables=dict(VARS))
+    # The production bridge pre-loads the calendar before the caller speaks; the
+    # eval must start from the same state or it tests a system we do not ship.
+    crm.seed_offered_slots(menu["slots"], menu["timezone"])
     violations: list[str] = []
     async with client.realtime.connect(model=MODEL) as connection:
         await connection.session.update(
@@ -544,13 +687,16 @@ async def main() -> int:
     args = parser.parse_args()
 
     install_fakes()
-    instructions = load_instructions(args.prompt_file)
+    menu = eval_menu()
+    instructions = load_instructions(args.prompt_file, menu)
     client = AsyncOpenAI(api_key=get_api_key())
 
     names = args.only or list(SCENARIOS)
     results: dict[str, bool] = {}
     for name in names:
-        passed, report = await run_scenario(client, instructions, name, SCENARIOS[name])
+        passed, report = await run_scenario(
+            client, instructions, name, SCENARIOS[name], menu
+        )
         results[name] = passed
         print(report, flush=True)
         if args.out_dir:

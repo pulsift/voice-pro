@@ -255,34 +255,67 @@ async def test_wait_for_user_executes_as_noop() -> None:
     assert "action" not in result  # must not trigger telephony actions
 
 
-def test_caller_speech_consumes_pending_greeting_once() -> None:
-    """Callee-speaks-first: the caller's first words disarm the fallback so it
-    can never double-greet; with no pending greeting nothing is consumed."""
-    session = make_session()
-    session._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
-    assert session.consume_pending_greeting() is True
-    assert session.consume_pending_greeting() is False  # already consumed
+@pytest.mark.asyncio
+async def test_hello_is_one_forced_line_and_fires_once() -> None:
+    """Turn 1 is a bare 'Hello?', forced with a per-response instruction override
+    so it is identical on every call, and it can never fire twice."""
+    session = _make_session_with_connection()
+    session._hello_line = "Hello?"  # noqa: SLF001
 
-    fresh = make_session()
-    assert fresh.consume_pending_greeting() is False  # nothing pending
+    assert await session.send_hello() is True
+    session.connection.response.create.assert_awaited_once()
+    sent = session.connection.response.create.await_args.kwargs["response"]
+    assert '"Hello?"' in sent["instructions"]
+    assert "Then stop and wait for them." in sent["instructions"]
+    # No tool may be reached for before anyone has even spoken.
+    assert sent["tool_choice"] == "none"
+
+    assert await session.send_hello() is False  # single shot
 
 
 @pytest.mark.asyncio
-async def test_greeting_fallback_closes_gate_and_is_single_shot() -> None:
-    """The silent-answerer fallback protects its greeting with the input gate
-    and refuses to fire once the caller has spoken."""
+async def test_opener_is_protected_by_holding_not_dropping_caller_audio() -> None:
+    """The opener must reach 'caught you at an okay time?'. Caller audio during it
+    is HELD and then forwarded, so an interruption is answered late, never lost."""
     session = _make_session_with_connection()
-    session.connection.input_audio_buffer.clear = AsyncMock()
-    session._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
+    session.connection.input_audio_buffer.append = AsyncMock()
 
-    assert await session.trigger_initial_greeting() is True
-    assert session._input_gate_open is False  # noqa: SLF001 - greeting playing
-    session.connection.response.create.assert_awaited_once()
+    session.note_response_created()  # 1: the hello
+    assert session.input_held is False
+    session.note_response_created()  # 2: the opener
+    assert session.input_held is True
 
-    assert await session.trigger_initial_greeting() is False  # single shot
+    await session.send_audio(b"\xff" * 400)
+    session.connection.input_audio_buffer.append.assert_not_awaited()  # held, not sent
 
-    spoken_first = _make_session_with_connection()
-    spoken_first._pending_initial_greeting = "Heyy Sami!"  # noqa: SLF001
-    spoken_first.consume_pending_greeting()
-    assert await spoken_first.trigger_initial_greeting() is False
-    assert spoken_first._input_gate_open is True  # noqa: SLF001 - never closed
+    await session.release_input_hold(reason="test")
+    session.connection.input_audio_buffer.append.assert_awaited_once()  # and now sent
+    assert session.input_held is False
+
+    # Releasing twice is a no-op, so the hold-ceiling timer and response.done can
+    # both fire without double-flushing the caller's audio.
+    session.connection.input_audio_buffer.append.reset_mock()
+    await session.release_input_hold(reason="again")
+    session.connection.input_audio_buffer.append.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_held_audio_is_capped_so_a_stuck_response_cannot_grow_memory() -> None:
+    session = _make_session_with_connection()
+    session.connection.input_audio_buffer.append = AsyncMock()
+    session.note_response_created()
+    session.note_response_created()
+
+    from app.services.gpt_realtime import _HELD_AUDIO_MAX_BYTES
+
+    await session.send_audio(b"\x00" * (_HELD_AUDIO_MAX_BYTES + 5000))
+    assert len(session._held_audio) == _HELD_AUDIO_MAX_BYTES  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_presence_check_is_skipped_once_the_caller_has_spoken() -> None:
+    session = _make_session_with_connection()
+    session.note_caller_spoke()
+    assert session.caller_has_spoken is True
+    assert await session.send_presence_check() is False
+    session.connection.response.create.assert_not_awaited()
