@@ -275,7 +275,7 @@ async def test_a_bare_time_with_no_context_is_still_ambiguous() -> None:
 
 
 @pytest.mark.asyncio
-async def test_yes_to_TWO_proposed_times_is_still_not_a_choice() -> None:
+async def test_yes_to_two_proposed_times_is_still_not_a_choice() -> None:
     tools = make_tools()
     tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
 
