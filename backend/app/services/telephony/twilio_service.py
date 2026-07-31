@@ -1,6 +1,13 @@
 """Twilio telephony service implementation."""
 
+import asyncio
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
+
 import structlog
+from requests.exceptions import Timeout as RequestsTimeout  # type: ignore[import-untyped]
+from twilio.base.exceptions import TwilioRestException
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 from twilio.twiml.voice_response import Connect, VoiceResponse
 
@@ -13,6 +20,63 @@ from app.services.telephony.base import (
 )
 
 logger = structlog.get_logger()
+_TWILIO_HTTP_TIMEOUT_SECONDS = 10.0
+_HTTP_SERVER_ERROR_MIN = 500
+_TWILIO_SDK_TIMEOUT_SECONDS = 12.0
+_TWILIO_SDK_MAX_CONCURRENCY = 8
+_TWILIO_SDK_SEMAPHORE = asyncio.BoundedSemaphore(_TWILIO_SDK_MAX_CONCURRENCY)
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class TwilioSdkTimeoutError(TimeoutError):
+    """The local async deadline elapsed while the SDK worker was still running."""
+
+
+class TwilioDialOutcomeUnknownError(RuntimeError):
+    """Twilio may have accepted the dial; reconciliation must settle the outcome."""
+
+
+def _is_ambiguous_twilio_dial_error(exc: Exception) -> bool:
+    return isinstance(exc, (RequestsTimeout, TwilioSdkTimeoutError)) or (
+        isinstance(exc, TwilioRestException)
+        and isinstance(exc.status, int)
+        and exc.status >= _HTTP_SERVER_ERROR_MIN
+    )
+
+
+async def _run_twilio_sdk(
+    operation: Callable[_P, _T],
+    /,
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _T:
+    """Run one blocking SDK operation without blocking or overfilling the event loop.
+
+    The completion callback owns the semaphore release. Cancellation or a local
+    timeout therefore cannot advertise capacity while the worker thread is still
+    executing the network operation.
+    """
+    await _TWILIO_SDK_SEMAPHORE.acquire()
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    except BaseException:
+        _TWILIO_SDK_SEMAPHORE.release()
+        raise
+
+    def _worker_done(completed: asyncio.Task[_T]) -> None:
+        _TWILIO_SDK_SEMAPHORE.release()
+        if not completed.cancelled():
+            completed.exception()
+
+    worker.add_done_callback(_worker_done)
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=_TWILIO_SDK_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        raise TwilioSdkTimeoutError("Twilio SDK operation exceeded the local deadline") from exc
 
 
 class TwilioService(TelephonyProvider):
@@ -27,7 +91,11 @@ class TwilioService(TelephonyProvider):
         """
         self.account_sid = account_sid
         self.auth_token = auth_token
-        self.client = Client(account_sid, auth_token)
+        http_client = TwilioHttpClient(
+            timeout=_TWILIO_HTTP_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        self.client = Client(account_sid, auth_token, http_client=http_client)
         self.logger = logger.bind(provider="twilio")
 
     async def initiate_call(
@@ -88,7 +156,12 @@ class TwilioService(TelephonyProvider):
             create_params["recording_status_callback"] = recording_callback_url
             create_params["recording_status_callback_event"] = ["completed"]
 
-        call = self.client.calls.create(**create_params)
+        try:
+            call = await _run_twilio_sdk(self.client.calls.create, **create_params)
+        except Exception as exc:
+            if _is_ambiguous_twilio_dial_error(exc):
+                raise TwilioDialOutcomeUnknownError("Twilio dial outcome is unknown") from exc
+            raise
 
         self.logger.info("call_initiated", call_sid=call.sid)
 
@@ -114,7 +187,7 @@ class TwilioService(TelephonyProvider):
         self.logger.info("hanging_up_call", call_sid=call_id)
 
         try:
-            self.client.calls(call_id).update(status="completed")
+            await _run_twilio_sdk(self.client.calls(call_id).update, status="completed")
             return True
         except Exception as e:
             self.logger.exception("hangup_failed", call_sid=call_id, error=str(e))
@@ -129,7 +202,8 @@ class TwilioService(TelephonyProvider):
         self.logger.info("listing_phone_numbers")
 
         numbers = []
-        for number in self.client.incoming_phone_numbers.list():
+        twilio_numbers = await _run_twilio_sdk(self.client.incoming_phone_numbers.list)
+        for number in twilio_numbers:
             numbers.append(
                 PhoneNumber(
                     id=number.sid,
@@ -183,7 +257,9 @@ class TwilioService(TelephonyProvider):
             params["contains"] = contains
 
         numbers = []
-        available = self.client.available_phone_numbers(country).local.list(**params)
+        available = await _run_twilio_sdk(
+            self.client.available_phone_numbers(country).local.list, **params
+        )
 
         for number in available:
             numbers.append(
@@ -214,7 +290,9 @@ class TwilioService(TelephonyProvider):
         """
         self.logger.info("purchasing_phone_number", phone_number=phone_number)
 
-        number = self.client.incoming_phone_numbers.create(phone_number=phone_number)
+        number = await _run_twilio_sdk(
+            self.client.incoming_phone_numbers.create, phone_number=phone_number
+        )
 
         self.logger.info("phone_number_purchased", sid=number.sid)
 
@@ -242,7 +320,7 @@ class TwilioService(TelephonyProvider):
         self.logger.info("releasing_phone_number", sid=phone_number_id)
 
         try:
-            self.client.incoming_phone_numbers(phone_number_id).delete()
+            await _run_twilio_sdk(self.client.incoming_phone_numbers(phone_number_id).delete)
             return True
         except Exception as e:
             self.logger.exception("release_failed", sid=phone_number_id, error=str(e))
@@ -279,7 +357,9 @@ class TwilioService(TelephonyProvider):
                 update_params["status_callback"] = status_callback_url
                 update_params["status_callback_method"] = "POST"
 
-            self.client.incoming_phone_numbers(phone_number_id).update(**update_params)
+            await _run_twilio_sdk(
+                self.client.incoming_phone_numbers(phone_number_id).update, **update_params
+            )
             return True
         except Exception as e:
             self.logger.exception("webhook_config_failed", sid=phone_number_id, error=str(e))
@@ -358,7 +438,7 @@ class TwilioService(TelephonyProvider):
             CallInfo or None if not found
         """
         try:
-            call = self.client.calls(call_sid).fetch()
+            call = await _run_twilio_sdk(self.client.calls(call_sid).fetch)
 
             # Map Twilio status to our CallStatus
             status_map = {

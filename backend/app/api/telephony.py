@@ -36,7 +36,10 @@ from app.services.call_events import schedule_call_ended_event
 from app.services.telephony import recording_policy
 from app.services.telephony.media_grant import arm_twilio_media_grant
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
-from app.services.telephony.twilio_service import TwilioService
+from app.services.telephony.twilio_service import (
+    TwilioDialOutcomeUnknownError,
+    TwilioService,
+)
 
 if TYPE_CHECKING:
     from app.services.telephony.base import PhoneNumber
@@ -1115,6 +1118,14 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
                 agent_id=call_request.agent_id,
             )
     except Exception as exc:
+        if isinstance(exc, TwilioDialOutcomeUnknownError):
+            log.warning(
+                "twilio_dial_outcome_unknown",
+                record_id=str(call_record.id),
+                error_type=type(exc.__cause__).__name__,
+            )
+            raise
+
         # Telnyx-only: an unknown dial outcome must NOT be marked failed (the call may
         # still be live); surface it and let reconciliation settle the record.
         if provider == "telnyx" and is_unknown_telnyx_dial_outcome(exc):

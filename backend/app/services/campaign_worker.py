@@ -30,7 +30,10 @@ from app.models.campaign import (
 )
 from app.models.contact import Contact
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
-from app.services.telephony.twilio_service import TwilioService
+from app.services.telephony.twilio_service import (
+    TwilioDialOutcomeUnknownError,
+    TwilioService,
+)
 
 logger = structlog.get_logger()
 
@@ -40,7 +43,7 @@ MAX_CALLS_PER_TICK = 10  # Maximum calls to initiate per poll cycle
 
 
 class CampaignDialOutcomeUnknownError(Exception):
-    """Telnyx may have accepted the call; automatic redial would risk duplication."""
+    """A provider may have accepted the call; automatic redial risks duplication."""
 
 
 class CampaignWorker:
@@ -411,6 +414,8 @@ class CampaignWorker:
                 agent_id=str(campaign.agent_id),
             )
         except Exception as exc:
+            if isinstance(exc, TwilioDialOutcomeUnknownError):
+                raise CampaignDialOutcomeUnknownError from exc
             if isinstance(telephony_service, TelnyxService) and is_unknown_telnyx_dial_outcome(exc):
                 raise CampaignDialOutcomeUnknownError from exc
             # A definitive provider rejection never produced a call. Undo the
