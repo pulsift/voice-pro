@@ -911,10 +911,20 @@ class GPTRealtimeSession:
         self._current_assistant_text += delta
 
     def flush_assistant_text(self) -> None:
-        """Flush accumulated assistant text to transcript."""
-        if self._current_assistant_text.strip():
-            self.add_assistant_transcript(self._current_assistant_text)
+        """Complete one assistant turn: hand it to the booking state, then persist.
+
+        The booking tools need what the agent SAID regardless of whether transcripts
+        are being stored — "yes" and "midday" only mean something next to the question
+        that prompted them. Persistence stays opt-in, exactly like the caller side.
+        """
+        spoken = self._current_assistant_text.strip()
         self._current_assistant_text = ""
+        if not spoken:
+            return
+        if self.tool_registry:
+            self.tool_registry.observe_assistant_utterance(spoken)
+        if self.agent_config.get("enable_transcript", False):
+            self.add_assistant_transcript(spoken)
 
     def get_transcript(self) -> str:
         """Get the full transcript as formatted text.

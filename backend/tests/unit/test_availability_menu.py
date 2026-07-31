@@ -217,3 +217,110 @@ async def test_once_times_are_offered_aloud_the_ordinary_guard_applies() -> None
 
     tools.observe_user_utterance("the second one")
     assert (await tools.select_slot("slot_2"))["success"] is True
+
+
+# --- the caller's reply is read in the CONTEXT of what the agent just offered ---
+# Live call 2026-07-31. The agent asked "would Monday at midday work?", Sami said
+# "yes, it would" -> refused (he had not NAMED a time). It re-offered, he said
+# "midday" -> refused again, because a 16-slot menu has a midday on four days so the
+# time alone was ambiguous. A person in that conversation understood both answers.
+
+
+def four_day_menu() -> dict:
+    """A midday on four separate days — the shape that broke the live call."""
+    return availability.build_menu(
+        [{"start": iso(day, hour)} for day in (13, 14, 15, 16) for hour in (12, 15)],
+        "UTC",
+    )
+
+
+@pytest.mark.asyncio
+async def test_yes_to_a_single_proposed_time_is_a_choice() -> None:
+    tools = make_tools()
+    menu = four_day_menu()
+    tools.seed_offered_slots(menu["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Yes, it would.")
+
+    selected = await tools.select_slot("slot_1")
+    assert selected["success"] is True
+    assert selected["when"] == "Monday at midday"
+
+
+@pytest.mark.asyncio
+async def test_a_bare_time_resolves_against_the_day_just_named() -> None:
+    tools = make_tools()
+    menu = four_day_menu()
+    tools.seed_offered_slots(menu["slots"], "UTC")
+
+    tools.observe_assistant_utterance(
+        "For Monday, would you like midday, or three in the afternoon?"
+    )
+    tools.observe_user_utterance("Uh, midday.")
+
+    selected = await tools.select_slot("slot_1")
+    assert selected["success"] is True
+    assert selected["when"] == "Monday at midday"
+
+
+@pytest.mark.asyncio
+async def test_a_bare_time_with_no_context_is_still_ambiguous() -> None:
+    """Four middays and nothing offered aloud: refusing and re-asking is correct."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_user_utterance("midday works for me")
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_yes_to_TWO_proposed_times_is_still_not_a_choice() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Monday at midday, or Monday at three?")
+    tools.observe_user_utterance("Yeah.")
+
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_agreement_never_selects_when_no_time_was_proposed() -> None:
+    """"Yes" answering "are you a real person?" must not book anything."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("I'm Pulsift's AI assistant, actually.")
+    tools.observe_user_utterance("Yes, fair enough.")
+
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_yes_but_a_different_time_follows_the_caller_not_the_agent() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Yes, but could we do Tuesday at midday instead?")
+
+    selected = await tools.select_slot("slot_3")  # Tuesday midday
+    assert selected["success"] is True
+    assert selected["when"] == "Tuesday at midday"
+
+
+@pytest.mark.asyncio
+async def test_ordinals_index_what_was_offered_not_the_whole_menu() -> None:
+    """With 8 slots, "the first one" must mean the first of the two just named."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance(
+        "I've got Wednesday at midday, or Wednesday at three in the afternoon."
+    )
+    tools.observe_user_utterance("The first one.")
+
+    selected = await tools.select_slot("slot_5")  # Wednesday midday, not Monday
+    assert selected["success"] is True
+    assert selected["when"] == "Wednesday at midday"

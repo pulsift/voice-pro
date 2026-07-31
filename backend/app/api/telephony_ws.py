@@ -903,7 +903,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                         if settings.AMD_ENABLED and amd_allowed and amd_task is None:
                             amd_task = asyncio.create_task(_classify_answerer(event.transcript))
 
-                elif enable_transcript and event_type in (
+                # Always accumulated: the booking state needs what the agent said in
+                # order to read the caller's reply in context. flush_assistant_text
+                # applies the transcript-persistence toggle itself.
+                elif event_type in (
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
                 ):
@@ -911,7 +914,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type in (
+                elif event_type in (
                     "response.audio_transcript.done",
                     "response.output_audio_transcript.done",
                 ):
@@ -1294,7 +1297,10 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                         realtime_session.observe_user_transcript(event.transcript)
                         log.debug("user_utterance_observed", length=len(event.transcript))
 
-                elif enable_transcript and event_type in (
+                # Always accumulated: the booking state needs what the agent said in
+                # order to read the caller's reply in context. flush_assistant_text
+                # applies the transcript-persistence toggle itself.
+                elif event_type in (
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
                 ):
@@ -1302,7 +1308,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     if hasattr(event, "delta") and event.delta:
                         realtime_session.accumulate_assistant_text(event.delta)
 
-                elif enable_transcript and event_type in (
+                elif event_type in (
                     "response.audio_transcript.done",
                     "response.output_audio_transcript.done",
                 ):

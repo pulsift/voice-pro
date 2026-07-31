@@ -68,6 +68,7 @@ class CRMTools:
         self._user_turn = 0
         self._offer_user_turn = 0
         self._latest_user_utterance = ""
+        self._latest_assistant_utterance = ""
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
@@ -154,6 +155,13 @@ class CRMTools:
         """Observe one completed user transcript for transcript-bound slot selection."""
         self._user_turn += 1
         self._latest_user_utterance = text.strip()
+
+    def observe_assistant_utterance(self, text: str) -> None:
+        """Observe what the agent just SAID, so the caller's reply can be read in
+        context — "yes" and "midday" only mean something next to the question."""
+        spoken = text.strip()
+        if spoken:
+            self._latest_assistant_utterance = spoken
 
     def get_booking_attempts(self) -> list[dict[str, Any]]:
         """Return a safe copy for later CallRecord persistence."""
@@ -342,21 +350,33 @@ class CRMTools:
             time_matches.add((12, 0))
         return time_matches
 
-    def _utterance_slot_candidates(self) -> set[str]:
-        """Conservatively infer the offered slot(s) named by the latest utterance."""
+    def _slots_named_in(self, utterance: str, *, shortlist: list[str] | None = None) -> set[str]:
+        """Which offered slots this sentence could be naming.
+
+        `shortlist` narrows the search to specific slot ids — used to read the
+        CALLER's words against only what the agent actually just offered, which is
+        how a person hears them too.
+        """
         from zoneinfo import ZoneInfo
 
-        text = " ".join(self._latest_user_utterance.lower().split())
+        text = " ".join(utterance.lower().split())
         # Whisper writes dotted meridiems ("1 p.m.") - normalize to "1 pm".
         text = re.sub(r"\b([ap])\.\s?m\.?", r"\1m", text)
+        pool = [
+            slot
+            for slot in self._offered_slots
+            if shortlist is None or slot["slot_id"] in shortlist
+        ]
+
+        # Ordinals are relative to WHAT WAS JUST OFFERED, never to the whole menu.
+        # With a 16-slot menu, "the first one" meaning menu-position-one would pick a
+        # time nobody had mentioned.
+        ordered = sorted(pool, key=lambda slot: str(slot["start"]))
         ordinal_candidates: set[str] = set()
-        if re.search(r"\b(first|earlier)\b", text) and self._offered_slots:
-            ordinal_candidates.add(self._offered_slots[0]["slot_id"])
-        if (
-            re.search(r"\b(second|later)\b", text)
-            and len(self._offered_slots) >= MIN_SLOTS_FOR_SECOND_SELECTION
-        ):
-            ordinal_candidates.add(self._offered_slots[1]["slot_id"])
+        if re.search(r"\b(first|earlier)\b", text) and ordered:
+            ordinal_candidates.add(ordered[0]["slot_id"])
+        if re.search(r"\b(second|later)\b", text) and len(ordered) >= MIN_SLOTS_FOR_SECOND_SELECTION:
+            ordinal_candidates.add(ordered[1]["slot_id"])
         if ordinal_candidates:
             return ordinal_candidates
 
@@ -388,7 +408,7 @@ class CRMTools:
 
         zone = ZoneInfo(self._normalized_timezone or "UTC")
         candidates: set[str] = set()
-        for slot in self._offered_slots:
+        for slot in pool:
             start = self._canonical_start(slot["start"])
             if start is None:
                 continue
@@ -401,6 +421,63 @@ class CRMTools:
             if time_ok and day_ok and period_ok:
                 candidates.add(slot["slot_id"])
         return candidates
+
+    def _utterance_slot_candidates(self) -> set[str]:
+        """The slot the caller just chose, read in the context of what was offered.
+
+        A live call on 2026-07-31 showed why context is not optional. The agent asked
+        "would Monday at midday work?", Sami said "yes, it would", and the booking was
+        refused because he had not NAMED a time. He then said "midday" — refused
+        again, because a 16-slot menu has a midday on four different days, so the time
+        alone was ambiguous. Both readings are wrong; a person in that conversation
+        would have understood both answers perfectly.
+
+        So the caller's words are read against the agent's last turn:
+          - a plain "yes" selects the time IF the agent had just proposed exactly one
+          - a time that matches several days narrows to the day the agent just named
+
+        Everything else is unchanged: silence, a vague "yeah" with nothing proposed,
+        or words matching several offered times still refuse and re-ask.
+        """
+        offered_now = self.slots_offered_aloud()
+        caller_anywhere = self._slots_named_in(self._latest_user_utterance)
+        if not offered_now:
+            return caller_anywhere
+
+        # Read them against the offer FIRST — that is what disambiguates "midday"
+        # when four days have one, and what makes "the first one" mean the first of
+        # the two just named rather than the first in a sixteen-slot menu.
+        in_context = self._slots_named_in(
+            self._latest_user_utterance, shortlist=sorted(offered_now)
+        )
+        if in_context:
+            return in_context
+        if caller_anywhere:
+            return caller_anywhere  # they named something else ("Tuesday instead")
+        if len(offered_now) == 1 and self._is_agreement(self._latest_user_utterance):
+            return offered_now  # "yes, it would" to a single proposed time
+        return set()
+
+    def slots_offered_aloud(self) -> set[str]:
+        """Offered slots the agent named in its most recent turn."""
+        return self._slots_named_in(self._latest_assistant_utterance)
+
+    _AGREEMENT = re.compile(
+        r"^\W*(yes|yeah|yep|yup|sure|ok|okay|perfect|great|good|fine|"
+        r"sounds good|works|that works|it would|i can|please|do that|go ahead|"
+        r"let's do that|lets do that|absolutely|definitely|deal)\b",
+        re.IGNORECASE,
+    )
+
+    def _is_agreement(self, utterance: str) -> bool:
+        """Whether the reply is a plain yes to whatever was just asked.
+
+        Deliberately anchored to the START of the sentence: "yes, that works" agrees,
+        while "yes, but can we do Thursday instead?" begins with agreement and then
+        names something else — the time-matching path handles that one.
+        """
+        text = " ".join((utterance or "").lower().split())
+        return bool(self._AGREEMENT.match(text))
 
     _STRONG_TIME_SIGNAL = re.compile(
         r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow)\b"
@@ -423,6 +500,11 @@ class CRMTools:
         """Pin one offered slot only when the latest post-offer transcript agrees."""
         if not self._offered_slots:
             return {"success": False, "error": "slots_not_offered"}
+        # A menu the caller was never read needs an unambiguous time of their own —
+        # UNLESS the agent has now actually said some of those times out loud, which
+        # is the moment it stops being a private list and becomes a real offer.
+        if self.slots_offered_aloud():
+            self._menu_announced = True
         if not self._menu_announced and not self._strong_time_signal():
             return {
                 "success": False,

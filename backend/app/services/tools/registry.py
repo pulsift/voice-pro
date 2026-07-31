@@ -210,6 +210,10 @@ class ToolRegistry:
         """Forward a completed caller utterance to the per-call CRM state."""
         self.crm_tools.observe_user_utterance(text)
 
+    def observe_assistant_utterance(self, text: str) -> None:
+        """Forward what the agent just said, so a reply can be read in context."""
+        self.crm_tools.observe_assistant_utterance(text)
+
     def get_booking_attempts(self) -> list[dict[str, Any]]:
         """Return sanitized booking diagnostics from the per-call CRM state."""
         return self.crm_tools.get_booking_attempts()
