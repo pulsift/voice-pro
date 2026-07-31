@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from app.api.telephony import (
     InitiateCallRequest,
     initiate_call,
+    require_owned_caller_id,
     resolve_outbound_workspace_id,
     telnyx_answer_webhook,
     telnyx_status_callback,
@@ -50,6 +51,12 @@ def _record() -> MagicMock:
 def _query_result(record: MagicMock | None) -> MagicMock:
     result = MagicMock()
     result.scalars.return_value.all.return_value = [] if record is None else [record]
+    return result
+
+
+def _scalar_result(value: object | None) -> MagicMock:
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = value
     return result
 
 
@@ -307,7 +314,9 @@ async def test_telnyx_pending_record_is_committed_before_external_dial() -> None
     locked = MagicMock()
     db = MagicMock(add=MagicMock(), commit=AsyncMock())
     locked.scalar_one.side_effect = lambda: db.add.call_args.args[0]
-    db.execute = AsyncMock(side_effect=[agent_result, memberships, locked])
+    db.execute = AsyncMock(
+        side_effect=[agent_result, memberships, _scalar_result(uuid.uuid4()), locked]
+    )
     service = MagicMock()
 
     async def dial_after_precommit(**_kwargs: object) -> CallInfo:
@@ -362,7 +371,7 @@ async def test_timeout_after_possible_accept_stays_pending_and_callback_repairs(
         SimpleNamespace(workspace_id=workspace_id, is_default=True)
     ]
     db = MagicMock(add=MagicMock(), commit=AsyncMock())
-    db.execute = AsyncMock(side_effect=[agent_result, memberships])
+    db.execute = AsyncMock(side_effect=[agent_result, memberships, _scalar_result(uuid.uuid4())])
     service = MagicMock()
     service.initiate_call = AsyncMock(
         side_effect=httpx.ReadTimeout("response lost after provider may have accepted")
@@ -613,6 +622,60 @@ async def test_workspace_resolution_rejects_mismatched_membership() -> None:
             requested_workspace_id=uuid.uuid4(),
             db=db,
         )
+
+
+@pytest.mark.asyncio
+async def test_caller_id_ownership_requires_exact_workspace_and_user() -> None:
+    workspace_id = uuid.uuid4()
+    db = MagicMock(execute=AsyncMock(return_value=_scalar_result(uuid.uuid4())))
+
+    await require_owned_caller_id(
+        from_number="+14085550100",
+        workspace_id=workspace_id,
+        owner_user_id=1,
+        db=db,
+    )
+
+    query = db.execute.await_args.args[0]
+    compiled = query.compile()
+    sql = str(compiled)
+    assert "phone_numbers.phone_number" in sql
+    assert "phone_numbers.workspace_id" in sql
+    assert "phone_numbers.user_id" in sql
+    assert "+14085550100" in compiled.params.values()
+    assert workspace_id in compiled.params.values()
+
+
+@pytest.mark.asyncio
+async def test_caller_id_ownership_rejects_number_outside_workspace() -> None:
+    db = MagicMock(execute=AsyncMock(return_value=_scalar_result(None)))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_owned_caller_id(
+            from_number="+14085550100",
+            workspace_id=uuid.uuid4(),
+            owner_user_id=1,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Caller ID is not owned by the selected workspace"
+
+
+@pytest.mark.asyncio
+async def test_caller_id_ownership_rejects_unscoped_call_without_query() -> None:
+    db = MagicMock(execute=AsyncMock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_owned_caller_id(
+            from_number="+14085550100",
+            workspace_id=None,
+            owner_user_id=1,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 403
+    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

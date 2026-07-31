@@ -30,6 +30,7 @@ from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
+from app.models.phone_number import PhoneNumber as StoredPhoneNumber
 from app.models.workspace import AgentWorkspace, Workspace
 from app.services.call_events import schedule_call_ended_event
 from app.services.telephony import recording_policy
@@ -452,6 +453,36 @@ async def resolve_outbound_workspace_id(
         status_code=400,
         detail="workspace_id is required because the agent has multiple workspaces",
     )
+
+
+async def require_owned_caller_id(
+    *,
+    from_number: str,
+    workspace_id: uuid.UUID | None,
+    owner_user_id: int,
+    db: AsyncSession,
+) -> None:
+    """Refuse outbound caller IDs not registered to the resolved workspace owner."""
+    if workspace_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Caller ID is not owned by the selected workspace",
+        )
+
+    result = await db.execute(
+        select(StoredPhoneNumber.id)
+        .where(
+            StoredPhoneNumber.phone_number == from_number,
+            StoredPhoneNumber.workspace_id == workspace_id,
+            StoredPhoneNumber.user_id == user_id_to_uuid(owner_user_id),
+        )
+        .limit(1)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Caller ID is not owned by the selected workspace",
+        )
 
 
 async def update_campaign_contact_from_call(
@@ -887,6 +918,12 @@ async def initiate_call(  # noqa: PLR0915
         agent_id=agent.id,
         owner_user_id=current_user.id,
         requested_workspace_id=workspace_uuid,
+        db=db,
+    )
+    await require_owned_caller_id(
+        from_number=call_request.from_number,
+        workspace_id=workspace_uuid,
+        owner_user_id=current_user.id,
         db=db,
     )
 

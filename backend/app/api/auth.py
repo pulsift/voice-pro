@@ -114,6 +114,12 @@ async def register(
     Returns:
         Created user
     """
+    if settings.APP_ENVIRONMENT == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Public registration is disabled",
+        )
+
     log = logger.bind(email=request.email, username=request.username)
     log.info("registering_user")
 

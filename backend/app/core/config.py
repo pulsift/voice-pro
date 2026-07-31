@@ -1,6 +1,6 @@
 """Application configuration using Pydantic settings."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import PostgresDsn, RedisDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # Application
     APP_NAME: str = "Voice Pro API"
     APP_VERSION: str = "0.1.0"
+    APP_ENVIRONMENT: Literal["development", "test", "production"] = "development"
     DEBUG: bool = False
     # Structlog level override ("DEBUG"|"INFO"|"WARNING"...). Without it, prod
     # (DEBUG=False) filters to WARNING and telephony INFO (greeting, gate,

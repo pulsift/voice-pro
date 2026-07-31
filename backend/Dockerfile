@@ -5,6 +5,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
+    APP_ENVIRONMENT=production \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PORT=8000
