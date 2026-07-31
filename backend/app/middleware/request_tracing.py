@@ -11,6 +11,20 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 logger = structlog.get_logger()
+_SENSITIVE_QUERY_KEYS = frozenset(
+    {"access_token", "cv", "media_grant", "signature", "token"}
+)
+_REDACTED_QUERY_VALUE = "[REDACTED]"
+
+
+def _safe_query_params(request: Request) -> dict[str, str] | None:
+    """Keep query observability without writing capabilities or lead context."""
+    if not request.query_params:
+        return None
+    return {
+        key: _REDACTED_QUERY_VALUE if key.lower() in _SENSITIVE_QUERY_KEYS else value
+        for key, value in request.query_params.items()
+    }
 
 
 class RequestTracingMiddleware(BaseHTTPMiddleware):
@@ -43,10 +57,7 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
         )
 
         # Log request start
-        logger.info(
-            "request_started",
-            query_params=dict(request.query_params) if request.query_params else None,
-        )
+        logger.info("request_started", query_params=_safe_query_params(request))
 
         try:
             response: Response = await call_next(request)

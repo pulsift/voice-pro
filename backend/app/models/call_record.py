@@ -131,6 +131,17 @@ class CallRecord(Base):
         nullable=True,
         comment="Per-call lead/offer variables supplied at dial time (outbound calls)",
     )
+    media_grant_cv_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="SHA-256 of the Twilio cv stream parameter"
+    )
+    media_grant_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="Twilio media grant expiry"
+    )
+    media_grant_consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the single-use Twilio media grant was consumed",
+    )
 
     # Timestamps
     started_at: Mapped[datetime] = mapped_column(

@@ -28,6 +28,7 @@ from app.models.workspace import AgentWorkspace
 from app.services.amd import MACHINE_VERDICTS, classify_greeting
 from app.services.call_events import FALLBACK_DELAY_SECONDS, schedule_call_ended_event
 from app.services.gpt_realtime import GPTRealtimeSession
+from app.services.telephony.media_grant import consume_twilio_media_grant
 
 router = APIRouter(prefix="/ws/telephony", tags=["telephony-ws"])
 logger = structlog.get_logger()
@@ -525,9 +526,9 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
     call_sid: str = ""
 
     try:
-        # Twilio strips query strings from <Stream> URLs, so per-call context (cv,
-        # workspace_id) arrives as TwiML <Parameter> values inside the start event's
-        # customParameters. Consume frames up to and including start BEFORE building
+        # Twilio strips query strings from <Stream> URLs, so the single-use grant and
+        # bound call context arrive in the start event's customParameters. Consume
+        # frames up to and including start BEFORE authorizing or building
         # the session; media frames buffer in the socket meanwhile (same as before,
         # when session setup also preceded the read loop).
         custom_params: dict[str, str] = {}
@@ -542,8 +543,14 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                 stream_sid = start_data.get("streamSid", "")
                 call_sid = start_data.get("callSid", "")
                 raw_params = start_data.get("customParameters") or {}
-                if isinstance(raw_params, dict):
-                    custom_params = {str(k): str(v) for k, v in raw_params.items()}
+                if not isinstance(raw_params, dict) or any(
+                    not isinstance(key, str) or not isinstance(value, str)
+                    for key, value in raw_params.items()
+                ):
+                    log.warning("twilio_media_parameters_invalid")
+                    await websocket.close(code=4003, reason="Invalid media grant")
+                    return
+                custom_params = dict(raw_params)
                 log.info(
                     "twilio_stream_started",
                     stream_sid=stream_sid,
@@ -558,8 +565,21 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                 return
             # anything else pre-start (unexpected) is ignored
 
+        call_record = await consume_twilio_media_grant(
+            db=db,
+            token=custom_params.get("media_grant", ""),
+            call_sid=call_sid,
+            agent_id=agent_id,
+            workspace_id=custom_params.get("workspace_id", ""),
+            cv=custom_params.get("cv", ""),
+        )
+        if call_record is None:
+            log.warning("twilio_media_grant_rejected", call_sid=call_sid)
+            await websocket.close(code=4003, reason="Invalid media grant")
+            return
+
         # Load agent configuration
-        result = await db.execute(select(Agent).where(Agent.id == uuid.UUID(agent_id)))
+        result = await db.execute(select(Agent).where(Agent.id == call_record.agent_id))
         agent = result.scalar_one_or_none()
 
         if not agent:
@@ -577,18 +597,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
         # agent.user_id is now directly the integer user ID
         user_id_int = agent.user_id
 
-        # Outbound answer webhooks carry the authoritative workspace selected by
-        # initiate_call. Inbound/legacy streams may fall back only when unambiguous.
-        try:
-            workspace_id = await resolve_media_workspace_id(
-                agent.id,
-                custom_params.get("workspace_id") or websocket.query_params.get("workspace_id"),
-                db,
-            )
-        except ValueError as exc:
-            log.warning("invalid_media_workspace", error=str(exc))
-            await websocket.close(code=4003, reason="Invalid workspace")
-            return
+        workspace_id = call_record.workspace_id
 
         # Build agent config
         agent_config = {
@@ -600,23 +609,11 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
             "initial_greeting": agent.initial_greeting,
         }
 
-        # Per-call lead/offer variables (base64 JSON) — personalize the prompt + fill
-        # the Cal.com booking attendee. Primary channel: start-event customParameters
-        # (<Parameter> survives Twilio's query-string stripping); query param kept as
-        # fallback for inbound/legacy streams. Telnyx keeps its query-param path.
-        call_variables: dict[str, Any] = {}
-        cv = custom_params.get("cv") or websocket.query_params.get("cv")
-        if cv:
-            try:
-                padded = cv + "=" * (-len(cv) % 4)  # tolerate unpadded base64url
-                decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode("utf-8"))
-                if isinstance(decoded, dict):
-                    call_variables = decoded
-                    log.info("call_variables_loaded", keys=list(call_variables.keys()))
-                else:
-                    log.warning("call_variables_not_dict", got=type(decoded).__name__)
-            except Exception as e:
-                log.warning("call_variables_decode_failed", error=str(e))
+        # Use only canonical variables from the grant-bound call record.
+        stored_variables = call_record.variables
+        call_variables = dict(stored_variables) if isinstance(stored_variables, dict) else {}
+        if call_variables:
+            log.info("call_variables_loaded", keys=list(call_variables.keys()))
 
         # Always render the greeting (defaults fill any {{placeholders}} so none leak raw).
         if agent_config.get("initial_greeting"):

@@ -41,6 +41,9 @@ COLUMN_RECONCILE = (
     # through create_all + this list, so it must be here too — otherwise every
     # transcript save would fail on a column that does not exist.
     ("call_records", "share_token", "VARCHAR(32)"),
+    ("call_records", "media_grant_cv_sha256", "VARCHAR(64)"),
+    ("call_records", "media_grant_expires_at", "TIMESTAMPTZ"),
+    ("call_records", "media_grant_consumed_at", "TIMESTAMPTZ"),
 )
 
 # Indexes on reconciled columns (create_all only builds indexes for tables it

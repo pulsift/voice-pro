@@ -34,6 +34,7 @@ from app.models.phone_number import PhoneNumber as StoredPhoneNumber
 from app.models.workspace import AgentWorkspace, Workspace
 from app.services.call_events import schedule_call_ended_event
 from app.services.telephony import recording_policy
+from app.services.telephony.media_grant import arm_twilio_media_grant
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import TwilioService
 
@@ -52,6 +53,14 @@ _TERMINAL_CALL_STATUSES = {
     CallStatus.NO_ANSWER.value,
     CallStatus.CANCELED.value,
 }
+
+_TWILIO_REJECT_TWIML = """<?xml version="1.0" encoding="UTF-8"?>
+<Response><Hangup/></Response>"""
+
+
+def _twilio_reject_response() -> Response:
+    """Fail closed without opening a media stream."""
+    return Response(content=_TWILIO_REJECT_TWIML, media_type="application/xml")
 
 
 def _parse_telnyx_timestamp(value: Any) -> datetime | None:
@@ -485,6 +494,85 @@ async def require_owned_caller_id(
         )
 
 
+async def _lock_twilio_outbound_answer_record(
+    *,
+    db: AsyncSession,
+    call_record_id: str,
+    call_sid: str,
+    agent_id: str,
+    workspace_id: str,
+    from_number: str,
+    to_number: str,
+) -> CallRecord | None:
+    """Correlate a signed Twilio answer to one precommitted outbound call."""
+    if not call_sid or not from_number or not to_number:
+        return None
+    try:
+        agent_uuid = uuid.UUID(agent_id)
+        workspace_uuid = uuid.UUID(workspace_id) if workspace_id else None
+        record_uuid = uuid.UUID(call_record_id) if call_record_id else None
+    except ValueError:
+        return None
+
+    workspace_filter = (
+        CallRecord.workspace_id == workspace_uuid
+        if workspace_uuid is not None
+        else CallRecord.workspace_id.is_(None)
+    )
+    scope = (
+        CallRecord.provider == "twilio",
+        CallRecord.direction == CallDirection.OUTBOUND.value,
+        CallRecord.agent_id == agent_uuid,
+        workspace_filter,
+        CallRecord.from_number == from_number,
+        CallRecord.to_number == to_number,
+    )
+
+    if record_uuid is not None:
+        result = await db.execute(
+            select(CallRecord)
+            .where(
+                CallRecord.id == record_uuid,
+                *scope,
+                or_(
+                    CallRecord.provider_call_id == call_sid,
+                    CallRecord.provider_call_id.like("pending:%"),
+                ),
+            )
+            .limit(2)
+            .with_for_update()
+        )
+        candidates = result.scalars().all()
+    else:
+        result = await db.execute(
+            select(CallRecord)
+            .where(*scope, CallRecord.provider_call_id == call_sid)
+            .limit(2)
+            .with_for_update()
+        )
+        candidates = result.scalars().all()
+        if not candidates:
+            pending = await db.execute(
+                select(CallRecord)
+                .where(
+                    *scope,
+                    CallRecord.provider_call_id.like("pending:%"),
+                    CallRecord.created_at >= datetime.now(UTC) - timedelta(minutes=2),
+                    CallRecord.ended_at.is_(None),
+                )
+                .order_by(CallRecord.created_at.desc())
+                .limit(2)
+                .with_for_update()
+            )
+            candidates = pending.scalars().all()
+
+    if len(candidates) != 1:
+        return None
+    record = candidates[0]
+    record.provider_call_id = call_sid
+    return record
+
+
 async def update_campaign_contact_from_call(
     call_record: CallRecord,
     call_status: str,
@@ -866,7 +954,7 @@ async def release_phone_number(
 
 @router.post("/calls", response_model=CallResponse)
 @limiter.limit("30/minute")  # Rate limit outbound call initiation (costs money!)
-async def initiate_call(  # noqa: PLR0915
+async def initiate_call(  # noqa: PLR0912, PLR0915
     call_request: InitiateCallRequest,
     request: Request,
     current_user: CurrentUser,
@@ -948,8 +1036,11 @@ async def initiate_call(  # noqa: PLR0915
 
     # Build webhook URL (forward per-call variables as base64-JSON in ?cv= so the
     # answer webhook -> media WS can personalize the prompt + fill the booking attendee)
+    call_record_id = uuid.uuid4()
     base_url = str(request.base_url).rstrip("/")
     webhook_url = f"{base_url}/webhooks/{provider}/answer?agent_id={call_request.agent_id}"
+    if provider == "twilio":
+        webhook_url = f"{webhook_url}&call_record_id={call_record_id}"
     if workspace_uuid:
         webhook_url = f"{webhook_url}&workspace_id={workspace_uuid}"
     if call_request.variables:
@@ -985,6 +1076,7 @@ async def initiate_call(  # noqa: PLR0915
     # callback can then reconcile by the unique pending From/To record instead of
     # being lost in the POST-before-record race.
     call_record = CallRecord(
+        id=call_record_id,
         user_id=user_id_to_uuid(current_user.id),
         workspace_id=workspace_uuid,
         provider=provider,
@@ -1167,19 +1259,52 @@ async def twilio_voice_webhook(
     # Get workspace for the agent
     agent_workspace_id = await get_agent_workspace_id(agent.id, db)
 
-    # Create call record for inbound call
-    call_record = CallRecord(
-        user_id=agent.user_id,
-        workspace_id=agent_workspace_id,
-        provider="twilio",
-        provider_call_id=call_sid,
-        agent_id=agent.id,
-        direction=CallDirection.INBOUND.value,
-        status=CallStatus.RINGING.value,
-        from_number=from_number,
-        to_number=to_number,
+    existing = await db.execute(
+        select(CallRecord)
+        .where(
+            CallRecord.provider == "twilio",
+            CallRecord.provider_call_id == call_sid,
+        )
+        .limit(2)
+        .with_for_update()
     )
-    db.add(call_record)
+    candidates = existing.scalars().all()
+    if len(candidates) > 1:
+        log.warning("twilio_inbound_call_ambiguous")
+        await db.rollback()
+        return _twilio_reject_response()
+    if candidates:
+        call_record = candidates[0]
+        if (
+            call_record.direction != CallDirection.INBOUND.value
+            or call_record.agent_id != agent.id
+            or call_record.workspace_id != agent_workspace_id
+            or call_record.from_number != from_number
+            or call_record.to_number != to_number
+        ):
+            log.warning("twilio_inbound_call_scope_mismatch")
+            await db.rollback()
+            return _twilio_reject_response()
+    else:
+        call_record = CallRecord(
+            id=uuid.uuid5(uuid.NAMESPACE_URL, f"pulsift:twilio:{call_sid}"),
+            user_id=agent.user_id,
+            workspace_id=agent_workspace_id,
+            provider="twilio",
+            provider_call_id=call_sid,
+            agent_id=agent.id,
+            direction=CallDirection.INBOUND.value,
+            status=CallStatus.RINGING.value,
+            from_number=from_number,
+            to_number=to_number,
+        )
+        db.add(call_record)
+
+    media_grant = arm_twilio_media_grant(call_record, "")
+    if media_grant is None:
+        log.warning("twilio_inbound_media_grant_refused")
+        await db.rollback()
+        return _twilio_reject_response()
     await db.commit()
     log.info("call_record_created", record_id=str(call_record.id))
 
@@ -1190,7 +1315,14 @@ async def twilio_voice_webhook(
 
     # Generate TwiML to connect to our WebSocket
     twilio_service = TwilioService("", "")  # Just need TwiML generation
-    twiml = twilio_service.generate_answer_response(stream_url, agent_id)
+    twiml = twilio_service.generate_answer_response(
+        stream_url,
+        agent_id,
+        custom_parameters={
+            "media_grant": media_grant,
+            "workspace_id": str(call_record.workspace_id) if call_record.workspace_id else "",
+        },
+    )
 
     log.info("twilio_twiml_generated", agent_id=agent_id)
 
@@ -1279,7 +1411,11 @@ async def twilio_answer_webhook(
     agent_id: str = Query(default=""),
     cv: str = Query(default=""),
     workspace_id: str = Query(default=""),
+    call_record_id: str = Query(default=""),
     db: AsyncSession = Depends(get_db),
+    call_sid: str = Form(default="", alias="CallSid"),
+    from_number: str = Form(default="", alias="From"),
+    to_number: str = Form(default="", alias="To"),
 ) -> Response:
     """Handle Twilio outbound call connection.
 
@@ -1294,30 +1430,39 @@ async def twilio_answer_webhook(
     log = logger.bind(webhook="twilio_answer", agent_id=agent_id, has_cv=bool(cv))
     log.info("twilio_outbound_answered")
 
-    # Build WebSocket URL (forward the per-call variables blob if present)
+    call_record = await _lock_twilio_outbound_answer_record(
+        db=db,
+        call_record_id=call_record_id,
+        call_sid=call_sid,
+        agent_id=agent_id,
+        workspace_id=workspace_id,
+        from_number=from_number,
+        to_number=to_number,
+    )
+    if call_record is None:
+        log.warning("twilio_outbound_call_not_correlated")
+        await db.rollback()
+        return _twilio_reject_response()
+
+    media_grant = arm_twilio_media_grant(call_record, cv)
+    if media_grant is None:
+        log.warning("twilio_outbound_media_grant_refused", record_id=str(call_record.id))
+        await db.rollback()
+        return _twilio_reject_response()
+    await db.commit()
+
     base_url = str(request.base_url).rstrip("/")
     ws_url = base_url.replace("http://", "wss://").replace("https://", "wss://")
     stream_url = f"{ws_url}/ws/telephony/twilio/{agent_id}"
-    query_parts: list[str] = []
-    if workspace_id:
-        from urllib.parse import quote
-
-        query_parts.append(f"workspace_id={quote(workspace_id, safe='')}")
-    if cv:
-        from urllib.parse import quote
-
-        query_parts.append(f"cv={quote(cv, safe='')}")
-    if query_parts:
-        stream_url = f"{stream_url}?{'&'.join(query_parts)}"
-
-    # Twilio strips the query string off <Stream> URLs, so cv/workspace_id must ALSO
-    # travel as TwiML <Parameter> values (arrive in the start event's customParameters).
-    # The query params above stay as a harmless fallback for older in-flight calls.
     twilio_service = TwilioService("", "")
     twiml = twilio_service.generate_answer_response(
         stream_url,
         agent_id,
-        custom_parameters={"cv": cv, "workspace_id": workspace_id},
+        custom_parameters={
+            "cv": cv,
+            "workspace_id": str(call_record.workspace_id) if call_record.workspace_id else "",
+            "media_grant": media_grant,
+        },
     )
 
     return Response(content=twiml, media_type="application/xml")

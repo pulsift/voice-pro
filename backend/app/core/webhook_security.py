@@ -149,7 +149,7 @@ async def verify_twilio_webhook(request: Request) -> bool:
 
     # Validate signature
     if not validate_twilio_signature(signature, url, params, auth_token):
-        logger.warning("invalid_twilio_signature", url=url)
+        logger.warning("invalid_twilio_signature", path=request.url.path)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     return True

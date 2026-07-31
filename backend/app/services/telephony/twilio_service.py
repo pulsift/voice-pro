@@ -63,7 +63,7 @@ class TwilioService(TelephonyProvider):
             "initiating_call",
             to=to_number,
             from_=from_number,
-            webhook_url=webhook_url,
+            has_webhook=bool(webhook_url),
             agent_id=agent_id,
             record=record,
         )
