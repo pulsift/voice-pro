@@ -1299,7 +1299,7 @@ async def twilio_voice_webhook(
     else:
         call_record = CallRecord(
             id=uuid.uuid5(uuid.NAMESPACE_URL, f"pulsift:twilio:{call_sid}"),
-            user_id=agent.user_id,
+            user_id=user_id_to_uuid(agent.user_id),
             workspace_id=agent_workspace_id,
             provider="twilio",
             provider_call_id=call_sid,
@@ -1593,7 +1593,7 @@ async def telnyx_voice_webhook(
 
     # Create call record for inbound call
     call_record = CallRecord(
-        user_id=agent.user_id,
+        user_id=user_id_to_uuid(agent.user_id),
         workspace_id=agent_workspace_id,
         provider="telnyx",
         provider_call_id=call_control_id,
