@@ -24,6 +24,7 @@ from app.api.telephony_ws import (
     telnyx_media_stream,
     update_telnyx_media_lifecycle,
 )
+from app.core.config import settings
 from app.models.call_record import CallStatus
 from app.models.campaign import CampaignContactStatus
 from app.services.campaign_worker import CampaignWorker
@@ -301,7 +302,11 @@ async def test_telnyx_answer_forwards_authoritative_workspace_to_media_stream() 
 
 
 @pytest.mark.asyncio
-async def test_telnyx_pending_record_is_committed_before_external_dial() -> None:
+async def test_telnyx_pending_record_is_committed_before_external_dial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent = SimpleNamespace(id=agent_id, user_id=1)
@@ -361,7 +366,11 @@ async def test_telnyx_pending_record_is_committed_before_external_dial() -> None
 
 
 @pytest.mark.asyncio
-async def test_timeout_after_possible_accept_stays_pending_and_callback_repairs() -> None:
+async def test_timeout_after_possible_accept_stays_pending_and_callback_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent_result = MagicMock()

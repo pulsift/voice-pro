@@ -57,6 +57,7 @@ def test_menu_groups_by_day_and_numbers_slots_chronologically() -> None:
     raw = [{"start": iso(13, 9)}, {"start": iso(13, 14)}, {"start": iso(14, 11)}]
     menu = availability.build_menu(raw, "UTC")
 
+    assert menu["status"] == "available"
     assert [slot["slot_id"] for slot in menu["slots"]] == ["slot_1", "slot_2", "slot_3"]
     assert [slot["day"] for slot in menu["slots"]] == ["Monday", "Monday", "Tuesday"]
     assert menu["slots"][1]["label"] == "Monday at two in the afternoon"
@@ -93,6 +94,7 @@ def test_menu_is_rendered_in_the_leads_own_clock() -> None:
 
 def test_bad_timezone_degrades_to_an_empty_menu_not_an_exception() -> None:
     menu = availability.build_menu([{"start": iso(13, 9)}], "Nowhere/Land")
+    assert menu["status"] == "unavailable"
     assert menu["slots"] == []
     assert "refresh_availability" in menu["block"]
 
@@ -114,6 +116,7 @@ async def test_fetch_menu_never_raises_when_the_calendar_is_down(
         AsyncMock(side_effect=RuntimeError("cal.com 500")),
     ):
         menu = await availability.fetch_menu("UTC")
+    assert menu["status"] == "unavailable"
     assert menu["slots"] == []
     assert menu["timezone"] == "UTC"
 
@@ -124,8 +127,25 @@ async def test_fetch_menu_skips_cleanly_when_calcom_is_unconfigured(
 ) -> None:
     monkeypatch.setattr(settings, "CALCOM_API_KEY", None)
     menu = await availability.fetch_menu("UTC")
+    assert menu["status"] == "unavailable"
     assert menu["slots"] == []
 
+
+@pytest.mark.asyncio
+async def test_fetch_menu_distinguishes_a_healthy_empty_calendar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "CALCOM_API_KEY", "k")
+    monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 1)
+    with patch(
+        "app.services.calcom_client.get_open_slots",
+        AsyncMock(return_value=[]),
+    ):
+        menu = await availability.fetch_menu("UTC")
+
+    assert menu["status"] == "empty"
+    assert menu["slots"] == []
+    assert "no open business-hours times" in menu["block"]
 
 # --- the booking tools adopt the menu ----------------------------------------
 

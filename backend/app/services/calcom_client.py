@@ -34,6 +34,11 @@ MORNING_START_HOUR = 9
 NOON_HOUR = 12
 AFTERNOON_END_HOUR = 16
 
+class CalendarAvailabilityError(RuntimeError):
+    """Cal.com did not return a trustworthy availability document."""
+
+
+
 _TIMEZONE_ALIASES = {
     "syria": "Asia/Damascus",
     "syrian time": "Asia/Damascus",
@@ -157,8 +162,12 @@ async def _fetch_raw_slots(lead_tz: str, days: int) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(f"{CALCOM_BASE}/slots", headers=headers, params=params)
         resp.raise_for_status()
-        data = resp.json().get("data", {})
-    return data if isinstance(data, dict) else {}
+        payload = resp.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        message = "Cal.com slots payload has no object data field"
+        raise CalendarAvailabilityError(message)
+    return data
 
 
 def _resolve_lead_zone(lead_tz: str) -> tuple[str, ZoneInfo]:
@@ -188,12 +197,18 @@ async def get_open_slots(lead_tz: str, days: int = 12) -> list[dict[str, str]]:
     for date_key in sorted(data.keys()):
         slots = data[date_key]
         if not isinstance(slots, list):
-            continue
+            message = "Cal.com slots payload contains a non-list day"
+            raise CalendarAvailabilityError(message)
         for slot in slots:
-            iso = slot.get("start") if isinstance(slot, dict) else slot
-            if not iso:
-                continue
-            local_dt = _parse_iso(iso).astimezone(lead_zone)
+            iso = slot.get("start") if isinstance(slot, dict) else None
+            if not isinstance(iso, str) or not iso.strip():
+                message = "Cal.com slots payload contains a slot without a start"
+                raise CalendarAvailabilityError(message)
+            try:
+                local_dt = _parse_iso(iso).astimezone(lead_zone)
+            except (TypeError, ValueError) as exc:
+                message = "Cal.com slots payload contains an invalid start"
+                raise CalendarAvailabilityError(message) from exc
             if local_dt.weekday() >= SATURDAY_INDEX:
                 continue
             if not (settings.BOOKING_HOUR_START <= local_dt.hour < settings.BOOKING_HOUR_END):

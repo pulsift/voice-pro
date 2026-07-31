@@ -17,6 +17,10 @@ from app.core.cache import cache_invalidate
 from app.core.config import settings
 from app.models.appointment import Appointment
 from app.models.contact import Contact
+from app.services.availability import (
+    CALCOM_REQUIRED_BACKEND,
+    CALENDAR_BACKEND_VARIABLE,
+)
 from app.services.fulfilment_webhook import schedule_fulfilment_webhook
 
 logger = structlog.get_logger()
@@ -58,6 +62,9 @@ class CRMTools:
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.variables = variables or {}
+        self._requires_calcom = (
+            self.variables.get(CALENDAR_BACKEND_VARIABLE) == CALCOM_REQUIRED_BACKEND
+        )
         self.logger = logger.bind(
             component="crm_tools", user_id=user_id, workspace_id=str(workspace_id)
         )
@@ -957,7 +964,7 @@ class CRMTools:
             self.logger.exception("create_contact_failed", error=str(e))
             return {"success": False, "error": str(e)}
 
-    async def check_availability(  # noqa: PLR0912
+    async def check_availability(  # noqa: PLR0911, PLR0912
         self,
         date: str | None = None,
         duration_minutes: int = 30,  # noqa: ARG002
@@ -1003,16 +1010,22 @@ class CRMTools:
                 from app.services.availability import fetch_menu
 
                 menu = await fetch_menu(lead_tz)
-                adopted = self.seed_offered_slots(
-                    menu["slots"], menu["timezone"], origin="offered"
-                )
-                if not adopted:
+                if menu["status"] == "unavailable":
+                    self._replace_offered_slots([], lead_tz)
+                    return {"success": False, "error": "calendar_unavailable"}
+                if menu["status"] == "empty":
                     self._replace_offered_slots([], lead_tz)
                     return {
                         "success": True,
                         "slots": [],
                         "message": "No open business-hours slots in the next two weeks - ask the lead for a preferred day.",
                     }
+                adopted = self.seed_offered_slots(
+                    menu["slots"], menu["timezone"], origin="offered"
+                )
+                if not adopted:
+                    self._replace_offered_slots([], lead_tz)
+                    return {"success": False, "error": "calendar_unavailable"}
                 return {
                     "success": True,
                     "timezone": menu["timezone"],
@@ -1027,8 +1040,16 @@ class CRMTools:
                 self._offered_slots = []
                 self._selected_slot_id = None
                 self._selected_start = None
-                self.logger.exception("calcom_check_availability_failed", error=str(e))
+                self.logger.exception(
+                    "calcom_check_availability_failed", error_type=type(e).__name__
+                )
                 return {"success": False, "error": "calendar_unavailable"}
+
+        if self._requires_calcom:
+            self._offered_slots = []
+            self._selected_slot_id = None
+            self._selected_start = None
+            return {"success": False, "error": "calendar_unavailable"}
 
         # --- Internal calendar fallback ---
         try:
@@ -1338,17 +1359,26 @@ class CRMTools:
                     fresh_menu = await fetch_menu(lead_tz)
                 except Exception as e:
                     self._replace_offered_slots([], lead_tz)
-                    self.logger.exception("calcom_conflict_refresh_failed", error=str(e))
+                    self.logger.exception(
+                        "calcom_conflict_refresh_failed", error_type=type(e).__name__
+                    )
                     return {"success": False, "error": "calendar_unavailable"}
+                if fresh_menu["status"] == "unavailable":
+                    self._replace_offered_slots([], lead_tz)
+                    return {"success": False, "error": "calendar_unavailable"}
+                if fresh_menu["status"] == "empty":
+                    self._replace_offered_slots([], lead_tz)
+                    return {
+                        "success": False,
+                        "error": "slot_conflict",
+                        "slots": [],
+                        "message": "That time was just taken and the calendar has no current openings. End without booking.",
+                    }
                 if not self.seed_offered_slots(
                     fresh_menu["slots"], fresh_menu["timezone"], origin="offered"
                 ):
                     self._replace_offered_slots([], lead_tz)
-                    return {
-                        "success": False,
-                        "error": "calendar_unavailable",
-                        "message": "The calendar has no current openings. End without booking.",
-                    }
+                    return {"success": False, "error": "calendar_unavailable"}
                 return {
                     "success": False,
                     "error": "slot_conflict",
@@ -1375,6 +1405,9 @@ class CRMTools:
                 "error": "booking_failed",
                 "message": "The calendar hiccuped - tell them you'll email to lock it in, then call end_call.",
             }
+        if self._requires_calcom:
+            return {"success": False, "error": "calendar_unavailable"}
+
 
         # --- Internal calendar fallback (phone-based) ---
         if not contact_phone:

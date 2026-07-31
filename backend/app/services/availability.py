@@ -24,7 +24,7 @@ Two things stay true regardless:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal, TypedDict
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -39,6 +39,24 @@ LOOKAHEAD_DAYS: Final = 12
 MAX_DAYS: Final = 5
 MAX_PER_DAY: Final = 4
 MAX_SLOTS: Final = 16
+
+# Server-owned call context. The public outbound telephony endpoint stamps this
+# onto its persisted variables so a call that crosses a restart/deploy can never
+# fall through to the fork's unrelated internal appointment calendar.
+CALENDAR_BACKEND_VARIABLE: Final = "_calendar_backend"
+CALCOM_REQUIRED_BACKEND: Final = "calcom_required"
+
+AvailabilityStatus = Literal["available", "empty", "unavailable"]
+
+
+class AvailabilityResult(TypedDict):
+    """A calendar read whose business-empty and dependency-down states differ."""
+
+    status: AvailabilityStatus
+    timezone: str
+    generated_at: str
+    slots: list[dict[str, str]]
+    block: str
 
 _NOON: Final = 12
 _EVENING_HOUR: Final = 17
@@ -110,7 +128,7 @@ def build_menu(
     max_days: int = MAX_DAYS,
     max_per_day: int = MAX_PER_DAY,
     max_slots: int = MAX_SLOTS,
-) -> dict[str, Any]:
+) -> AvailabilityResult:
     """Turn a flat Cal.com slot list into the agent's menu (pure, testable).
 
     `raw_slots` items need only a "start" (ISO 8601). Grouping, ordering and
@@ -165,7 +183,9 @@ def build_menu(
         if len(slots) >= max_slots:
             break
 
+    status: AvailabilityStatus = "available" if slots else "empty"
     return {
+        "status": status,
         "timezone": lead_tz,
         "generated_at": datetime.now(UTC).isoformat(),
         "slots": slots,
@@ -173,23 +193,35 @@ def build_menu(
     }
 
 
-def empty_menu(lead_tz: str) -> dict[str, Any]:
-    """The menu when the calendar could not be pre-loaded (never a hard failure)."""
+def empty_menu(
+    lead_tz: str,
+    *,
+    status: Literal["empty", "unavailable"] = "unavailable",
+) -> AvailabilityResult:
+    """Represent a healthy empty calendar separately from a failed calendar read."""
+    if status == "empty":
+        block = (
+            "The calendar has no open business-hours times in the current window. "
+            "Do not invent or promise a time."
+        )
+    else:
+        block = (
+            "The calendar could not be pre-loaded for this call. Once you know "
+            "their timezone, call refresh_availability once and offer what it returns."
+        )
     return {
+        "status": status,
         "timezone": lead_tz,
         "generated_at": datetime.now(UTC).isoformat(),
         "slots": [],
-        "block": (
-            "The calendar could not be pre-loaded for this call. Once you know "
-            "their timezone, call refresh_availability once and offer what it returns."
-        ),
+        "block": block,
     }
 
 
 def render_block(days: list[dict[str, Any]], lead_tz: str) -> str:
     """Render the menu as the prompt block the agent reads its times from."""
     if not days:
-        return empty_menu(lead_tz)["block"]
+        return empty_menu(lead_tz, status="empty")["block"]
     # Spoken form, never the IANA path: an agent that can read "Asia/Damascus" is an
     # agent that will eventually say "Asia slash Damascus" down a phone line.
     from app.services.lead_timezone import spoken_zone_name
@@ -205,26 +237,41 @@ def render_block(days: list[dict[str, Any]], lead_tz: str) -> str:
     return "\n".join(lines)
 
 
-async def fetch_menu(lead_tz: str) -> dict[str, Any]:
-    """Ask Cal.com for the real free gaps and build the menu. Never raises.
+def missing_calcom_settings() -> tuple[str, ...]:
+    """Return setting names only; never return or log credential values."""
+    missing: list[str] = []
+    if not (settings.CALCOM_API_KEY or "").strip():
+        missing.append("CALCOM_API_KEY")
+    if not settings.CALCOM_EVENT_TYPE_ID:
+        missing.append("CALCOM_EVENT_TYPE_ID")
+    return tuple(missing)
+
+
+async def fetch_menu(lead_tz: str) -> AvailabilityResult:
+    """Ask Cal.com for the real free gaps and return a discriminated result.
 
     Called on the dial path, so a slow or broken calendar must degrade to an
-    empty menu rather than block the call from being placed.
+    unavailable result rather than raise. Callers decide whether that dependency
+    failure is soft (preload) or must stop an interactive booking operation.
     """
-    if not (settings.CALCOM_API_KEY and settings.CALCOM_EVENT_TYPE_ID):
-        logger.info("availability_menu_skipped_calcom_unconfigured")
+    missing = missing_calcom_settings()
+    if missing:
+        logger.error("availability_menu_calcom_unconfigured", missing_settings=missing)
         return empty_menu(lead_tz)
     try:
         from app.services.calcom_client import get_open_slots
 
         raw = await get_open_slots(lead_tz=lead_tz, days=LOOKAHEAD_DAYS)
     except Exception as exc:
-        logger.warning("availability_menu_fetch_failed", error=str(exc))
+        logger.error(  # noqa: TRY400 - do not attach provider exception text to logs
+            "availability_menu_fetch_failed", error_type=type(exc).__name__
+        )
         return empty_menu(lead_tz)
 
     menu = build_menu(raw, lead_tz)
     logger.info(
         "availability_menu_built",
+        status=menu["status"],
         lead_tz=lead_tz,
         raw_count=len(raw),
         slot_count=len(menu["slots"]),

@@ -32,6 +32,11 @@ from app.models.call_record import CallDirection, CallRecord, CallStatus
 from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
 from app.models.phone_number import PhoneNumber as StoredPhoneNumber
 from app.models.workspace import AgentWorkspace, Workspace
+from app.services.availability import (
+    CALCOM_REQUIRED_BACKEND,
+    CALENDAR_BACKEND_VARIABLE,
+    missing_calcom_settings,
+)
 from app.services.call_events import schedule_call_ended_event
 from app.services.telephony import recording_policy
 from app.services.telephony.media_grant import arm_twilio_media_grant
@@ -1018,6 +1023,22 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
         db=db,
     )
 
+    missing_calendar_settings = missing_calcom_settings()
+    if missing_calendar_settings:
+        log.error(
+            "outbound_call_calendar_unavailable",
+            missing_settings=missing_calendar_settings,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "calendar_unavailable"},
+        )
+
+    # This value is server-owned: a caller cannot opt a live Pulsift call into the
+    # fork's unrelated internal appointment calendar by supplying its own variables.
+    call_variables = dict(call_request.variables or {})
+    call_variables[CALENDAR_BACKEND_VARIABLE] = CALCOM_REQUIRED_BACKEND
+
     # Select the outbound provider: honour TELEPHONY_OUTBOUND_PROVIDER, falling back to
     # the other only if the preferred one isn't configured. Twilio is first-class;
     # Telnyx is dormant (used only when preferred, or as a fallback).
@@ -1046,11 +1067,11 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
         webhook_url = f"{webhook_url}&call_record_id={call_record_id}"
     if workspace_uuid:
         webhook_url = f"{webhook_url}&workspace_id={workspace_uuid}"
-    if call_request.variables:
+    if call_variables:
         import base64
         import json as _json
 
-        cv = base64.urlsafe_b64encode(_json.dumps(call_request.variables).encode()).decode()
+        cv = base64.urlsafe_b64encode(_json.dumps(call_variables).encode()).decode()
         webhook_url = f"{webhook_url}&cv={cv}"
 
     # Recording gate: the (previously dead) per-agent toggle ANDed with the legal
@@ -1091,7 +1112,7 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
         to_number=call_request.to_number,
         # Persisted so the terminal call-ended event can echo the lead context back
         # to the reply-router even from the bare status-callback path.
-        variables=call_request.variables or None,
+        variables=call_variables,
     )
     db.add(call_record)
     await db.commit()

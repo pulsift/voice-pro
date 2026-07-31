@@ -642,6 +642,10 @@ class GPTRealtimeSession:
             )
 
             menu = await fetch_menu(lead_tz)
+            if menu["status"] == "unavailable":
+                self.logger.warning("availability_preload_unavailable")
+                return False
+
             self._availability_loaded = True
             adopted = 0
             if self.tool_registry:
@@ -654,6 +658,7 @@ class GPTRealtimeSession:
             )
             self.logger.info(
                 "availability_preloaded",
+                status=menu["status"],
                 slot_count=adopted,
                 timezone=menu["timezone"],
             )
@@ -661,7 +666,7 @@ class GPTRealtimeSession:
         except Exception as e:
             # A calendar hiccup must never cost us the call: the agent keeps the
             # default block, which tells it to call refresh_availability instead.
-            self.logger.warning("availability_preload_failed", error=str(e))
+            self.logger.warning("availability_preload_failed", error_type=type(e).__name__)
             return False
 
     async def send_hello(self) -> bool:

@@ -227,6 +227,8 @@ async def test_non_5xx_or_non_integer_status_re_raises_original_error(status: ob
 async def test_direct_twilio_unknown_outcome_leaves_precommitted_record_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent_result = _scalar_result(SimpleNamespace(id=agent_id, user_id=1, enable_recording=False))
@@ -272,6 +274,8 @@ async def test_direct_twilio_unknown_outcome_leaves_precommitted_record_pending(
 async def test_direct_twilio_4xx_marks_precommitted_record_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent_result = _scalar_result(SimpleNamespace(id=agent_id, user_id=1, enable_recording=False))
