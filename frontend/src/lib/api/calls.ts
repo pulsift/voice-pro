@@ -26,6 +26,13 @@ export interface CallRecord {
   to_number: string;
   duration_seconds: number;
   recording_url: string | null;
+  /**
+   * Credential-free link to play the recording, served by our own backend.
+   * The provider's recording_url is behind HTTP Basic auth, so pointing an
+   * <audio> element at it makes the browser demand a login nobody can give.
+   * Optional: older backend builds omit the field.
+   */
+  recording_playback_url?: string | null;
   transcript: string | null;
   /**
    * Per-call lead variables injected into the agent prompt.

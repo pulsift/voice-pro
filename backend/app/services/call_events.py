@@ -101,6 +101,17 @@ def build_transcript_url(share_token: str | None) -> str | None:
     return f"{base.rstrip('/')}{_TRANSCRIPT_PATH_PREFIX}/{share_token}"
 
 
+def build_recording_url(share_token: str | None) -> str | None:
+    """Playable link to the call recording, or None when there is nothing to play.
+
+    Points at our own proxy rather than the provider's media URL: the provider
+    URL is behind HTTP Basic auth, so a browser opening it asks for credentials
+    no human has. Same token, same expiry as the transcript link.
+    """
+    page = build_transcript_url(share_token)
+    return f"{page}/recording" if page else None
+
+
 def build_call_ended_payload(record: CallRecord) -> dict[str, Any]:
     """Build the call-ended event body from the record's in-memory state."""
     booked, booking_uid = extract_booking_outcome(record.booking_attempts)

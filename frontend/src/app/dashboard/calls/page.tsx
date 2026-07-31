@@ -102,7 +102,10 @@ export default function CallHistoryPage() {
   const totalCalls = data?.total ?? 0;
 
   const handlePlayRecording = (call: CallRecord) => {
-    if (!call.recording_url) {
+    // Always play through our own proxy: the provider's URL is behind HTTP
+    // Basic auth and would pop a login box the user cannot satisfy.
+    const source = call.recording_playback_url;
+    if (!source) {
       toast.error("No recording available for this call");
       return;
     }
@@ -120,7 +123,7 @@ export default function CallHistoryPage() {
     }
 
     // Create new audio element and play
-    const audio = new Audio(call.recording_url);
+    const audio = new Audio(source);
     audioRef.current = audio;
     setPlayingCallId(call.id);
 
@@ -332,7 +335,7 @@ export default function CallHistoryPage() {
                       </TableCell>
                       <TableCell>
                         <div className="flex gap-1">
-                          {call.recording_url && (
+                          {call.recording_playback_url && (
                             <Button
                               variant="ghost"
                               size="icon"

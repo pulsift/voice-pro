@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import user_id_to_uuid
 from app.core.config import settings
-from app.core.public_id import generate_public_id
+from app.core.public_id import SHARE_TOKEN_LENGTH, generate_public_id
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
@@ -48,7 +48,6 @@ _TERMINAL_CALL_STATUSES = {
 }
 
 # Length of the base62 secret behind a public transcript link (B2).
-SHARE_TOKEN_LENGTH = 16
 
 
 def _response_id(event: Any) -> str | None:

@@ -11,6 +11,11 @@ EXPECTED_PARTS_COUNT = 2
 MIN_RANDOM_LENGTH = 6
 MAX_RANDOM_LENGTH = 16
 
+# Length of a call share token — the secret that stands in for auth on public
+# transcript and recording links. Lives here because both the websocket bridge
+# and the recording webhook mint one.
+SHARE_TOKEN_LENGTH = 16
+
 
 def generate_public_id(prefix: str = "ag", length: int = 8) -> str:
     """Generate a URL-safe, short public ID.

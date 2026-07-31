@@ -24,6 +24,7 @@ from app.api.settings import get_user_api_keys
 from app.core.auth import CurrentUser, user_id_to_uuid
 from app.core.config import settings
 from app.core.limiter import limiter
+from app.core.public_id import SHARE_TOKEN_LENGTH, generate_public_id
 from app.core.webhook_security import verify_telnyx_webhook, verify_twilio_webhook
 from app.db.session import get_db
 from app.models.agent import Agent
@@ -1329,6 +1330,13 @@ async def twilio_recording_callback(
     # Twilio's RecordingUrl is extension-less; appending ".mp3" is the documented way
     # to request the compressed audio rather than raw WAV.
     call_record.recording_url = f"{recording_url}.mp3"
+    # The share token is what lets this audio be played without anyone being
+    # asked for credentials. It is normally minted alongside the transcript, but
+    # a call can be recorded and leave no transcript (an instant hang-up), so
+    # mint one here too rather than stranding the recording behind an auth box.
+    if not call_record.share_token:
+        call_record.share_token = generate_public_id(prefix="tr",
+                                                     length=SHARE_TOKEN_LENGTH)
     await db.commit()
 
     log.info("call_recording_saved", record_id=str(call_record.id))

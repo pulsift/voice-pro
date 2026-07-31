@@ -348,14 +348,19 @@ export default function CallDetailPage() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {data.recording_url ? (
+          {data.recording_playback_url ? (
             <div className="space-y-3">
-              <audio controls preload="none" src={data.recording_url} className="w-full">
+              <audio
+                controls
+                preload="none"
+                src={data.recording_playback_url}
+                className="w-full"
+              >
                 Your browser does not support the audio element.
               </audio>
               <Button variant="outline" size="sm" asChild>
                 <a
-                  href={data.recording_url}
+                  href={data.recording_playback_url}
                   download={`recording-${data.id}.mp3`}
                   target="_blank"
                   rel="noopener noreferrer"

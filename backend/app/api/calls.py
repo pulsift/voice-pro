@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.core.auth import CurrentUser, user_id_to_uuid
 from app.db.session import get_db
 from app.models.call_record import CallRecord
+from app.services.call_events import build_recording_url
 
 router = APIRouter(prefix="/api/v1/calls", tags=["calls"])
 logger = structlog.get_logger()
@@ -41,6 +42,10 @@ class CallRecordResponse(BaseModel):
     to_number: str
     duration_seconds: int
     recording_url: str | None
+    # Playable recording link that needs no credentials — the provider's own URL
+    # is behind HTTP Basic auth, so the dashboard must never point an <audio>
+    # element at it. None when the call has no recording.
+    recording_playback_url: str | None = None
     transcript: str | None
     booking_attempts: list[dict[str, object]]
     # Per-call lead/offer variables (outbound dials) - lets the dashboard show who
@@ -172,6 +177,10 @@ async def list_calls(
                 to_number=record.to_number,
                 duration_seconds=record.duration_seconds,
                 recording_url=record.recording_url,
+                recording_playback_url=(
+                    build_recording_url(record.share_token)
+                    if record.recording_url else None
+                ),
                 transcript=record.transcript,
                 booking_attempts=record.booking_attempts or [],
                 variables=record.variables if isinstance(record.variables, dict) else {},
@@ -250,6 +259,9 @@ async def get_call(
         to_number=record.to_number,
         duration_seconds=record.duration_seconds,
         recording_url=record.recording_url,
+        recording_playback_url=(
+            build_recording_url(record.share_token) if record.recording_url else None
+        ),
         transcript=record.transcript,
         booking_attempts=record.booking_attempts or [],
         variables=record.variables if isinstance(record.variables, dict) else {},

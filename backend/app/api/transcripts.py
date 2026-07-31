@@ -23,9 +23,11 @@ import html
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Final
+from urllib.parse import urlparse
 
+import httpx
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import HTMLResponse
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +47,16 @@ RETENTION_INTERVAL_SECONDS: Final = 24 * 60 * 60
 
 _SECONDS_PER_MINUTE: Final = 60
 _PHONE_SUFFIX_LENGTH: Final = 4
+
+# Recording playback proxy. Credentials are attached for these hosts and no
+# others; everything else is treated as a corrupt URL, not a place to send an
+# auth header.
+_RECORDING_HOSTS: Final = frozenset({"api.twilio.com", "media.twiliocdn.com"})
+_RECORDING_TIMEOUT_SECONDS: Final = 30.0
+_RECORDING_PASSTHROUGH_HEADERS: Final = frozenset(
+    {"content-length", "content-range", "accept-ranges"}
+)
+_HTTP_BAD_REQUEST: Final = 400
 
 # The URL is the capability, so the page must not be cached, indexed, or leaked
 # through a Referer header on any link the reader clicks.
@@ -75,6 +87,7 @@ header {{ border-bottom: 3px solid {_ACCENT}; padding-bottom: 16px; margin-botto
 h1 {{ font-size: 20px; margin: 0 0 10px; font-weight: 600; letter-spacing: -0.01em; }}
 .meta {{ display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 14px; color: #5c5c5c; }}
 .meta b {{ color: #1a1a1a; font-weight: 600; }}
+.rec {{ display: block; width: 100%; margin-top: 14px; }}
 .turn {{ display: flex; margin-bottom: 14px; }}
 .turn.user {{ justify-content: flex-start; }}
 .turn.assistant {{ justify-content: flex-end; }}
@@ -192,12 +205,114 @@ def render_transcript_page(record: CallRecord) -> str:
         f"<span>Duration <b>{html.escape(_format_duration(record.duration_seconds))}</b></span>"
         f"<span>Number <b>{html.escape(_mask_number(record.to_number))}</b></span>"
     )
+    # The recording plays through our own proxy on this same token, so the page
+    # never asks the reader for credentials it is impossible to have.
+    player = ""
+    if record.recording_url and record.share_token:
+        player = (
+            '<audio class="rec" controls preload="none" '
+            f'src="{html.escape(record.share_token)}/recording"></audio>'
+        )
     return _page(
         "Call transcript",
-        f'<header><h1>Call transcript</h1><div class="meta">{meta}</div></header>'
+        f'<header><h1>Call transcript</h1><div class="meta">{meta}</div>'
+        f"{player}</header>"
         f"{bubbles}"
         f"<footer>This link expires {settings.TRANSCRIPT_RETENTION_DAYS} days "
         "after the call.</footer>",
+    )
+
+
+async def _record_for_token(share_token: str, db: AsyncSession,
+                            *, needs_transcript: bool) -> CallRecord | None:
+    """The call a share token unlocks, or None when the link is bad or expired.
+
+    Expiry is enforced HERE, not only by the nightly sweep (Codex review
+    2026-07-30): the worker ticks once a day, so a token could otherwise outlive
+    its advertised retention by up to a day — or indefinitely if the worker is
+    down.
+    """
+    cutoff = datetime.now(UTC) - timedelta(days=settings.TRANSCRIPT_RETENTION_DAYS)
+    conditions = [
+        CallRecord.share_token == share_token,
+        or_(CallRecord.ended_at.is_(None), CallRecord.ended_at >= cutoff),
+    ]
+    if needs_transcript:
+        conditions.append(CallRecord.transcript.is_not(None))
+    result = await db.execute(select(CallRecord).where(*conditions))
+    return result.scalar_one_or_none()
+
+
+@router.get("/{share_token}/recording", include_in_schema=False)
+async def public_call_recording(
+    share_token: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Stream a call recording through us, so nobody is ever asked to log in.
+
+    A Twilio recording URL is protected by HTTP Basic auth using the ACCOUNT
+    credentials. Opening one directly makes the browser pop a username/password
+    box that no human login can satisfy — the only accepted password is the
+    account auth token, which must never be typed into a browser prompt. So the
+    audio is fetched server-side with the credentials we already hold and piped
+    back on the same share token that unlocks the transcript: same capability,
+    same retention expiry, one tap on a phone.
+
+    The credentials are attached ONLY for Twilio's own media host. The URL is
+    written by a signature-verified webhook, but sending an auth header to
+    whatever host a column happens to contain is how a data bug becomes a
+    credential leak.
+    """
+    record = await _record_for_token(share_token, db, needs_transcript=False)
+    if record is None or not record.recording_url:
+        logger.info("public_recording_not_found_or_expired")
+        return HTMLResponse(render_not_found(), status_code=404,
+                            headers=_PRIVACY_HEADERS)
+
+    if urlparse(record.recording_url).hostname not in _RECORDING_HOSTS:
+        logger.warning("public_recording_untrusted_host", call_id=str(record.id))
+        return HTMLResponse(render_not_found(), status_code=404,
+                            headers=_PRIVACY_HEADERS)
+
+    if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN):
+        logger.warning("public_recording_no_credentials", call_id=str(record.id))
+        return HTMLResponse(render_not_found(), status_code=404,
+                            headers=_PRIVACY_HEADERS)
+
+    # Forward the player's Range header: audio elements on iOS ask for byte
+    # ranges before they will play at all.
+    forwarded = {"Range": request.headers["range"]} if "range" in request.headers else {}
+    try:
+        async with httpx.AsyncClient(timeout=_RECORDING_TIMEOUT_SECONDS) as client:
+            upstream = await client.get(
+                record.recording_url,
+                auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                headers=forwarded,
+                follow_redirects=True,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("public_recording_fetch_failed", call_id=str(record.id),
+                       error=type(exc).__name__)
+        return HTMLResponse(render_not_found(), status_code=502,
+                            headers=_PRIVACY_HEADERS)
+
+    if upstream.status_code >= _HTTP_BAD_REQUEST:
+        logger.warning("public_recording_upstream_error", call_id=str(record.id),
+                       status=upstream.status_code)
+        return HTMLResponse(render_not_found(), status_code=404,
+                            headers=_PRIVACY_HEADERS)
+
+    passthrough = {
+        key: value for key, value in upstream.headers.items()
+        if key.lower() in _RECORDING_PASSTHROUGH_HEADERS
+    }
+    logger.info("public_recording_served", call_id=str(record.id))
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "audio/mpeg"),
+        headers={**_PRIVACY_HEADERS, **passthrough},
     )
 
 
@@ -206,22 +321,8 @@ async def public_transcript_page(
     share_token: str,
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
-    """Serve one call transcript as a public read-only page. The token is the key.
-
-    Expiry is enforced HERE, not only by the nightly sweep (Codex review
-    2026-07-30): the worker ticks once a day, so a token could otherwise outlive
-    its advertised retention by up to a day — or indefinitely if the worker is
-    down.
-    """
-    cutoff = datetime.now(UTC) - timedelta(days=settings.TRANSCRIPT_RETENTION_DAYS)
-    result = await db.execute(
-        select(CallRecord).where(
-            CallRecord.share_token == share_token,
-            CallRecord.transcript.is_not(None),
-            or_(CallRecord.ended_at.is_(None), CallRecord.ended_at >= cutoff),
-        )
-    )
-    record = result.scalar_one_or_none()
+    """Serve one call transcript as a public read-only page. The token is the key."""
+    record = await _record_for_token(share_token, db, needs_transcript=True)
 
     if record is None:
         logger.info("public_transcript_not_found_or_expired")
