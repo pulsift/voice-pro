@@ -354,10 +354,26 @@ async def create_booking(
                 "status_code": resp.status_code,
                 "raw_body": raw_body,
             }
-        payload = resp.json()
-        d = payload.get("data", {}) if isinstance(payload, dict) else {}
-        uid = str(d.get("uid") or "").strip() if isinstance(d, dict) else ""
-        returned_start = d.get("start") if isinstance(d, dict) else None
+        try:
+            payload = resp.json()
+            d = payload.get("data", {}) if isinstance(payload, dict) else {}
+            uid = str(d.get("uid") or "").strip() if isinstance(d, dict) else ""
+            returned_start = d.get("start") if isinstance(d, dict) else None
+        except Exception as exc:
+            # Cal.com may have committed the booking even when its success body is
+            # unreadable. Treat the outcome as unknown so the caller reconciles it
+            # before retrying or telling the prospect that booking failed.
+            log.warning(
+                "booking_response_unreadable",
+                status=resp.status_code,
+                error_type=type(exc).__name__,
+            )
+            return {
+                "success": False,
+                "category": "transient",
+                "status_code": resp.status_code,
+                "raw_body": raw_body,
+            }
         try:
             start_matches = bool(returned_start) and _parse_iso(str(returned_start)).astimezone(
                 UTC

@@ -305,6 +305,52 @@ async def test_malformed_success_response_fails_closed_then_reconciles(
     ]
 
 
+@pytest.mark.asyncio
+async def test_unreadable_success_response_reconciles_without_duplicate_post() -> None:
+    """A committed booking with broken 2xx JSON must be recovered by a read."""
+    tools = make_tools()
+    await offer_and_select(tools)
+    response = MagicMock(status_code=201, text='{"data":')
+    response.json.side_effect = ValueError("truncated JSON")
+    client = MagicMock(post=AsyncMock(return_value=response))
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=client)
+    context.__aexit__ = AsyncMock(return_value=None)
+    reconcile = AsyncMock(
+        side_effect=[
+            {"success": False, "category": "not_found", "status_code": 200},
+            {
+                "success": True,
+                "category": "reconciled_success",
+                "status_code": 200,
+                "uid": "committed-despite-broken-json",
+                "start": SLOT["start"],
+            },
+        ]
+    )
+    webhook = MagicMock()
+
+    with (
+        patch("app.services.calcom_client.httpx.AsyncClient", return_value=context),
+        patch("app.services.calcom_client.find_existing_booking", reconcile),
+        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook", webhook),
+    ):
+        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+
+    assert result["uid"] == "committed-despite-broken-json"
+    client.post.assert_awaited_once()
+    assert reconcile.await_args_list == [
+        call(start_iso=SLOT["start"], email="lead@example.com"),
+        call(start_iso=SLOT["start"], email="lead@example.com"),
+    ]
+    webhook.assert_called_once()
+    assert [attempt["category"] for attempt in tools.get_booking_attempts()][-3:] == [
+        "not_found",
+        "transient",
+        "reconciled_success",
+    ]
+
+
 def test_provider_diagnostics_redact_pii_secrets_and_attendee_metadata() -> None:
     raw = (
         '{"email":"lead@example.com","phone":"+1 408 555 0101",'
