@@ -373,9 +373,15 @@ class CRMTools:
         # time nobody had mentioned.
         ordered = sorted(pool, key=lambda slot: str(slot["start"]))
         ordinal_candidates: set[str] = set()
-        if re.search(r"\b(first|earlier)\b", text) and ordered:
+        # "earlier"/"later" only count inside a bounded phrase that points AT one of the
+        # offered times — "the later one", "the later slot". Bare "later" is usually
+        # about the call, not the calendar: "can we talk later?" must never book the
+        # second option (Codex review #6).
+        first = r"\bfirst\b|\bearlier (one|option|slot|time)\b"
+        second = r"\bsecond\b|\blater (one|option|slot|time)\b"
+        if re.search(first, text) and ordered:
             ordinal_candidates.add(ordered[0]["slot_id"])
-        if re.search(r"\b(second|later)\b", text) and len(ordered) >= MIN_SLOTS_FOR_SECOND_SELECTION:
+        if re.search(second, text) and len(ordered) >= MIN_SLOTS_FOR_SECOND_SELECTION:
             ordinal_candidates.add(ordered[1]["slot_id"])
         if ordinal_candidates:
             return ordinal_candidates
@@ -439,6 +445,14 @@ class CRMTools:
         Everything else is unchanged: silence, a vague "yeah" with nothing proposed,
         or words matching several offered times still refuse and re-ask.
         """
+        # A refusal or a "let me get back to you" is never a selection, however many
+        # times it happens to name (Codex review #6: "No, Tuesday at ten doesn't work"
+        # named a slot, so the matcher returned it and Cal.com booked the time the
+        # caller had just rejected). The gate is deliberately strict — when the words
+        # carry a no, a doubt or a delay, we re-ask rather than guess.
+        if self._refuses_or_defers(self._latest_user_utterance):
+            return set()
+
         offered_now = self.slots_offered_aloud()
         caller_anywhere = self._slots_named_in(self._latest_user_utterance)
         if not offered_now:
@@ -462,21 +476,60 @@ class CRMTools:
         """Offered slots the agent named in its most recent turn."""
         return self._slots_named_in(self._latest_assistant_utterance)
 
+    # A no, in any of the shapes a person actually says one.
+    _NEGATION = re.compile(
+        r"\b(no|nope|nah|not|never|cant|cannot|wont|dont|doesnt|isnt|aint)\b"
+        r"|\bn'?t\b|\b(can|do|does|is|was|will|would)n'?t\b",
+        re.IGNORECASE,
+    )
+    # Not a no, but not a yes either: they want to think, check, or be called back.
+    _DEFERRAL = re.compile(
+        r"\b(maybe|perhaps|possibly|probably|might|unsure|not sure|dunno|"
+        r"let me check|i'?ll check|check with|get back to you|call me back|"
+        r"another time|some other time|later on|next week|think about it|"
+        r"run it by|confirm with|too early|too late)\b",
+        re.IGNORECASE,
+    )
+
+    def _refuses_or_defers(self, utterance: str) -> bool:
+        """Whether the reply carries a refusal, a doubt or a delay.
+
+        Kept separate from time matching on purpose: a caller can name a time inside a
+        sentence that rejects it ("no, Tuesday at ten doesn't work"), and naming is not
+        choosing. "Tuesday instead" carries no negation, so it still selects — swapping
+        to a different time IS a choice.
+        """
+        text = " ".join((utterance or "").lower().split())
+        if not text:
+            return False
+        return bool(self._NEGATION.search(text) or self._DEFERRAL.search(text))
+
+    _AGREEMENT_WORD = (
+        r"(yes|yeah|yep|yup|sure|ok|okay|perfect|great|good|fine|lovely|brilliant|"
+        r"sounds good|sounds great|sounds perfect|works|that works|this works|"
+        r"that'?s? fine|it works|it would|that would|i can|we can|please|do that|"
+        r"book it|go ahead|let'?s do that|lets do that|absolutely|definitely|deal)"
+    )
+    # Politeness that may TRAIL an agreement but never stands as one on its own.
+    _AGREEMENT_TAIL = r"(thanks|thank you|cheers|for me|then|too|cool|nice|mate|man)"
     _AGREEMENT = re.compile(
-        r"^\W*(yes|yeah|yep|yup|sure|ok|okay|perfect|great|good|fine|"
-        r"sounds good|works|that works|it would|i can|please|do that|go ahead|"
-        r"let's do that|lets do that|absolutely|definitely|deal)\b",
+        rf"^\W*{_AGREEMENT_WORD}"
+        rf"(\s*[,.!-]?\s*({_AGREEMENT_WORD}|{_AGREEMENT_TAIL}))*"
+        r"\s*[.!]*\W*$",
         re.IGNORECASE,
     )
 
     def _is_agreement(self, utterance: str) -> bool:
-        """Whether the reply is a plain yes to whatever was just asked.
+        """Whether the reply is a plain yes to whatever was just asked, and NOTHING else.
 
-        Deliberately anchored to the START of the sentence: "yes, that works" agrees,
-        while "yes, but can we do Thursday instead?" begins with agreement and then
-        names something else — the time-matching path handles that one.
+        Matches the WHOLE utterance, not just its opening (Codex review #6). A prefix
+        match read "sure, let me check and get back to you" as consent, which is the
+        opposite of what the caller said. "Yes, it would" and "perfect, thanks" still
+        agree; anything carrying extra business does not, and is re-asked instead.
         """
         text = " ".join((utterance or "").lower().split())
+        if not text or self._refuses_or_defers(text):
+            return False
         return bool(self._AGREEMENT.match(text))
 
     _STRONG_TIME_SIGNAL = re.compile(

@@ -324,3 +324,106 @@ async def test_ordinals_index_what_was_offered_not_the_whole_menu() -> None:
     selected = await tools.select_slot("slot_5")  # Wednesday midday, not Monday
     assert selected["success"] is True
     assert selected["when"] == "Wednesday at midday"
+
+
+# Codex machine review #6 (2026-08-01). Naming a time is not choosing it, and a
+# sentence that starts with "sure" can end anywhere. Every case below could book a
+# time the caller never agreed to, which is the one thing the gate exists to stop.
+
+
+@pytest.mark.asyncio
+async def test_a_time_inside_a_refusal_is_not_a_choice() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Tuesday at midday work?")
+    tools.observe_user_utterance("No, Tuesday at midday doesn't work.")
+
+    assert (await tools.select_slot("slot_3"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_agreement_that_carries_on_into_a_maybe_is_not_a_choice() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Sure, let me check my diary and get back to you.")
+
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_asking_to_speak_later_does_not_pick_the_later_slot() -> None:
+    """"Can we talk later?" is about the call, not the calendar."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Monday at midday, or Monday at three?")
+    tools.observe_user_utterance("Can we talk later?")
+
+    assert (await tools.select_slot("slot_2"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_the_later_one_still_selects_the_second_offered_slot() -> None:
+    """The bounded phrase is a real choice and must keep working."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Monday at midday, or Monday at three?")
+    tools.observe_user_utterance("The later one, please.")
+
+    selected = await tools.select_slot("slot_2")
+    assert selected["success"] is True
+    assert selected["when"] == "Monday at three in the afternoon"
+
+
+@pytest.mark.asyncio
+async def test_hedged_yes_with_a_condition_is_not_a_choice() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Fine, but I'm not sure yet.")
+
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+@pytest.mark.asyncio
+async def test_a_polite_plain_yes_still_books() -> None:
+    """The veto must not make the agent deaf to an ordinary acceptance."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Perfect, thanks.")
+
+    selected = await tools.select_slot("slot_1")
+    assert selected["success"] is True
+    assert selected["when"] == "Monday at midday"
+
+
+@pytest.mark.asyncio
+async def test_swapping_to_another_time_is_still_a_choice() -> None:
+    """"Instead" carries no refusal — picking a different time IS deciding."""
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Tuesday at midday instead, please.")
+
+    selected = await tools.select_slot("slot_3")
+    assert selected["success"] is True
+    assert selected["when"] == "Tuesday at midday"
+
+
+@pytest.mark.asyncio
+async def test_call_me_back_another_time_books_nothing() -> None:
+    tools = make_tools()
+    tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
+
+    tools.observe_assistant_utterance("Would Monday at midday work?")
+    tools.observe_user_utterance("Call me back another time.")
+
+    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
