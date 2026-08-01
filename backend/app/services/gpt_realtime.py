@@ -507,48 +507,6 @@ class GPTRealtimeSession:
 
         return result
 
-    async def process_realtime_events(self) -> None:
-        """Process events from OpenAI Realtime API using official SDK.
-
-        This is the main event loop that:
-        1. Receives events from OpenAI
-        2. Handles tool calls by routing to internal tool handlers
-        3. Sends responses back to OpenAI
-        """
-        if not self.connection:
-            raise RuntimeError("Realtime connection not established")
-
-        try:
-            async for event in self.connection:
-                try:
-                    event_type = event.type
-
-                    self.logger.debug("realtime_event_received", event_type=event_type)
-
-                    # Handle function/tool calls
-                    if event_type == "response.function_call_arguments.done":
-                        await self.handle_function_call_event(event)
-
-                    # Handle audio output
-                    elif event_type == "response.audio.delta":
-                        # Audio data available in event.delta
-                        pass
-
-                    # Handle transcription
-                    elif event_type == "conversation.item.input_audio_transcription.completed":
-                        self.observe_user_transcript(getattr(event, "transcript", ""))
-
-                    # Handle errors
-                    elif event_type == "error":
-                        self.logger.error("realtime_api_error", error=event.error)
-
-                except Exception as e:
-                    self.logger.exception("event_processing_error", error=str(e))
-
-        except Exception as e:
-            self.logger.exception("realtime_event_loop_error", error=str(e))
-            raise
-
     async def handle_function_call_event(self, event: Any) -> dict[str, Any]:
         """Handle function call from GPT Realtime.
 

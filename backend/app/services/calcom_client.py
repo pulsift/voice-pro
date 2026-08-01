@@ -31,9 +31,6 @@ HTTP_CONFLICT = 409
 HTTP_RATE_LIMITED = 429
 HTTP_SERVER_ERROR_MIN = 500
 SATURDAY_INDEX = 5
-MORNING_START_HOUR = 9
-NOON_HOUR = 12
-AFTERNOON_END_HOUR = 16
 
 class CalendarAvailabilityError(RuntimeError):
     """Cal.com did not return a trustworthy availability document."""
@@ -171,9 +168,8 @@ async def get_open_slots(lead_tz: str, days: int = 12) -> list[dict[str, str]]:
     """Every weekday business-hours opening, in order — the raw material for the
     pre-call slot menu (services/availability.py).
 
-    Same filtering rules as get_business_slots (weekdays only, inside
-    [BOOKING_HOUR_START, BOOKING_HOUR_END) evaluated in the LEAD's local time),
-    but with no morning/afternoon reduction: the menu layer decides how many
+    Filters to weekdays inside [BOOKING_HOUR_START, BOOKING_HOUR_END),
+    evaluated in the LEAD's local time. The menu layer decides how many
     times a human should actually be offered.
     """
     lead_tz, lead_zone = _resolve_lead_zone(lead_tz)
@@ -202,100 +198,6 @@ async def get_open_slots(lead_tz: str, days: int = 12) -> list[dict[str, str]]:
             picked.append({"start": iso})
     logger.info("open_slots_fetched", lead_tz=lead_tz, count=len(picked))
     return picked
-
-
-async def get_business_slots(
-    lead_tz: str,
-    days: int = 10,
-    max_slots: int = 2,
-) -> list[dict[str, str]]:
-    """Return up to `max_slots` open slots within business hours, on distinct days.
-
-    Pulls Cal.com availability for the configured event type starting tomorrow,
-    then filters to weekdays inside [BOOKING_HOUR_START, BOOKING_HOUR_END) in the
-    LEAD's timezone (so a US lead is never offered middle-of-the-night times just
-    because they fall inside the team's day), and returns one slot per day for
-    variety. Only when no valid lead timezone is known does the window fall back
-    to the team timezone.
-
-    Each item: {"start": <original ISO for booking>, "label": <human label in lead tz>}.
-    """
-    log = logger.bind(component="calcom", op="get_business_slots", lead_tz=lead_tz)
-    now = datetime.now(UTC)
-    start = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-    end = (now + timedelta(days=days)).strftime("%Y-%m-%d")
-
-    # Validate the lead timezone up front; fall back to the team tz so an invalid
-    # tzName can't 400 the slots request (and the business-hours window below then
-    # evaluates in the team timezone as the only remaining anchor).
-    try:
-        lead_zone = ZoneInfo(lead_tz)
-    except Exception:
-        log.warning("invalid_lead_tz_falling_back", lead_tz=lead_tz)
-        lead_tz = settings.BOOKING_TEAM_TIMEZONE
-        lead_zone = ZoneInfo(lead_tz)
-
-    headers = {
-        "Authorization": f"Bearer {settings.CALCOM_API_KEY}",
-        "cal-api-version": SLOTS_API_VERSION,
-    }
-    params = {
-        "eventTypeId": settings.CALCOM_EVENT_TYPE_ID,
-        "start": start,
-        "end": end,
-        "timeZone": lead_tz,
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(f"{CALCOM_BASE}/slots", headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-
-    # Offer one MORNING (9-12) + one AFTERNOON (12-17) slot rather than two earliest
-    # (which were both 8am). `extra` is a fallback if only one half-day has openings.
-    morning: dict[str, str] | None = None
-    afternoon: dict[str, str] | None = None
-    extra: dict[str, str] | None = None
-
-    for date_key in sorted(data.keys()):
-        slots = data[date_key]
-        if not isinstance(slots, list):
-            continue
-        for slot in slots:
-            iso = slot.get("start") if isinstance(slot, dict) else slot
-            if not iso:
-                continue
-            dt = _parse_iso(iso)
-            # Evaluate the business-hours window in the LEAD's local time — the same
-            # clock the slot is spoken in — never the team's (B3).
-            local_dt = dt.astimezone(lead_zone)
-            if local_dt.weekday() >= SATURDAY_INDEX:  # Sat/Sun
-                continue
-            h = local_dt.hour
-            if not (settings.BOOKING_HOUR_START <= h < settings.BOOKING_HOUR_END):
-                continue
-            entry = {
-                "start": iso,
-                # Day + time only — no date (the caller found the spoken date pointless).
-                "label": local_dt.strftime("%A %I:%M %p").replace(" 0", " "),
-            }
-            if MORNING_START_HOUR <= h < NOON_HOUR and morning is None:
-                morning = entry
-            elif NOON_HOUR <= h <= AFTERNOON_END_HOUR and afternoon is None:
-                afternoon = entry
-            elif extra is None:
-                extra = entry
-
-    picked = [s for s in (morning, afternoon) if s]
-    if len(picked) < max_slots and extra:
-        picked.append(extra)
-    log.info(
-        "slots_picked",
-        count=len(picked),
-        morning=morning is not None,
-        afternoon=afternoon is not None,
-    )
-    return picked[:max_slots]
 
 
 async def create_booking(
