@@ -380,14 +380,15 @@ def select_outbound_provider(
     """Pick the outbound telephony provider.
 
     Honours the configured preference (`TELEPHONY_OUTBOUND_PROVIDER`, default "twilio")
-    and falls back to the other provider only if the preferred one isn't configured.
-    Returns None when neither is available. This is what keeps Telnyx dormant while
-    Twilio is present, and re-enables Telnyx by flipping the preference.
+    without silently switching providers. Returns None when the selected provider is
+    invalid or unavailable.
     """
     pref = (preferred or "twilio").lower()
     if pref == "telnyx":
-        return "telnyx" if has_telnyx else ("twilio" if has_twilio else None)
-    return "twilio" if has_twilio else ("telnyx" if has_telnyx else None)
+        return "telnyx" if has_telnyx else None
+    if pref == "twilio":
+        return "twilio" if has_twilio else None
+    return None
 
 
 def resolve_recording_flag(*, agent_enabled: bool, to_number: str) -> tuple[bool, str | None, str]:
@@ -1039,9 +1040,8 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     call_variables = dict(call_request.variables or {})
     call_variables[CALENDAR_BACKEND_VARIABLE] = CALCOM_REQUIRED_BACKEND
 
-    # Select the outbound provider: honour TELEPHONY_OUTBOUND_PROVIDER, falling back to
-    # the other only if the preferred one isn't configured. Twilio is first-class;
-    # Telnyx is dormant (used only when preferred, or as a fallback).
+    # Select exactly the configured outbound provider. Telnyx is dormant unless it is
+    # explicitly selected; missing credentials must fail closed rather than rerouting.
     telnyx_service = await get_telnyx_service(current_user.id, db, workspace_id=workspace_uuid)
     twilio_service = await get_twilio_service(current_user.id, db, workspace_id=workspace_uuid)
 
@@ -1051,12 +1051,11 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     )
 
     if provider is None:
+        log.error("selected_telephony_provider_unavailable", provider=preferred)
         raise HTTPException(
-            status_code=400,
-            detail="No telephony provider configured. Please add Twilio or Telnyx credentials in Settings.",
+            status_code=503,
+            detail={"code": "telephony_provider_unavailable", "provider": preferred},
         )
-    if provider != preferred:
-        log.warning("telephony_provider_fallback", preferred=preferred, using=provider)
 
     # Build webhook URL (forward per-call variables as base64-JSON in ?cv= so the
     # answer webhook -> media WS can personalize the prompt + fill the booking attendee)

@@ -342,11 +342,14 @@ class CampaignWorker:
                 else None
             )
 
-        # Honour the outbound-provider gate; Telnyx stays dormant unless preferred/fallback.
+        # Use exactly the configured provider. A missing or invalid selection fails closed;
+        # switching to Telnyx requires an explicit configuration change.
         preferred = (settings.TELEPHONY_OUTBOUND_PROVIDER or "twilio").lower()
         if preferred == "telnyx":
-            return _telnyx() or _twilio()
-        return _twilio() or _telnyx()
+            return _telnyx()
+        if preferred == "twilio":
+            return _twilio()
+        return None
 
     async def _initiate_call(
         self,

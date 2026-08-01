@@ -307,6 +307,7 @@ async def test_telnyx_pending_record_is_committed_before_external_dial(
 ) -> None:
     monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
+    monkeypatch.setattr(settings, "TELEPHONY_OUTBOUND_PROVIDER", "telnyx")
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent = SimpleNamespace(id=agent_id, user_id=1)
@@ -371,6 +372,7 @@ async def test_timeout_after_possible_accept_stays_pending_and_callback_repairs(
 ) -> None:
     monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
+    monkeypatch.setattr(settings, "TELEPHONY_OUTBOUND_PROVIDER", "telnyx")
     agent_id = uuid.uuid4()
     workspace_id = uuid.uuid4()
     agent_result = MagicMock()

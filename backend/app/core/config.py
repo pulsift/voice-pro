@@ -141,9 +141,9 @@ class Settings(BaseSettings):
     TELNYX_PUBLIC_KEY: str | None = None
     TWILIO_ACCOUNT_SID: str | None = None
     TWILIO_AUTH_TOKEN: str | None = None
-    # Outbound caller ID (E.164) for Twilio calls, and the preferred outbound
-    # provider. The gate makes Twilio first-class; Telnyx stays in the codebase,
-    # dormant, and is used only as a fallback (or by flipping this to "telnyx").
+    # Outbound caller ID (E.164) for Twilio calls, and the selected outbound provider.
+    # Twilio is the default. Telnyx stays dormant unless this is explicitly set to
+    # "telnyx"; missing credentials fail closed instead of switching providers.
     TWILIO_FROM_NUMBER: str | None = None
     TELEPHONY_OUTBOUND_PROVIDER: str = "twilio"
 
