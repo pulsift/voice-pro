@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -23,16 +24,62 @@ from app.services.availability import (
     CALENDAR_BACKEND_VARIABLE,
     AvailabilityResult,
 )
-from app.services.fulfilment_webhook import schedule_fulfilment_webhook
+from app.services.fulfilment_webhook import (
+    ExtraBookingConflictError,
+    authorize_fulfilment_booking,
+    claim_fulfilment_booking,
+    finalize_fulfilment_intent,
+    stage_fulfilment_intent,
+)
 
 logger = structlog.get_logger()
 MAX_BOOKING_ATTEMPTS = 2
 MIN_SLOTS_FOR_SECOND_SELECTION = 2
 MAX_12_HOUR = 12
 MAX_MINUTE = 59
+_FULFILMENT_ICP_LIST_FIELDS = (
+    "offer_types", "states", "industries", "cities",
+)
+_FULFILMENT_ICP_FIELDS = {*_FULFILMENT_ICP_LIST_FIELDS, "min_kw"}
 
 AvailabilityLoader = Callable[[str, str], Awaitable[AvailabilityResult | None]]
 AvailabilityInvalidator = Callable[[str], Awaitable[None]]
+
+
+def _normalize_fulfilment_icp(value: dict[str, Any] | str) -> dict[str, Any]:
+    """Return the exact ICP shape accepted by the paid fulfilment receiver."""
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise TypeError("ICP JSON must be an object")
+        value = parsed
+    if not isinstance(value, dict):
+        raise TypeError("ICP must be an object")
+    unknown = set(value) - _FULFILMENT_ICP_FIELDS
+    if unknown:
+        raise ValueError("ICP contains unsupported fields")
+
+    normalized: dict[str, Any] = {}
+    for field in _FULFILMENT_ICP_LIST_FIELDS:
+        if field not in value:
+            continue
+        items = value[field]
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) or not item.strip() for item in items
+        ):
+            raise TypeError(f"ICP {field} must be a list of non-empty strings")
+        normalized[field] = [item.strip() for item in items]
+
+    if "min_kw" in value:
+        min_kw = value["min_kw"]
+        if min_kw is not None and (
+            isinstance(min_kw, bool)
+            or not isinstance(min_kw, (int, float))
+            or not math.isfinite(float(min_kw))
+        ):
+            raise TypeError("ICP min_kw must be a finite number or null")
+        normalized["min_kw"] = min_kw
+    return normalized
 
 
 class CRMTools:
@@ -796,6 +843,7 @@ class CRMTools:
                         "icp": {
                             "type": "object",
                             "description": "REQUIRED. Quick fit-check captured on the call, in 2-3 brief questions.",
+                            "additionalProperties": False,
                             "properties": {
                                 "offer_types": {
                                     "type": "array",
@@ -1247,11 +1295,62 @@ class CRMTools:
                     "message": "Ask the lead the quick fit questions (what they install, minimum project size in kW, target states) before booking, then call book_appointment again with icp filled in.",
                 }
 
-            icp_str = icp if isinstance(icp, str) else json.dumps(icp, ensure_ascii=False)
+            try:
+                fulfilment_icp = _normalize_fulfilment_icp(icp)
+            except (TypeError, ValueError) as exc:
+                self.logger.warning(
+                    "calcom_book_invalid_icp", error_type=type(exc).__name__
+                )
+                return {
+                    "success": False,
+                    "error": "invalid_icp",
+                    "message": (
+                        "Ask the fit questions again, then call book_appointment with "
+                        "offer_types and states as lists, plus min_kw as a number."
+                    ),
+                }
+
+            icp_str = json.dumps(fulfilment_icp, ensure_ascii=False)
             full_notes = notes or ""
             if service_type:
                 full_notes = f"{service_type}. {full_notes}".strip()
             full_notes = f"{full_notes}\nICP: {icp_str}".strip()
+
+            fulfilment_payload = {
+                "name": name,
+                "company": str(self.variables.get("company") or ""),
+                "email": attendee_email,
+                "phone": self.variables.get("leadPhone") or self.variables.get("phone"),
+                "icp": fulfilment_icp,
+                "campaign_id": self.variables.get("campaign_id")
+                or self.variables.get("campaignId"),
+                "conversation_id": self.variables.get("conversation_id")
+                or self.variables.get("conversationId"),
+            }
+            try:
+                intent_key = await stage_fulfilment_intent(
+                    start_iso=self._selected_start,
+                    email=attendee_email,
+                    payload=fulfilment_payload,
+                    workspace_id=self.workspace_id,
+                    user_id=self.user_id,
+                )
+                booking_claim_token = await claim_fulfilment_booking(intent_key)
+            except Exception as exc:
+                self.logger.exception(
+                    "fulfilment_intent_stage_failed",
+                    error_type=type(exc).__name__,
+                )
+                return {
+                    "success": False,
+                    "error": "fulfilment_unavailable",
+                    "message": (
+                        "The booking system is unavailable. Do not retry this time; "
+                        "tell them the team will confirm by email."
+                    ),
+                }
+
+            booking_dispatched = False
             try:
                 from app.services.calcom_client import create_booking, find_existing_booking
 
@@ -1339,7 +1438,27 @@ class CRMTools:
                             "message": "The calendar cannot safely verify this time. Do not retry it; tell them the team will confirm by email.",
                         }
 
-                remaining_attempts = MAX_BOOKING_ATTEMPTS - prior_count
+                if not booking_result.get("success"):
+                    if booking_claim_token is None:
+                        return {
+                            "success": False,
+                            "error": "booking_outcome_unknown",
+                            "message": "Another booking attempt is being verified. Do not try that time again; tell them the team will confirm by email.",
+                        }
+                    booking_dispatched = await authorize_fulfilment_booking(
+                        intent_key,
+                        booking_claim_token,
+                    )
+                    if not booking_dispatched:
+                        return {
+                            "success": False,
+                            "error": "booking_outcome_unknown",
+                            "message": "The booking lease changed while the calendar was checked. Do not try that time again; tell them the team will confirm by email.",
+                        }
+
+                # A Cal.com create is non-idempotent. Once its durable dispatch
+                # marker is set, every later attempt is reconciliation-only.
+                remaining_attempts = min(1, MAX_BOOKING_ATTEMPTS - prior_count)
                 for local_attempt in range(remaining_attempts):
                     booking_result = await create_booking(
                         start_iso=self._selected_start,
@@ -1394,23 +1513,34 @@ class CRMTools:
                         await asyncio.sleep(0.1)
             except Exception as e:
                 self.logger.exception("calcom_book_failed", error=str(e))
+                if booking_dispatched:
+                    return {
+                        "success": False,
+                        "error": "booking_outcome_unknown",
+                        "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
+                    }
                 return {"success": False, "error": "booking_failed"}
             if booking_result.get("success"):
                 booking_id = booking_result.get("uid")
-                schedule_fulfilment_webhook(
-                    {
-                        "booking_id": booking_id,
-                        "name": name,
-                        "company": self.variables.get("company"),
-                        "email": attendee_email,
-                        "phone": self.variables.get("leadPhone") or self.variables.get("phone"),
-                        "icp": icp if isinstance(icp, dict) else icp_str,
-                        "campaign_id": self.variables.get("campaign_id")
-                        or self.variables.get("campaignId"),
-                        "conversation_id": self.variables.get("conversation_id")
-                        or self.variables.get("conversationId"),
-                    }
-                )
+                try:
+                    finalized = await finalize_fulfilment_intent(intent_key, booking_id)
+                    if not finalized:
+                        self.logger.error("fulfilment_intent_missing_after_booking")
+                except ExtraBookingConflictError as exc:
+                    self.logger.exception(
+                        "calcom_extra_booking_requires_manual_reconciliation",
+                        intent_key=intent_key,
+                        booking_id=booking_id,
+                        error=str(exc),
+                    )
+                except Exception as exc:
+                    # The pre-booking intent is already durable. Its worker can
+                    # reconcile this exact attendee/slot after a commit-unknown
+                    # finalization, so never deny a booking Cal.com proved exists.
+                    self.logger.exception(
+                        "fulfilment_intent_finalize_failed",
+                        error_type=type(exc).__name__,
+                    )
                 self._selected_slot_id = None
                 self._selected_start = None
                 self._booking_completed = {
@@ -1466,6 +1596,12 @@ class CRMTools:
                     "status_code": booking_result.get("status_code"),
                 }
             if booking_result.get("category") == "reconcile_unavailable":
+                return {
+                    "success": False,
+                    "error": "booking_outcome_unknown",
+                    "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
+                }
+            if booking_result.get("category") == "transient":
                 return {
                     "success": False,
                     "error": "booking_outcome_unknown",

@@ -58,6 +58,10 @@ from app.services.call_events import (
     stop_call_event_worker,
 )
 from app.services.campaign_worker import start_campaign_worker, stop_campaign_worker
+from app.services.fulfilment_webhook import (
+    start_fulfilment_worker,
+    stop_fulfilment_worker,
+)
 
 # Configure structured logging with async processors
 structlog.configure(
@@ -151,6 +155,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
     except Exception:
         logger.exception("Failed to start call-event outbox worker - events remain pending")
 
+    # Start durable promised-list delivery (non-fatal; intents remain in Postgres).
+    try:
+        await start_fulfilment_worker()
+    except Exception:
+        logger.exception("Failed to start fulfilment outbox worker - jobs remain pending")
+
     # Start transcript retention sweep (non-fatal)
     try:
         await start_transcript_retention_worker()
@@ -172,6 +182,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
         logger.info("Campaign worker stopped")
     except Exception:
         logger.exception("Error stopping campaign worker")
+
+    # Stop durable promised-list delivery before disposing the database engine.
+    try:
+        await stop_fulfilment_worker()
+    except Exception:
+        logger.exception("Error stopping fulfilment outbox worker")
 
     # Stop durable call-ended delivery before disposing the database engine.
     try:

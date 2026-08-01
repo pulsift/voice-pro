@@ -21,6 +21,22 @@ def configured_calcom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 123)
     monkeypatch.setattr(settings, "BOOKING_TEAM_TIMEZONE", "Europe/Stockholm")
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.stage_fulfilment_intent",
+        AsyncMock(return_value="intent-key"),
+    )
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.finalize_fulfilment_intent",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.claim_fulfilment_booking",
+        AsyncMock(return_value=uuid.UUID(int=1)),
+    )
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.authorize_fulfilment_booking",
+        AsyncMock(return_value=True),
+    )
 
 
 def make_tools() -> CRMTools:
@@ -72,12 +88,12 @@ async def test_timeout_after_provider_commit_reconciles_without_duplicate_post()
             },
         ]
     )
-    webhook = MagicMock()
+    webhook = AsyncMock(return_value=True)
 
     with (
         patch("app.services.calcom_client.create_booking", post),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
-        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook", webhook),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
 
@@ -86,15 +102,15 @@ async def test_timeout_after_provider_commit_reconciles_without_duplicate_post()
     assert post.await_count == 1
     assert reconcile.await_count == 2
     reconcile.assert_awaited_with(start_iso=SLOT["start"], email="lead@example.com")
-    webhook.assert_called_once()
+    webhook.assert_awaited_once()
     categories = [attempt["category"] for attempt in tools.get_booking_attempts()]
     assert categories[-3:] == ["not_found", "transient", "reconciled_success"]
     assert tools.get_booking_attempts()[-1]["uid"] == "committed-booking"
 
 
 @pytest.mark.asyncio
-async def test_repeated_booking_invocation_never_exceeds_two_posts_for_selected_slot() -> None:
-    """Tool retries by the model cannot reset the per-selection provider POST cap."""
+async def test_repeated_booking_invocation_never_reposts_a_dispatched_intent() -> None:
+    """Tool retries by the model become reconciliation-only after one POST."""
     tools = make_tools()
     await offer_and_select(tools)
     post = AsyncMock(
@@ -118,13 +134,17 @@ async def test_repeated_booking_invocation_never_exceeds_two_posts_for_selected_
         patch("app.services.calcom_client.create_booking", post),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.asyncio.sleep", AsyncMock()),
+        patch(
+            "app.services.tools.crm_tools.claim_fulfilment_booking",
+            AsyncMock(side_effect=[uuid.UUID(int=1), None]),
+        ),
     ):
         first = await tools.book_appointment(SLOT["start"], icp=ICP)
         second = await tools.book_appointment(SLOT["start"], icp=ICP)
 
     assert first["success"] is False
     assert second["success"] is False
-    assert post.await_count == 2
+    assert post.await_count == 1
     assert {call.kwargs["start_iso"] for call in post.await_args_list} == {SLOT["start"]}
 
 
@@ -188,19 +208,19 @@ async def test_new_session_preflight_finds_existing_booking_before_any_post() ->
             "start": SLOT["start"],
         }
     )
-    webhook = MagicMock()
+    webhook = AsyncMock(return_value=True)
 
     with (
         patch("app.services.calcom_client.create_booking", post),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
-        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook", webhook),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
 
     assert result["uid"] == "earlier-session-booking"
     post.assert_not_awaited()
     reconcile.assert_awaited_once_with(start_iso=SLOT["start"], email="lead@example.com")
-    webhook.assert_called_once()
+    webhook.assert_awaited_once()
     assert [attempt["operation"] for attempt in tools.get_booking_attempts()] == [
         "availability",
         "select",
@@ -229,7 +249,7 @@ async def test_booking_transition_evidence_orders_offer_select_reconcile_create(
     with (
         patch("app.services.calcom_client.create_booking", post),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
-        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook"),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent"),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
 
@@ -246,6 +266,119 @@ async def test_booking_transition_evidence_orders_offer_select_reconcile_create(
         "not_found",
         "success",
     ]
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_intent_commits_before_cal_post_and_finalizes_after_success() -> None:
+    tools = make_tools()
+    await offer_and_select(tools)
+    order: list[str] = []
+
+    async def stage_intent(**_kwargs: object) -> str:
+        order.append("stage")
+        return "intent-key"
+
+    async def reconcile_booking(**_kwargs: object) -> dict[str, object]:
+        order.append("reconcile")
+        return {"success": False, "category": "not_found", "status_code": 200}
+
+    async def create_cal_booking(**_kwargs: object) -> dict[str, object]:
+        order.append("create")
+        return {
+            "success": True,
+            "category": "success",
+            "status_code": 201,
+            "uid": "booking-ordered",
+            "start": SLOT["start"],
+        }
+
+    async def finalize_intent(intent_key: str, booking_id: object) -> bool:
+        assert intent_key == "intent-key"
+        assert booking_id == "booking-ordered"
+        order.append("finalize")
+        return True
+
+    staged = AsyncMock(side_effect=stage_intent)
+    with (
+        patch(
+            "app.services.tools.crm_tools.stage_fulfilment_intent",
+            staged,
+        ),
+        patch(
+            "app.services.calcom_client.find_existing_booking",
+            AsyncMock(side_effect=reconcile_booking),
+        ),
+        patch(
+            "app.services.calcom_client.create_booking",
+            AsyncMock(side_effect=create_cal_booking),
+        ),
+        patch(
+            "app.services.tools.crm_tools.finalize_fulfilment_intent",
+            AsyncMock(side_effect=finalize_intent),
+        ),
+    ):
+        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+
+    assert result["uid"] == "booking-ordered"
+    assert order == ["stage", "reconcile", "create", "finalize"]
+    assert staged.await_args.kwargs["start_iso"] == SLOT["start"]
+    assert staged.await_args.kwargs["email"] == "lead@example.com"
+    assert staged.await_args.kwargs["payload"]["company"] == ""
+    assert staged.await_args.kwargs["payload"]["icp"] == ICP
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_icp",
+    [
+        {"offer_types": ["solar"], "states": ["Texas"], "service_area": "DFW"},
+        {"offer_types": ["solar"], "states": "Texas", "min_kw": 50},
+    ],
+)
+async def test_receiver_incompatible_icp_cannot_create_booking(
+    invalid_icp: dict[str, object],
+) -> None:
+    tools = make_tools()
+    await offer_and_select(tools)
+    stage = AsyncMock()
+    reconcile = AsyncMock()
+    create = AsyncMock()
+
+    with (
+        patch("app.services.tools.crm_tools.stage_fulfilment_intent", stage),
+        patch("app.services.calcom_client.find_existing_booking", reconcile),
+        patch("app.services.calcom_client.create_booking", create),
+    ):
+        result = await tools.book_appointment(SLOT["start"], icp=invalid_icp)
+
+    assert result["success"] is False
+    assert result["error"] == "invalid_icp"
+    stage.assert_not_awaited()
+    reconcile.assert_not_awaited()
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_intent_stage_failure_prevents_any_cal_read_or_write() -> None:
+    tools = make_tools()
+    await offer_and_select(tools)
+    reconcile = AsyncMock()
+    create = AsyncMock()
+
+    with (
+        patch(
+            "app.services.tools.crm_tools.stage_fulfilment_intent",
+            AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ),
+        patch("app.services.calcom_client.find_existing_booking", reconcile),
+        patch("app.services.calcom_client.create_booking", create),
+    ):
+        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+
+    assert result["success"] is False
+    assert result["error"] == "fulfilment_unavailable"
+    reconcile.assert_not_awaited()
+    create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -284,7 +417,7 @@ async def test_malformed_success_response_fails_closed_then_reconciles(
     with (
         patch("app.services.calcom_client.httpx.AsyncClient", return_value=context),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
-        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook"),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent"),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
 
@@ -328,12 +461,12 @@ async def test_unreadable_success_response_reconciles_without_duplicate_post() -
             },
         ]
     )
-    webhook = MagicMock()
+    webhook = AsyncMock(return_value=True)
 
     with (
         patch("app.services.calcom_client.httpx.AsyncClient", return_value=context),
         patch("app.services.calcom_client.find_existing_booking", reconcile),
-        patch("app.services.tools.crm_tools.schedule_fulfilment_webhook", webhook),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
 
@@ -343,7 +476,7 @@ async def test_unreadable_success_response_reconciles_without_duplicate_post() -
         call(start_iso=SLOT["start"], email="lead@example.com"),
         call(start_iso=SLOT["start"], email="lead@example.com"),
     ]
-    webhook.assert_called_once()
+    webhook.assert_awaited_once()
     assert [attempt["category"] for attempt in tools.get_booking_attempts()][-3:] == [
         "not_found",
         "transient",

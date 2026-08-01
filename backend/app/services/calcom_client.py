@@ -313,6 +313,7 @@ async def create_booking(
 async def find_existing_booking(
     start_iso: str,
     email: str,
+    event_type_id: int | None = None,
 ) -> dict[str, Any]:
     """Reconcile an unknown POST outcome before any retry can create a duplicate."""
     target_start = _parse_iso(start_iso).astimezone(UTC)
@@ -324,7 +325,9 @@ async def find_existing_booking(
     }
     params = {
         "attendeeEmail": email,
-        "eventTypeId": settings.CALCOM_EVENT_TYPE_ID,
+        "eventTypeId": (
+            event_type_id if event_type_id is not None else settings.CALCOM_EVENT_TYPE_ID
+        ),
         "afterStart": window_start,
         "beforeEnd": window_end,
         "limit": 20,

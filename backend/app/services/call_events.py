@@ -13,7 +13,6 @@ HMAC-SHA256 over the raw JSON bytes — keyed by CALL_EVENTS_SECRET. Unset secre
 """
 
 import asyncio
-import contextlib
 import hashlib
 import hmac
 import json
@@ -21,7 +20,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
-import httpx
 import structlog
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -32,17 +30,24 @@ from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.call_event_outbox import CallEventOutbox
 from app.models.call_record import CallDirection, CallRecord
+from app.services.durable_events import (
+    DEFAULT_LEASE_SECONDS,
+    DeliveryDisposition,
+    classify_delivery_status,
+    exponential_backoff,
+    lease_one,
+    post_once,
+    run_worker_loop,
+    start_worker_task,
+    stop_worker_task,
+    transition_claim,
+)
 
 logger = structlog.get_logger()
 
 _TIMEOUT_SECONDS = 10.0
-_HTTP_SUCCESS_MIN = 200
-_HTTP_SUCCESS_MAX = 300
-_HTTP_CONFLICT = 409
 _WORKER_POLL_SECONDS = 1.0
-_LEASE_SECONDS = 60
-_INITIAL_BACKOFF_SECONDS = 5
-_MAX_BACKOFF_SECONDS = 30 * 60
+_LEASE_SECONDS = DEFAULT_LEASE_SECONDS
 # Preserve the existing provider/media race grace. Both signals make a row
 # immediately eligible; either signal alone waits this long before fallback.
 FALLBACK_DELAY_SECONDS = 20.0
@@ -257,46 +262,42 @@ class _PayloadIntegrityError(RuntimeError):
 async def _claim_due_event(*, now: datetime | None = None) -> _Claim | None:
     now = now or datetime.now(UTC)
     expired_before = now - timedelta(seconds=_LEASE_SECONDS)
-    async with AsyncSessionLocal() as db, db.begin():
-        result = await db.execute(
-            select(CallEventOutbox)
-            .join(CallRecord, CallRecord.id == CallEventOutbox.call_id)
-            .where(
-                or_(
-                    and_(
-                        CallEventOutbox.state == "pending",
-                        CallEventOutbox.next_attempt_at <= now,
-                    ),
-                    and_(
-                        CallEventOutbox.state == "sending",
-                        or_(
-                            CallEventOutbox.claimed_at.is_(None),
-                            CallEventOutbox.claimed_at <= expired_before,
-                        ),
-                    ),
+    statement = (
+        select(CallEventOutbox)
+        .join(CallRecord, CallRecord.id == CallEventOutbox.call_id)
+        .where(
+            or_(
+                and_(
+                    CallEventOutbox.state == "pending",
+                    CallEventOutbox.next_attempt_at <= now,
                 ),
                 and_(
-                    CallEventOutbox.carrier_terminal_at.is_not(None),
+                    CallEventOutbox.state == "sending",
                     or_(
-                        CallRecord.media_finalized_at.is_not(None),
-                        CallEventOutbox.available_at <= now,
+                        CallEventOutbox.claimed_at.is_(None),
+                        CallEventOutbox.claimed_at <= expired_before,
                     ),
                 ),
-            )
-            .order_by(CallEventOutbox.next_attempt_at, CallEventOutbox.created_at)
-            .limit(1)
-            .with_for_update(of=CallEventOutbox, skip_locked=True)
+            ),
+            and_(
+                CallEventOutbox.carrier_terminal_at.is_not(None),
+                or_(
+                    CallRecord.media_finalized_at.is_not(None),
+                    CallEventOutbox.available_at <= now,
+                ),
+            ),
         )
-        row = result.scalar_one_or_none()
-        if row is None:
-            return None
-        token = uuid.uuid4()
-        row.state = "sending"
-        row.claimed_at = now
-        row.claim_token = token
-        row.attempts += 1
-        row.last_error = None
-        return _Claim(row.call_id, token, row.attempts)
+        .order_by(CallEventOutbox.next_attempt_at, CallEventOutbox.created_at)
+        .limit(1)
+        .with_for_update(of=CallEventOutbox, skip_locked=True)
+    )
+    return await lease_one(
+        AsyncSessionLocal,
+        statement,
+        now=now,
+        claimed_state="sending",
+        claim_factory=lambda row, token, attempts: _Claim(row.call_id, token, attempts),
+    )
 
 
 async def _materialize_claimed_body(claim: _Claim) -> bytes | None:
@@ -341,69 +342,41 @@ async def _materialize_claimed_body(claim: _Claim) -> bytes | None:
 
 
 async def _ack_claim(claim: _Claim) -> bool:
-    now = datetime.now(UTC)
-    async with AsyncSessionLocal() as db, db.begin():
-        result = await db.execute(
-            update(CallEventOutbox)
-            .where(
-                CallEventOutbox.call_id == claim.call_id,
-                CallEventOutbox.state == "sending",
-                CallEventOutbox.claim_token == claim.token,
-            )
-            .values(
-                state="sent",
-                sent_at=now,
-                claimed_at=None,
-                claim_token=None,
-                last_error=None,
-                updated_at=now,
-            )
-        )
-        return bool(getattr(result, "rowcount", 0))
+    return await transition_claim(
+        AsyncSessionLocal,
+        CallEventOutbox,
+        identity_conditions=(CallEventOutbox.call_id == claim.call_id,),
+        token=claim.token,
+        expected_state="sending",
+        target_state="sent",
+        mark_sent=True,
+    )
 
 
 async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool:
-    now = datetime.now(UTC)
-    async with AsyncSessionLocal() as db, db.begin():
-        result = await db.execute(
-            update(CallEventOutbox)
-            .where(
-                CallEventOutbox.call_id == claim.call_id,
-                CallEventOutbox.state == "sending",
-                CallEventOutbox.claim_token == claim.token,
-            )
-            .values(
-                state="pending",
-                next_attempt_at=now + timedelta(seconds=delay_seconds),
-                claimed_at=None,
-                claim_token=None,
-                last_error=error[:1000],
-                updated_at=now,
-            )
-        )
-        return bool(getattr(result, "rowcount", 0))
+    return await transition_claim(
+        AsyncSessionLocal,
+        CallEventOutbox,
+        identity_conditions=(CallEventOutbox.call_id == claim.call_id,),
+        token=claim.token,
+        expected_state="sending",
+        target_state="pending",
+        error=error,
+        delay_seconds=delay_seconds,
+    )
 
 
 async def _block_claim(claim: _Claim, error: str) -> bool:
     """Permanently expose an immutable-payload or integrity conflict."""
-    now = datetime.now(UTC)
-    async with AsyncSessionLocal() as db, db.begin():
-        result = await db.execute(
-            update(CallEventOutbox)
-            .where(
-                CallEventOutbox.call_id == claim.call_id,
-                CallEventOutbox.state == "sending",
-                CallEventOutbox.claim_token == claim.token,
-            )
-            .values(
-                state="blocked",
-                claimed_at=None,
-                claim_token=None,
-                last_error=error[:1000],
-                updated_at=now,
-            )
-        )
-        return bool(getattr(result, "rowcount", 0))
+    return await transition_claim(
+        AsyncSessionLocal,
+        CallEventOutbox,
+        identity_conditions=(CallEventOutbox.call_id == claim.call_id,),
+        token=claim.token,
+        expected_state="sending",
+        target_state="blocked",
+        error=error,
+    )
 
 
 async def _mark_missing_url() -> None:
@@ -422,14 +395,11 @@ async def _mark_missing_url() -> None:
 
 
 def _retry_delay(attempts: int) -> int:
-    exponent = min(max(attempts - 1, 0), 8)
-    return int(min(_INITIAL_BACKOFF_SECONDS * (2**exponent), _MAX_BACKOFF_SECONDS))
+    return exponential_backoff(attempts)
 
 
 async def _post_once(url: str, body: bytes, headers: dict[str, str]) -> int:
-    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-        response = await client.post(url, content=body, headers=headers)
-    return response.status_code
+    return await post_once(url, body, headers, timeout_seconds=_TIMEOUT_SECONDS)
 
 
 async def dispatch_due_call_event() -> bool:  # noqa: PLR0911
@@ -480,7 +450,11 @@ async def dispatch_due_call_event() -> bool:  # noqa: PLR0911
         log.warning("call_ended_event_delivery_error", error=error, attempt=claim.attempts)
         return True
 
-    if _HTTP_SUCCESS_MIN <= status_code < _HTTP_SUCCESS_MAX:
+    disposition = classify_delivery_status(
+        status_code,
+        permanent_client_errors=False,
+    )
+    if disposition is DeliveryDisposition.ACK:
         acknowledged = await _ack_claim(claim)
         log.info(
             "call_ended_event_delivered",
@@ -489,7 +463,7 @@ async def dispatch_due_call_event() -> bool:  # noqa: PLR0911
         )
         return True
 
-    if status_code == _HTTP_CONFLICT:
+    if disposition is DeliveryDisposition.BLOCK:
         error = "HTTP 409: immutable call-event payload conflict"
         blocked = await _block_claim(claim, error)
         log.error(
@@ -506,24 +480,20 @@ async def dispatch_due_call_event() -> bool:  # noqa: PLR0911
 
 
 async def _worker_loop(*, interval_seconds: float) -> None:
-    while True:
-        try:
-            processed = await dispatch_due_call_event()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("call_ended_event_worker_error")
-            processed = False
-        if not processed:
-            await asyncio.sleep(interval_seconds)
+    await run_worker_loop(
+        dispatch_due_call_event,
+        interval_seconds=interval_seconds,
+        on_error=lambda: logger.exception("call_ended_event_worker_error"),
+    )
 
 
 async def start_call_event_worker() -> None:
     global _worker_task
     if _worker_task is not None and not _worker_task.done():
         return
-    _worker_task = asyncio.create_task(
-        _worker_loop(interval_seconds=_WORKER_POLL_SECONDS),
+    _worker_task = start_worker_task(
+        _worker_task,
+        lambda: _worker_loop(interval_seconds=_WORKER_POLL_SECONDS),
         name="call-event-outbox",
     )
     logger.info("call_ended_event_worker_started")
@@ -535,7 +505,5 @@ async def stop_call_event_worker() -> None:
     _worker_task = None
     if task is None:
         return
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    await stop_worker_task(task)
     logger.info("call_ended_event_worker_stopped")

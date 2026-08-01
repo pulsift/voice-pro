@@ -174,14 +174,13 @@ class Settings(BaseSettings):
     BOOKING_HOUR_START: int = 8
     BOOKING_HOUR_END: int = 20
 
-    # Fulfilment handoff (optional). When set, a successful Cal.com booking fires a
-    # fire-and-forget POST to f"{FULFIL_WEBHOOK_URL}/fulfil" with the booking + ICP
-    # payload so the fulfilment service can build the lead-magnet list. Unset = skip
-    # silently (no fulfilment service deployed yet / not wanted for this environment).
-    # When FULFIL_WEBHOOK_SECRET is set, the POST body is signed with
+    # Fulfilment handoff. Every Cal.com booking intent is persisted before the booking
+    # request; a durable worker POSTs confirmed bookings to
+    # f"{FULFIL_WEBHOOK_URL}/fulfil" so fulfilment can build the promised lead list.
+    # The POST body is signed with
     # X-Fulfil-Signature: sha256=<HMAC-SHA256 hex over the raw JSON bytes> so the
-    # fulfilment service can reject forged requests. Unset = send unsigned (legacy)
-    # with a one-time warning.
+    # fulfilment service can reject forged requests. A missing URL or secret fails
+    # closed: no HTTP request is sent and durable work remains pending for repair.
     FULFIL_WEBHOOK_URL: str | None = None
     FULFIL_WEBHOOK_SECRET: str | None = None
 
