@@ -18,6 +18,10 @@ logger = structlog.get_logger()
 HTTP_SERVER_ERROR_MIN = 500
 
 
+class TelnyxDialNotStartedError(RuntimeError):
+    """Local preflight proved the provider dial POST was never attempted."""
+
+
 def is_unknown_telnyx_dial_outcome(exc: Exception) -> bool:
     """Return True when Telnyx may have accepted a dial despite the local error."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -100,7 +104,7 @@ class TelnyxService(TelephonyProvider):
         )
         connection_id = await self._get_connection_id()
         if not connection_id:
-            raise ValueError(
+            raise TelnyxDialNotStartedError(
                 "No Telnyx TeXML Application found for outbound calls. "
                 "Create one (voice_url -> /webhooks/telnyx/voice) and assign the number to it."
             )

@@ -9,15 +9,19 @@ This module provides:
 """
 
 import asyncio
+import hashlib
+import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import structlog
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
-from sqlalchemy import or_, select
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ValidationError
+from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.settings import get_user_api_keys
@@ -40,7 +44,11 @@ from app.services.availability import (
 from app.services.call_events import schedule_call_ended_event
 from app.services.telephony import recording_policy
 from app.services.telephony.media_grant import arm_twilio_media_grant
-from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
+from app.services.telephony.telnyx_service import (
+    TelnyxDialNotStartedError,
+    TelnyxService,
+    is_unknown_telnyx_dial_outcome,
+)
 from app.services.telephony.twilio_service import (
     TwilioDialOutcomeUnknownError,
     TwilioService,
@@ -136,8 +144,10 @@ async def _find_twilio_lifecycle_record(
     db: AsyncSession,
 ) -> tuple[CallRecord | None, int]:
     """Lock and reconcile the outbound row authorized by a signed Twilio callback."""
-    if not call_sid:
+    real_call_sid = _real_provider_call_id(call_sid)
+    if real_call_sid is None:
         return None, 0
+    call_sid = real_call_sid
 
     if call_record_id:
         if not from_number or not to_number:
@@ -175,6 +185,7 @@ async def _find_twilio_lifecycle_record(
     call_record = candidates[0]
     if call_record.provider_call_id.startswith("pending:"):
         call_record.provider_call_id = call_sid
+    _mark_dial_attempt_accepted_by_callback(call_record)
     return call_record, 1
 
 
@@ -304,6 +315,13 @@ async def _find_telnyx_lifecycle_record(
     db: AsyncSession,
 ) -> tuple[CallRecord | None, int]:
     """Lock an exact record or reconcile one pre-dial pending row with bounded retries."""
+    identifiers = {
+        provider_id
+        for value in identifiers
+        if (provider_id := _real_provider_call_id(value)) is not None
+    }
+    if not identifiers:
+        return None, 0
     candidate_count = 0
     for delay in (0.0, 0.05, 0.1, 0.2, 0.4):
         if delay:
@@ -323,6 +341,7 @@ async def _find_telnyx_lifecycle_record(
         candidates = exact.scalars().all()
         candidate_count = len(candidates)
         if candidate_count == 1:
+            _mark_dial_attempt_accepted_by_callback(candidates[0])
             return candidates[0], candidate_count
 
         if candidate_count == 0 and from_number and to_number:
@@ -351,6 +370,7 @@ async def _find_telnyx_lifecycle_record(
                 record = locked.scalar_one()
                 if record.provider_call_id.startswith("pending:"):
                     record.provider_call_id = sorted(identifiers)[0]
+                _mark_dial_attempt_accepted_by_callback(record)
                 return record, candidate_count
 
     return None, candidate_count
@@ -400,8 +420,14 @@ class InitiateCallRequest(BaseModel):
     variables: dict[str, Any] | None = None
 
 
+class IdempotentInitiateCallRequest(InitiateCallRequest):
+    """Versioned request whose UUID identifies one physical dial attempt."""
+
+    dial_attempt_id: uuid.UUID
+
+
 class CallResponse(BaseModel):
-    """Call response."""
+    """Accepted call response; the legacy route always keeps a concrete call ID."""
 
     call_id: str
     call_control_id: str | None = None
@@ -410,6 +436,328 @@ class CallResponse(BaseModel):
     direction: str
     status: str
     agent_id: str | None = None
+    call_record_id: str | None = None
+    dial_attempt_id: str | None = None
+    dial_attempt_status: Literal["accepted"] | None = None
+
+
+class DialAttemptPendingResponse(BaseModel):
+    """A keyed attempt that must be reconciled, never redialled under a new key."""
+
+    call_id: None = None
+    call_control_id: None = None
+    from_number: str
+    to_number: str
+    direction: str
+    status: str
+    agent_id: str | None = None
+    call_record_id: str
+    dial_attempt_id: str
+    dial_attempt_status: Literal["in_progress", "outcome_unknown"]
+
+
+class DialAttemptErrorDetail(BaseModel):
+    """Sanitized keyed-dial conflict or definitive rejection."""
+
+    code: Literal["dial_attempt_conflict", "dial_attempt_rejected"]
+    call_record_id: str | None = None
+    dial_attempt_id: str | None = None
+
+
+class DialAttemptErrorResponse(BaseModel):
+    detail: DialAttemptErrorDetail
+
+
+# Legacy builds used `reserved` while the carrier POST could already be running.
+# Never auto-resume that value during a rolling deployment.
+_DIAL_RESERVED = "reserved"
+_DIAL_READY_V2 = "dispatch_ready_v2"
+_DIAL_DISPATCHING = "dispatching"
+_DIAL_ACCEPTED = "accepted"
+_DIAL_UNKNOWN = "outcome_unknown"
+_DIAL_REJECTED = "rejected"
+_HTTP_CLIENT_ERROR_MIN = 400
+_HTTP_SERVER_ERROR_MIN = 500
+_HTTP_REQUEST_TIMEOUT = 408
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchReadyAttempt:
+    """A v2 key proven not to have begun provider dispatch yet."""
+
+    call_record_id: uuid.UUID
+    workspace_id: uuid.UUID | None
+    provider: str
+    variables: dict[str, Any]
+    response: JSONResponse
+
+
+def _real_provider_call_id(value: object) -> str | None:
+    """Return one real carrier ID, excluding blanks and our pending sentinel."""
+    provider_id = str(value or "").strip()
+    if not provider_id or provider_id.startswith("pending:"):
+        return None
+    return provider_id
+
+
+def _mark_dial_attempt_accepted_by_callback(record: CallRecord) -> None:
+    """Promote keyed state when a verified carrier callback proves acceptance."""
+    if not isinstance(getattr(record, "dial_attempt_id", None), uuid.UUID):
+        return
+    if _real_provider_call_id(record.provider_call_id) is None:
+        return
+    if record.dial_attempt_state == _DIAL_REJECTED:
+        # A signed carrier callback is stronger than our earlier local rejection.
+        # Remove the synthetic terminal state before the lifecycle applicator runs.
+        record.status = CallStatus.INITIATED.value
+        record.answered_at = None
+        record.ended_at = None
+        record.duration_seconds = 0
+    if record.dial_attempt_state != _DIAL_ACCEPTED:
+        record.dial_attempt_state = _DIAL_ACCEPTED
+        record.dial_attempt_result = None
+
+
+def _parse_requested_workspace_id(workspace_id: str | None) -> uuid.UUID | None:
+    if not workspace_id:
+        return None
+    try:
+        return uuid.UUID(workspace_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid workspace_id format") from exc
+
+
+def _dial_request_sha256(
+    call_request: InitiateCallRequest,
+    requested_workspace_id: uuid.UUID | None,
+) -> str:
+    """Hash only the immutable client transport contract."""
+    variables = {
+        key: value
+        for key, value in (call_request.variables or {}).items()
+        if key
+        not in {
+            "dialAttemptId",
+            "dial_attempt_id",
+            CALENDAR_BACKEND_VARIABLE,
+        }
+    }
+    canonical = json.dumps(
+        {
+            "agent_id": call_request.agent_id,
+            "from_number": call_request.from_number,
+            "to_number": call_request.to_number,
+            "variables": variables,
+            "requested_workspace_id": str(requested_workspace_id) if requested_workspace_id else "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def _load_dial_attempt(
+    dial_attempt_id: uuid.UUID,
+    db: AsyncSession,
+    *,
+    for_update: bool = False,
+) -> CallRecord | None:
+    statement = (
+        select(CallRecord)
+        .where(CallRecord.dial_attempt_id == dial_attempt_id)
+        .limit(2)
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    result = await db.execute(statement)
+    candidates = result.scalars().all()
+    if len(candidates) > 1:
+        logger.error("dial_attempt_unique_invariant_broken")
+        raise HTTPException(status_code=409, detail={"code": "dial_attempt_conflict"})
+    return candidates[0] if candidates else None
+
+
+def _dial_attempt_matches(
+    record: CallRecord,
+    *,
+    owner_user_id: uuid.UUID,
+    request_sha256: str,
+) -> bool:
+    return record.user_id == owner_user_id and record.dial_request_sha256 == request_sha256
+
+
+def _accepted_response_from_record(record: CallRecord) -> CallResponse:
+    stored = record.dial_attempt_result
+    if record.dial_attempt_state == _DIAL_ACCEPTED and isinstance(stored, dict):
+        try:
+            accepted = CallResponse.model_validate(stored)
+        except ValidationError:
+            pass
+        else:
+            if _real_provider_call_id(accepted.call_id) is not None:
+                return accepted
+
+    provider_id = _real_provider_call_id(record.provider_call_id)
+    if provider_id is None:
+        raise ValueError("accepted dial attempt has no provider call ID")
+    return CallResponse(
+        call_id=provider_id,
+        call_control_id=provider_id if record.provider == "twilio" else None,
+        from_number=record.from_number,
+        to_number=record.to_number,
+        direction=record.direction,
+        status=record.status,
+        agent_id=str(record.agent_id) if record.agent_id else None,
+        call_record_id=str(record.id),
+        dial_attempt_id=str(record.dial_attempt_id) if record.dial_attempt_id else None,
+        dial_attempt_status=_DIAL_ACCEPTED,
+    )
+
+
+def _pending_dial_response(record: CallRecord, state: str) -> JSONResponse:
+    pending_state: Literal["in_progress", "outcome_unknown"] = (
+        "outcome_unknown" if state == _DIAL_UNKNOWN else "in_progress"
+    )
+    body = DialAttemptPendingResponse(
+        from_number=record.from_number,
+        to_number=record.to_number,
+        direction=record.direction,
+        status=CallStatus.INITIATED.value,
+        agent_id=str(record.agent_id) if record.agent_id else None,
+        call_record_id=str(record.id),
+        dial_attempt_id=str(record.dial_attempt_id),
+        dial_attempt_status=pending_state,
+    )
+    return JSONResponse(status_code=202, content=body.model_dump(mode="json"))
+
+
+def _dial_attempt_rejected_error(record: CallRecord) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "dial_attempt_rejected",
+            "call_record_id": str(record.id),
+            "dial_attempt_id": str(record.dial_attempt_id),
+        },
+    )
+
+
+async def _replay_dial_attempt(
+    *,
+    dial_attempt_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    request_sha256: str,
+    db: AsyncSession,
+) -> CallResponse | JSONResponse | _DispatchReadyAttempt | None:
+    """Return persisted state, or a resumable pre-dispatch reservation."""
+    record = await _load_dial_attempt(dial_attempt_id, db, for_update=True)
+    if record is None:
+        return None
+    if not _dial_attempt_matches(
+        record,
+        owner_user_id=owner_user_id,
+        request_sha256=request_sha256,
+    ):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "dial_attempt_conflict"})
+
+    provider_id = _real_provider_call_id(record.provider_call_id)
+    if provider_id is not None:
+        accepted_response = _accepted_response_from_record(record)
+        record.dial_attempt_state = _DIAL_ACCEPTED
+        record.dial_attempt_result = accepted_response.model_dump(mode="json")
+        await db.commit()
+        return accepted_response
+
+    if record.dial_attempt_state == _DIAL_REJECTED:
+        error = _dial_attempt_rejected_error(record)
+        await db.commit()
+        raise error
+
+    if (
+        record.dial_attempt_state == _DIAL_READY_V2
+        and record.provider_call_id.startswith("pending:")
+    ):
+        resume = _DispatchReadyAttempt(
+            call_record_id=record.id,
+            workspace_id=record.workspace_id,
+            provider=record.provider,
+            variables=dict(record.variables or {}),
+            response=_pending_dial_response(record, "in_progress"),
+        )
+        await db.commit()
+        return resume
+
+    state = _DIAL_UNKNOWN if record.dial_attempt_state == _DIAL_UNKNOWN else "in_progress"
+    pending_response = _pending_dial_response(record, state)
+    await db.commit()
+    return pending_response
+
+
+async def _claim_dispatch_ready_dial_attempt(
+    *,
+    call_record_id: uuid.UUID,
+    dial_attempt_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    request_sha256: str,
+    db: AsyncSession,
+) -> CallRecord | CallResponse | JSONResponse:
+    """Atomically let exactly one v2 reservation reach the carrier."""
+    claimed = await db.execute(
+        update(CallRecord)
+        .where(
+            CallRecord.id == call_record_id,
+            CallRecord.dial_attempt_id == dial_attempt_id,
+            CallRecord.user_id == owner_user_id,
+            CallRecord.dial_request_sha256 == request_sha256,
+            CallRecord.dial_attempt_state == _DIAL_READY_V2,
+            CallRecord.provider_call_id.like("pending:%"),
+        )
+        .values(dial_attempt_state=_DIAL_DISPATCHING)
+        .returning(CallRecord)
+        .execution_options(populate_existing=True)
+    )
+    record = claimed.scalar_one_or_none()
+    if record is not None:
+        await db.commit()
+        return record
+
+    # Another worker or a signed callback won. End this transaction, then return
+    # the winner's authoritative state; never infer that a second POST is safe.
+    await db.rollback()
+    replay = await _replay_dial_attempt(
+        dial_attempt_id=dial_attempt_id,
+        owner_user_id=owner_user_id,
+        request_sha256=request_sha256,
+        db=db,
+    )
+    if replay is None:
+        raise HTTPException(status_code=409, detail={"code": "dial_attempt_conflict"})
+    if isinstance(replay, _DispatchReadyAttempt):
+        return replay.response
+    return replay
+
+
+def _provider_rejection_is_definitive(exc: Exception) -> bool:
+    """Only explicit no-dispatch evidence or provider 4xx proves rejection."""
+    if isinstance(exc, TelnyxDialNotStartedError):
+        return True
+    response = getattr(exc, "response", None)
+    raw_status = (
+        getattr(exc, "status", None)
+        or getattr(exc, "status_code", None)
+        or getattr(response, "status_code", None)
+    )
+    try:
+        status = int(str(raw_status))
+    except (TypeError, ValueError):
+        return False
+    return (
+        _HTTP_CLIENT_ERROR_MIN <= status < _HTTP_SERVER_ERROR_MIN
+        and status != _HTTP_REQUEST_TIMEOUT
+    )
 
 
 # =============================================================================
@@ -621,8 +969,10 @@ async def _lock_twilio_outbound_answer_record(
     to_number: str,
 ) -> CallRecord | None:
     """Correlate a signed Twilio answer to one precommitted outbound call."""
-    if not call_sid or not from_number or not to_number:
+    real_call_sid = _real_provider_call_id(call_sid)
+    if real_call_sid is None or not from_number or not to_number:
         return None
+    call_sid = real_call_sid
     try:
         agent_uuid = uuid.UUID(agent_id)
         workspace_uuid = uuid.UUID(workspace_id) if workspace_id else None
@@ -686,6 +1036,7 @@ async def _lock_twilio_outbound_answer_record(
         return None
     record = candidates[0]
     record.provider_call_id = call_sid
+    _mark_dial_attempt_accepted_by_callback(record)
     return record
 
 
@@ -1070,7 +1421,7 @@ async def release_phone_number(
 
 @router.post("/calls", response_model=CallResponse)
 @limiter.limit("30/minute")  # Rate limit outbound call initiation (costs money!)
-async def initiate_call(  # noqa: PLR0912, PLR0915
+async def initiate_call(
     call_request: InitiateCallRequest,
     request: Request,
     current_user: CurrentUser,
@@ -1078,7 +1429,124 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     workspace_id: str | None = Query(
         None, description="Workspace ID (optional; falls back to account-level keys)"
     ),
-) -> CallResponse:
+) -> CallResponse | JSONResponse:
+    """Legacy unkeyed call route retained for rolling compatibility."""
+    return await _initiate_call_impl(
+        call_request,
+        request,
+        current_user,
+        db,
+        workspace_id=workspace_id,
+    )
+
+
+@router.post(
+    "/calls/idempotent",
+    response_model=CallResponse,
+    responses={
+        202: {"model": DialAttemptPendingResponse},
+        409: {"model": DialAttemptErrorResponse},
+    },
+)
+async def initiate_call_idempotent(
+    call_request: IdempotentInitiateCallRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+    workspace_id: str | None = Query(
+        None, description="Workspace ID (optional; falls back to account-level keys)"
+    ),
+) -> CallResponse | JSONResponse:
+    """Replay first; rate-limit only a genuinely unseen physical dial key."""
+    legacy_request = InitiateCallRequest.model_validate(
+        call_request.model_dump(exclude={"dial_attempt_id"})
+    )
+    requested_workspace_id = _parse_requested_workspace_id(workspace_id)
+    replay = await _replay_dial_attempt(
+        dial_attempt_id=call_request.dial_attempt_id,
+        owner_user_id=user_id_to_uuid(current_user.id),
+        request_sha256=_dial_request_sha256(legacy_request, requested_workspace_id),
+        db=db,
+    )
+    if isinstance(replay, _DispatchReadyAttempt):
+        return await _resume_keyed_call(
+            legacy_request,
+            request,
+            current_user,
+            db,
+            workspace_id=workspace_id,
+            dial_attempt_id=call_request.dial_attempt_id,
+            resume_attempt=replay,
+        )
+    if replay is not None:
+        return replay
+    new_attempt = await _initiate_new_keyed_call(
+        legacy_request,
+        request,
+        current_user,
+        db,
+        workspace_id=workspace_id,
+        dial_attempt_id=call_request.dial_attempt_id,
+    )
+    return cast("CallResponse | JSONResponse", new_attempt)
+
+
+@limiter.limit("30/minute")
+async def _initiate_new_keyed_call(
+    call_request: InitiateCallRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    dial_attempt_id: uuid.UUID,
+) -> CallResponse | JSONResponse:
+    """Apply the cost limiter only after the key was absent from durable state."""
+    return await _initiate_call_impl(
+        call_request,
+        request,
+        current_user,
+        db,
+        workspace_id=workspace_id,
+        dial_attempt_id=dial_attempt_id,
+        skip_dial_attempt_replay=True,
+    )
+
+
+async def _resume_keyed_call(
+    call_request: InitiateCallRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    dial_attempt_id: uuid.UUID,
+    resume_attempt: _DispatchReadyAttempt,
+) -> CallResponse | JSONResponse:
+    """Resume a provably pre-dispatch reservation without reusing the limiter."""
+    return await _initiate_call_impl(
+        call_request,
+        request,
+        current_user,
+        db,
+        workspace_id=workspace_id,
+        dial_attempt_id=dial_attempt_id,
+        skip_dial_attempt_replay=True,
+        resume_attempt=resume_attempt,
+    )
+
+
+async def _initiate_call_impl(  # noqa: PLR0911, PLR0912, PLR0915
+    call_request: InitiateCallRequest,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession,
+    *,
+    workspace_id: str | None,
+    dial_attempt_id: uuid.UUID | None = None,
+    skip_dial_attempt_replay: bool = False,
+    resume_attempt: _DispatchReadyAttempt | None = None,
+) -> CallResponse | JSONResponse:
     """Initiate an outbound call.
 
     Args:
@@ -1096,21 +1564,47 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     )
     log.info("initiating_call", to=call_request.to_number, from_=call_request.from_number)
 
-    # Parse workspace_id (optional - single-tenant falls back to account-level keys)
-    workspace_uuid: uuid.UUID | None = None
-    if workspace_id:
-        try:
-            workspace_uuid = uuid.UUID(workspace_id)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail="Invalid workspace_id format") from e
+    # The keyed replay fingerprint uses the transport workspace selection, not the
+    # mutable workspace that happens to be the user's default when a replay arrives.
+    requested_workspace_uuid = _parse_requested_workspace_id(workspace_id)
 
-    # Load agent to get provider preference (verify user owns agent).
+    # These values are server-owned. Hash them before any mutable new-dial preflight,
+    # so an accepted attempt remains replayable after agent/config ownership changes.
+    call_variables = dict(call_request.variables or {})
+    call_variables[CALENDAR_BACKEND_VARIABLE] = CALCOM_REQUIRED_BACKEND
+    owner_user_id = user_id_to_uuid(current_user.id)
+    request_sha256: str | None = None
+    if dial_attempt_id is not None:
+        request_sha256 = _dial_request_sha256(
+            call_request,
+            requested_workspace_uuid,
+        )
+        if not skip_dial_attempt_replay:
+            replay = await _replay_dial_attempt(
+                dial_attempt_id=dial_attempt_id,
+                owner_user_id=owner_user_id,
+                request_sha256=request_sha256,
+                db=db,
+            )
+            if isinstance(replay, _DispatchReadyAttempt):
+                resume_attempt = replay
+            elif replay is not None:
+                return replay
+        if resume_attempt is not None:
+            call_variables = dict(resume_attempt.variables)
+        else:
+            # The transport copy is authoritative; callers cannot spoof a different key
+            # inside variables and poison call-ended correlation.
+            call_variables["dialAttemptId"] = str(dial_attempt_id)
+            call_variables["dial_attempt_id"] = str(dial_attempt_id)
+
+    # Only a new attempt passes mutable authorization and dependency gates.
     # Agent.user_id is the INTEGER users.id (not the UUID) — comparing it to a UUID
     # throws "operator does not exist: integer = uuid".
     result = await db.execute(
         select(Agent).where(
             Agent.id == uuid.UUID(call_request.agent_id),
-            Agent.user_id == current_user.id,  # Ensure user owns the agent
+            Agent.user_id == current_user.id,
         )
     )
     agent = result.scalar_one_or_none()
@@ -1118,11 +1612,15 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    workspace_uuid = await resolve_outbound_workspace_id(
-        agent_id=agent.id,
-        owner_user_id=current_user.id,
-        requested_workspace_id=workspace_uuid,
-        db=db,
+    workspace_uuid = (
+        resume_attempt.workspace_id
+        if resume_attempt is not None
+        else await resolve_outbound_workspace_id(
+            agent_id=agent.id,
+            owner_user_id=current_user.id,
+            requested_workspace_id=requested_workspace_uuid,
+            db=db,
+        )
     )
     await require_owned_caller_id(
         from_number=call_request.from_number,
@@ -1142,17 +1640,16 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
             detail={"code": "calendar_unavailable"},
         )
 
-    # This value is server-owned: a caller cannot opt a live Pulsift call into the
-    # fork's unrelated internal appointment calendar by supplying its own variables.
-    call_variables = dict(call_request.variables or {})
-    call_variables[CALENDAR_BACKEND_VARIABLE] = CALCOM_REQUIRED_BACKEND
-
     # Select exactly the configured outbound provider. Telnyx is dormant unless it is
     # explicitly selected; missing credentials must fail closed rather than rerouting.
     telnyx_service = await get_telnyx_service(current_user.id, db, workspace_id=workspace_uuid)
     twilio_service = await get_twilio_service(current_user.id, db, workspace_id=workspace_uuid)
 
-    preferred = (settings.TELEPHONY_OUTBOUND_PROVIDER or "twilio").lower()
+    preferred = (
+        resume_attempt.provider
+        if resume_attempt is not None
+        else (settings.TELEPHONY_OUTBOUND_PROVIDER or "twilio").lower()
+    )
     provider = select_outbound_provider(
         preferred, has_telnyx=telnyx_service is not None, has_twilio=twilio_service is not None
     )
@@ -1166,7 +1663,9 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
 
     # Build webhook URL (forward per-call variables as base64-JSON in ?cv= so the
     # answer webhook -> media WS can personalize the prompt + fill the booking attendee)
-    call_record_id = uuid.uuid4()
+    call_record_id = (
+        resume_attempt.call_record_id if resume_attempt is not None else uuid.uuid4()
+    )
     base_url = str(request.base_url).rstrip("/")
     webhook_url = f"{base_url}/webhooks/{provider}/answer?agent_id={call_request.agent_id}"
     if provider == "twilio":
@@ -1205,23 +1704,67 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
     # Commit a correlation row BEFORE dialing (both providers). An immediate status
     # callback can then reconcile by the unique pending From/To record instead of
     # being lost in the POST-before-record race.
-    call_record = CallRecord(
-        id=call_record_id,
-        user_id=user_id_to_uuid(current_user.id),
-        workspace_id=workspace_uuid,
-        provider=provider,
-        provider_call_id=f"pending:{uuid.uuid4()}",
-        agent_id=agent.id,
-        direction=CallDirection.OUTBOUND.value,
-        status=CallStatus.INITIATED.value,
-        from_number=call_request.from_number,
-        to_number=call_request.to_number,
-        # Persisted so the terminal call-ended event can echo the lead context back
-        # to the reply-router even from the bare status-callback path.
-        variables=call_variables,
-    )
-    db.add(call_record)
-    await db.commit()
+    call_record: CallRecord | None = None
+    if resume_attempt is None:
+        call_record = CallRecord(
+            id=call_record_id,
+            user_id=owner_user_id,
+            workspace_id=workspace_uuid,
+            provider=provider,
+            provider_call_id=f"pending:{uuid.uuid4()}",
+            agent_id=agent.id,
+            direction=CallDirection.OUTBOUND.value,
+            status=CallStatus.INITIATED.value,
+            from_number=call_request.from_number,
+            to_number=call_request.to_number,
+            # Persisted so the terminal call-ended event can echo the lead context back
+            # to the reply-router even from the bare status-callback path.
+            variables=call_variables,
+            dial_attempt_id=dial_attempt_id,
+            dial_request_sha256=request_sha256,
+            dial_attempt_state=_DIAL_READY_V2 if dial_attempt_id else None,
+        )
+        db.add(call_record)
+        try:
+            await db.commit()
+        except IntegrityError:
+            if dial_attempt_id is None or request_sha256 is None:
+                raise
+            await db.rollback()
+            replay = await _replay_dial_attempt(
+                dial_attempt_id=dial_attempt_id,
+                owner_user_id=owner_user_id,
+                request_sha256=request_sha256,
+                db=db,
+            )
+            if replay is None:
+                raise
+            if isinstance(replay, _DispatchReadyAttempt):
+                return await _resume_keyed_call(
+                    call_request,
+                    request,
+                    current_user,
+                    db,
+                    workspace_id=workspace_id,
+                    dial_attempt_id=dial_attempt_id,
+                    resume_attempt=replay,
+                )
+            return replay
+
+    if dial_attempt_id is not None and request_sha256 is not None:
+        dispatch_claim = await _claim_dispatch_ready_dial_attempt(
+            call_record_id=call_record_id,
+            dial_attempt_id=dial_attempt_id,
+            owner_user_id=owner_user_id,
+            request_sha256=request_sha256,
+            db=db,
+        )
+        if not isinstance(dispatch_claim, CallRecord):
+            return dispatch_claim
+        call_record = dispatch_claim
+
+    if call_record is None:  # pragma: no cover - defensive legacy invariant
+        raise RuntimeError("call record missing before provider dispatch")
 
     # Recording is a Twilio-only capability, so it is passed on the concrete Twilio
     # branch rather than through the abstract provider contract.
@@ -1245,7 +1788,51 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
                 agent_id=call_request.agent_id,
             )
     except Exception as exc:
-        if isinstance(exc, TwilioDialOutcomeUnknownError):
+        twilio_unknown = isinstance(exc, TwilioDialOutcomeUnknownError)
+        telnyx_unknown = provider == "telnyx" and is_unknown_telnyx_dial_outcome(exc)
+
+        if dial_attempt_id is not None:
+            locked = await db.execute(
+                select(CallRecord)
+                .where(CallRecord.id == call_record.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            attempt_record = locked.scalar_one()
+            if _real_provider_call_id(attempt_record.provider_call_id) is not None:
+                # The signed carrier callback is stronger evidence than a lost SDK
+                # response: Twilio/Telnyx accepted the call.
+                accepted_response = _accepted_response_from_record(attempt_record)
+                attempt_record.dial_attempt_state = _DIAL_ACCEPTED
+                attempt_record.dial_attempt_result = accepted_response.model_dump(mode="json")
+                await db.commit()
+                return accepted_response
+
+            if twilio_unknown or telnyx_unknown or not _provider_rejection_is_definitive(exc):
+                attempt_record.dial_attempt_state = _DIAL_UNKNOWN
+                pending_response = _pending_dial_response(attempt_record, _DIAL_UNKNOWN)
+                record_id = str(attempt_record.id)
+                await db.commit()
+                log.warning(
+                    "dial_attempt_outcome_unknown",
+                    record_id=record_id,
+                    provider=provider,
+                    error_type=type(exc).__name__,
+                )
+                return pending_response
+
+            attempt_record.dial_attempt_state = _DIAL_REJECTED
+            attempt_record.dial_attempt_result = {
+                "code": "dial_attempt_rejected",
+                "error_type": type(exc).__name__,
+            }
+            attempt_record.status = CallStatus.FAILED.value
+            attempt_record.ended_at = datetime.now(UTC)
+            error = _dial_attempt_rejected_error(attempt_record)
+            await db.commit()
+            raise error from exc
+
+        if twilio_unknown:
             log.warning(
                 "twilio_dial_outcome_unknown",
                 record_id=str(call_record.id),
@@ -1255,7 +1842,7 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
 
         # Telnyx-only: an unknown dial outcome must NOT be marked failed (the call may
         # still be live); surface it and let reconciliation settle the record.
-        if provider == "telnyx" and is_unknown_telnyx_dial_outcome(exc):
+        if telnyx_unknown:
             log.warning(
                 "telnyx_dial_outcome_unknown",
                 record_id=str(call_record.id),
@@ -1274,6 +1861,32 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
         await db.commit()
         raise
 
+    provider_call_id = _real_provider_call_id(call_info.call_id)
+    if dial_attempt_id is not None and provider_call_id is None:
+        locked = await db.execute(
+            select(CallRecord)
+            .where(CallRecord.id == call_record.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        attempt_record = locked.scalar_one()
+        if _real_provider_call_id(attempt_record.provider_call_id) is not None:
+            accepted_response = _accepted_response_from_record(attempt_record)
+            attempt_record.dial_attempt_state = _DIAL_ACCEPTED
+            attempt_record.dial_attempt_result = accepted_response.model_dump(mode="json")
+            await db.commit()
+            return accepted_response
+        attempt_record.dial_attempt_state = _DIAL_UNKNOWN
+        pending_response = _pending_dial_response(attempt_record, _DIAL_UNKNOWN)
+        record_id = str(attempt_record.id)
+        await db.commit()
+        log.warning(
+            "dial_attempt_missing_provider_id",
+            record_id=record_id,
+            provider=provider,
+        )
+        return pending_response
+
     locked = await db.execute(
         select(CallRecord)
         .where(CallRecord.id == call_record.id)
@@ -1281,21 +1894,28 @@ async def initiate_call(  # noqa: PLR0912, PLR0915
         .execution_options(populate_existing=True)
     )
     call_record = locked.scalar_one()
-    call_record.provider_call_id = call_info.call_id
-    await db.commit()
-
-    log.info("call_initiated", call_id=call_info.call_id, provider=provider)
-    log.info("call_record_created", record_id=str(call_record.id))
-
-    return CallResponse(
-        call_id=call_info.call_id,
+    call_record.provider_call_id = provider_call_id or call_info.call_id
+    response = CallResponse(
+        call_id=provider_call_id or call_info.call_id,
         call_control_id=call_info.call_control_id,
         from_number=call_info.from_number,
         to_number=call_info.to_number,
         direction=call_info.direction.value,
         status=call_info.status.value,
         agent_id=call_info.agent_id,
+        call_record_id=str(call_record.id),
+        dial_attempt_id=str(dial_attempt_id) if dial_attempt_id else None,
+        dial_attempt_status=_DIAL_ACCEPTED if dial_attempt_id else None,
     )
+    if dial_attempt_id is not None:
+        call_record.dial_attempt_state = _DIAL_ACCEPTED
+        call_record.dial_attempt_result = response.model_dump(mode="json")
+    await db.commit()
+
+    log.info("call_initiated", call_id=call_info.call_id, provider=provider)
+    log.info("call_record_created", record_id=str(call_record.id))
+
+    return response
 
 
 @router.post("/calls/{call_id}/hangup")

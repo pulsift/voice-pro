@@ -85,6 +85,7 @@ def test_payload_reports_booking_from_successful_create_attempt() -> None:
     assert payload == {
         "call_id": str(record.id),
         "provider_call_id": "CA-test-1",
+        "dial_attempt_id": None,
         "to_number": "+15550000002",
         "status": "completed",
         "answered": True,

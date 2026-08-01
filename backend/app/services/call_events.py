@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import json
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -119,6 +120,11 @@ def build_call_ended_payload(record: CallRecord) -> dict[str, Any]:
     return {
         "call_id": str(record.id),
         "provider_call_id": record.provider_call_id,
+        "dial_attempt_id": (
+            str(record.dial_attempt_id)
+            if isinstance(getattr(record, "dial_attempt_id", None), uuid.UUID)
+            else None
+        ),
         "to_number": record.to_number,
         "status": record.status,
         "answered": record.answered_at is not None,

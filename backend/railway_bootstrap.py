@@ -44,6 +44,10 @@ COLUMN_RECONCILE = (
     ("call_records", "media_grant_cv_sha256", "VARCHAR(64)"),
     ("call_records", "media_grant_expires_at", "TIMESTAMPTZ"),
     ("call_records", "media_grant_consumed_at", "TIMESTAMPTZ"),
+    ("call_records", "dial_attempt_id", "UUID"),
+    ("call_records", "dial_request_sha256", "VARCHAR(64)"),
+    ("call_records", "dial_attempt_state", "VARCHAR(32)"),
+    ("call_records", "dial_attempt_result", "JSON"),
 )
 
 # Indexes on reconciled columns (create_all only builds indexes for tables it
@@ -51,6 +55,8 @@ COLUMN_RECONCILE = (
 INDEX_RECONCILE = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_call_records_share_token "
     "ON call_records (share_token)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_call_records_dial_attempt_id "
+    "ON call_records (dial_attempt_id) WHERE dial_attempt_id IS NOT NULL",
 )
 
 

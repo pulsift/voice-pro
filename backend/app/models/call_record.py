@@ -5,7 +5,18 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -43,6 +54,15 @@ class CallRecord(Base):
     """
 
     __tablename__ = "call_records"
+    __table_args__ = (
+        Index(
+            "uq_call_records_dial_attempt_id",
+            "dial_attempt_id",
+            unique=True,
+            postgresql_where=text("dial_attempt_id IS NOT NULL"),
+            sqlite_where=text("dial_attempt_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -59,6 +79,14 @@ class CallRecord(Base):
         index=True,
         comment="Provider call ID (CallSid for Twilio, call_control_id for Telnyx)",
     )
+    dial_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=True,
+        comment="Router-owned idempotency key for one physical dial attempt",
+    )
+    dial_request_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dial_attempt_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dial_attempt_result: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
 
     # Agent reference
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
