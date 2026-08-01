@@ -145,6 +145,19 @@ def test_payload_reports_booking_from_successful_create_attempt() -> None:
     }
 
 
+def test_payload_preserves_conversation_generation_aliases() -> None:
+    record = make_record(variables={
+        "leadName": "Ada",
+        "conversation_generation": 2,
+        "conversationGeneration": 2,
+    })
+
+    payload = call_events.build_call_ended_payload(record)
+
+    assert payload["variables"]["conversation_generation"] == 2
+    assert payload["variables"]["conversationGeneration"] == 2
+
+
 def test_payload_counts_reconciled_booking_as_booked() -> None:
     record = make_record(
         booking_attempts=[
