@@ -41,7 +41,7 @@ from app.services.availability import (
     CALENDAR_BACKEND_VARIABLE,
     missing_calcom_settings,
 )
-from app.services.call_events import schedule_call_ended_event
+from app.services.call_events import stage_terminal_call_event
 from app.services.telephony import recording_policy
 from app.services.telephony.media_grant import arm_twilio_media_grant
 from app.services.telephony.telnyx_service import (
@@ -2122,6 +2122,7 @@ async def twilio_status_callback(
     )
 
     if call_record:
+        callback_at = datetime.now(UTC)
         normalized_status = call_status.strip().lower().replace("_", "-")
         mapped_status = _TWILIO_STATUS_MAP.get(normalized_status)
         entered_terminal = False
@@ -2132,7 +2133,7 @@ async def twilio_status_callback(
             entered_terminal = _apply_twilio_lifecycle_status(
                 call_record,
                 mapped_status,
-                event_at=datetime.now(UTC),
+                event_at=callback_at,
                 provider_duration=_parse_twilio_duration(call_duration),
             )
 
@@ -2144,11 +2145,14 @@ async def twilio_status_callback(
                 db=db,
             )
 
+        if (
+            mapped_status in _TERMINAL_CALL_STATUSES
+            and call_record.direction == CallDirection.OUTBOUND.value
+        ):
+            await stage_terminal_call_event(db, call_record, observed_at=callback_at)
+
         await db.commit()
         log.info("call_record_updated", record_id=str(call_record.id), status=call_record.status)
-
-        if entered_terminal and call_record.direction == CallDirection.OUTBOUND.value:
-            schedule_call_ended_event(call_record)
     else:
         await db.rollback()
         log.warning(
@@ -2501,11 +2505,12 @@ async def telnyx_status_callback(
     )
 
     if call_record:
+        lifecycle_at = event_at or datetime.now(UTC)
         _apply_telnyx_lifecycle_event(
             call_record,
             event_type,
             payload,
-            event_at=event_at or datetime.now(UTC),
+            event_at=lifecycle_at,
             provider_duration=provider_duration,
         )
 
@@ -2520,20 +2525,15 @@ async def telnyx_status_callback(
                 db=db,
             )
 
+        if event_type == "call.hangup" and call_record.direction == CallDirection.OUTBOUND.value:
+            await stage_terminal_call_event(db, call_record, observed_at=lifecycle_at)
+
         await db.commit()
         log.info(
             "call_record_updated",
             record_id=str(call_record.id),
             lifecycle_event=event_type,
         )
-
-        # B4: a terminal carrier status is the authoritative "what happened after
-        # the call" moment — emit the (guarded, single-shot) call-ended event.
-        if (
-            call_record.direction == CallDirection.OUTBOUND.value
-            and call_record.status in _TERMINAL_CALL_STATUSES
-        ):
-            schedule_call_ended_event(call_record)
     else:
         log.warning(
             "call_record_not_found_or_ambiguous",

@@ -7,15 +7,27 @@ import hashlib
 import hmac
 import json
 import uuid
-from datetime import UTC, datetime
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
+import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.api.telephony import telnyx_status_callback, twilio_status_callback
+from app.api.telephony_ws import save_transcript_to_call_record
 from app.core.config import settings
+from app.models.call_event_outbox import CallEventOutbox
 from app.models.call_record import CallRecord
 from app.services import call_events
 
@@ -49,28 +61,60 @@ def make_record(**overrides: Any) -> CallRecord:
     return CallRecord(**defaults)
 
 
-def make_http_context(*statuses: int) -> tuple[MagicMock, MagicMock]:
-    responses = [MagicMock(status_code=status) for status in statuses]
-    client = MagicMock(post=AsyncMock(side_effect=responses))
-    context = MagicMock()
-    context.__aenter__ = AsyncMock(return_value=client)
-    context.__aexit__ = AsyncMock(return_value=None)
-    return context, client
-
-
-async def drain_tasks() -> None:
-    tasks = tuple(call_events._background_tasks)
-    if tasks:
-        await asyncio.gather(*tasks)
-
-
-@pytest.fixture(autouse=True)
-def reset_dispatch_state(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest_asyncio.fixture(autouse=True)
+async def reset_dispatch_state(monkeypatch: pytest.MonkeyPatch) -> Any:
+    await call_events.stop_call_event_worker()
     monkeypatch.setattr(settings, "CALL_EVENTS_URL", "https://router.test")
     monkeypatch.setattr(settings, "CALL_EVENTS_SECRET", "events-secret")
     monkeypatch.setattr(call_events, "_warned_unsigned", False)
-    call_events._sent_call_ids.clear()
-    call_events._background_tasks.clear()
+    monkeypatch.setattr(call_events, "_warned_missing_url", False)
+    yield
+    await call_events.stop_call_event_worker()
+
+
+@pytest_asyncio.fixture
+async def outbox_engine(tmp_path: Path) -> AsyncGenerator[AsyncEngine, None]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'call-events.db').as_posix()}")
+
+    def create_tables(connection: Connection) -> None:
+        CallRecord.metadata.create_all(
+            connection,
+            tables=[CallRecord.__table__, CallEventOutbox.__table__],
+        )
+
+    async with engine.begin() as connection:
+        await connection.run_sync(create_tables)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+def outbox_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    outbox_engine: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    factory = async_sessionmaker(
+        outbox_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False,
+    )
+    monkeypatch.setattr(call_events, "AsyncSessionLocal", factory)
+    return factory
+
+
+async def persist_record(factory: async_sessionmaker[AsyncSession], record: CallRecord) -> None:
+    async with factory() as db:
+        db.add(record)
+        await db.commit()
+
+
+async def load_outbox(
+    factory: async_sessionmaker[AsyncSession], call_id: uuid.UUID
+) -> CallEventOutbox | None:
+    async with factory() as db:
+        return await db.get(CallEventOutbox, call_id)
 
 
 # ---------------------------------------------------------------------------
@@ -161,58 +205,366 @@ def test_unset_secret_sends_unsigned_and_warns_once(monkeypatch: pytest.MonkeyPa
 
 
 # ---------------------------------------------------------------------------
-# Single-shot guard + scheduling
+# Durable signal staging and carrier-first eligibility
+# ---------------------------------------------------------------------------
+
+
+async def stage_signals(
+    factory: async_sessionmaker[AsyncSession],
+    record: CallRecord,
+    *,
+    observed_at: datetime,
+    terminal: bool,
+    media: bool,
+) -> None:
+    await persist_record(factory, record)
+    async with factory() as db:
+        stored = await db.get(CallRecord, record.id)
+        assert stored is not None
+        if terminal:
+            await call_events.stage_terminal_call_event(db, stored, observed_at=observed_at)
+        if media:
+            await call_events.stage_media_finalized_call_event(db, stored, observed_at=observed_at)
+        await db.commit()
+
+
+def test_outbox_schema_enforces_one_row_per_call() -> None:
+    assert [column.name for column in CallEventOutbox.__table__.primary_key.columns] == ["call_id"]
+    assert "ix_call_event_outbox_due" in {index.name for index in CallEventOutbox.__table__.indexes}
+
+
+@pytest.mark.asyncio
+async def test_repeated_signals_upsert_one_row_and_preserve_both_facts(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await persist_record(outbox_session_factory, record)
+
+    async with outbox_session_factory() as db:
+        stored = await db.get(CallRecord, record.id)
+        assert stored is not None
+        await call_events.stage_terminal_call_event(db, stored, observed_at=observed_at)
+        await call_events.stage_terminal_call_event(
+            db, stored, observed_at=observed_at + timedelta(milliseconds=1)
+        )
+        await call_events.stage_media_finalized_call_event(db, stored, observed_at=observed_at)
+        await db.commit()
+
+    async with outbox_session_factory() as db:
+        rows = (await db.execute(select(CallEventOutbox))).scalars().all()
+        stored = await db.get(CallRecord, record.id)
+
+    assert len(rows) == 1
+    assert rows[0].carrier_terminal_at is not None
+    assert stored is not None
+    assert stored.media_finalized_at is not None
+
+
+@pytest.mark.asyncio
+async def test_media_only_never_dispatches_even_after_grace(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(hours=2)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=False,
+        media=True,
+    )
+
+    claim = await call_events._claim_due_event(now=datetime.now(UTC) + timedelta(days=1))
+    row = await load_outbox(outbox_session_factory, record.id)
+
+    assert claim is None
+    assert row is not None
+    assert row.state == "pending"
+    assert row.carrier_terminal_at is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_only_waits_for_bounded_grace(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=False,
+    )
+
+    before_grace = await call_events._claim_due_event(
+        now=observed_at + timedelta(seconds=call_events.FALLBACK_DELAY_SECONDS - 1)
+    )
+    after_grace = await call_events._claim_due_event(
+        now=observed_at + timedelta(seconds=call_events.FALLBACK_DELAY_SECONDS + 1)
+    )
+
+    assert before_grace is None
+    assert after_grace is not None
+    assert after_grace.call_id == record.id
+
+
+@pytest.mark.asyncio
+async def test_terminal_plus_media_is_immediately_eligible(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+
+    claim = await call_events._claim_due_event(now=observed_at + timedelta(milliseconds=1))
+
+    assert claim is not None
+    assert claim.call_id == record.id
+
+
+@pytest.mark.asyncio
+async def test_inbound_media_is_marked_without_creating_outbox_work(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC)
+    record = make_record(direction="inbound")
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=False,
+        media=True,
+    )
+
+    async with outbox_session_factory() as db:
+        stored = await db.get(CallRecord, record.id)
+        outbox = await db.get(CallEventOutbox, record.id)
+
+    assert stored is not None
+    assert stored.media_finalized_at is not None
+    assert outbox is None
+
+
+# ---------------------------------------------------------------------------
+# Immutable delivery, durable retries, leases, and worker lifecycle
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_exactly_one_event_per_call_across_repeated_terminal_signals() -> None:
-    record = make_record()
-    post = AsyncMock(return_value=(True, False))
+async def test_retry_reuses_exact_persisted_bytes_after_record_changes(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record(status="completed", transcript="initial transcript")
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+    post = AsyncMock(side_effect=[503, 204])
 
     with patch.object(call_events, "_post_once", post):
-        call_events.schedule_call_ended_event(record)
-        call_events.schedule_call_ended_event(record)
-        await drain_tasks()
-        # A late signal after delivery must also be a no-op.
-        call_events.schedule_call_ended_event(record)
-        await drain_tasks()
+        assert await call_events.dispatch_due_call_event() is True
+        first_row = await load_outbox(outbox_session_factory, record.id)
+        assert first_row is not None
+        assert first_row.state == "pending"
+        assert first_row.payload_body is not None
+        first_body = post.await_args_list[0].args[1]
+        assert first_body == first_row.payload_body.encode("utf-8")
+        assert first_row.payload_sha256 == hashlib.sha256(first_body).hexdigest()
 
-    post.assert_awaited_once()
-    url = post.await_args.args[0]
-    assert url == "https://router.test/webhooks/call-ended"
+        async with outbox_session_factory() as db:
+            stored = await db.get(CallRecord, record.id)
+            outbox = await db.get(CallEventOutbox, record.id)
+            assert stored is not None
+            assert outbox is not None
+            stored.status = "failed"
+            stored.transcript = "late transcript must not alter the event"
+            stored.booking_attempts = []
+            stored.variables = {"leadName": "Changed"}
+            stored.share_token = "tr_changed"
+            outbox.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+            await db.commit()
+
+        assert await call_events.dispatch_due_call_event() is True
+
+    second_row = await load_outbox(outbox_session_factory, record.id)
+    second_body = post.await_args_list[1].args[1]
+    assert post.await_count == 2
+    assert second_body == first_body
+    assert second_row is not None
+    assert second_row.state == "sent"
+    assert second_row.payload_body == first_body.decode("utf-8")
+    assert second_row.payload_sha256 == hashlib.sha256(first_body).hexdigest()
 
 
 @pytest.mark.asyncio
-async def test_delayed_ws_fallback_yields_to_the_status_callback_send() -> None:
+async def test_http_409_blocks_and_retains_payload_for_operator_action(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
     record = make_record()
-    post = AsyncMock(return_value=(True, False))
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+
+    with patch.object(call_events, "_post_once", AsyncMock(return_value=409)):
+        assert await call_events.dispatch_due_call_event() is True
+
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "blocked"
+    assert row.payload_body is not None
+    assert row.payload_sha256 is not None
+    assert row.last_error == "HTTP 409: immutable call-event payload conflict"
+    assert await call_events._claim_due_event(now=datetime.now(UTC) + timedelta(days=1)) is None
+
+
+@pytest.mark.asyncio
+async def test_non_conflict_http_rejection_remains_durably_retryable(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+
+    with patch.object(call_events, "_post_once", AsyncMock(return_value=400)):
+        assert await call_events.dispatch_due_call_event() is True
+
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "pending"
+    assert row.attempts == 1
+    assert row.last_error == "HTTP 400"
+    assert row.payload_body is not None
+
+
+@pytest.mark.asyncio
+async def test_missing_url_leaves_pending_visible_work_without_claiming(
+    monkeypatch: pytest.MonkeyPatch,
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+    monkeypatch.setattr(settings, "CALL_EVENTS_URL", None)
+    post = AsyncMock()
 
     with (
         patch.object(call_events, "_post_once", post),
-        patch("app.services.call_events.asyncio.sleep", AsyncMock()),
+        patch.object(call_events.logger, "error") as error_log,
     ):
-        # Status callback (primary) and media-WS teardown (delayed fallback)
-        # both fire for the same call.
-        call_events.schedule_call_ended_event(record)
-        call_events.schedule_call_ended_event(record, delay_seconds=20.0)
-        await drain_tasks()
+        assert await call_events.dispatch_due_call_event() is False
+        assert await call_events.dispatch_due_call_event() is False
 
-    post.assert_awaited_once()
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "pending"
+    assert row.attempts == 0
+    assert row.last_error == "CALL_EVENTS_URL not configured"
+    post.assert_not_awaited()
+    error_log.assert_called_once_with(
+        "call_ended_event_worker_unconfigured",
+        reason="CALL_EVENTS_URL not configured",
+    )
 
 
 @pytest.mark.asyncio
-async def test_unset_url_disables_the_sender() -> None:
-    monkey_record = make_record()
-    with patch.object(settings, "CALL_EVENTS_URL", None):
-        call_events.schedule_call_ended_event(monkey_record)
+async def test_expired_lease_is_reclaimed_and_all_mutations_require_exact_token(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(minutes=5)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+    stale_token = uuid.uuid4()
+    now = datetime.now(UTC)
+    async with outbox_session_factory() as db:
+        row = await db.get(CallEventOutbox, record.id)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = stale_token
+        row.claimed_at = now - timedelta(seconds=call_events._LEASE_SECONDS + 1)
+        row.attempts = 1
+        await db.commit()
 
-    assert not call_events._background_tasks
-    assert not call_events._sent_call_ids
+    claim = await call_events._claim_due_event(now=now)
+    assert claim is not None
+    assert claim.call_id == record.id
+    assert claim.token != stale_token
+    assert claim.attempts == 2
+
+    stale_claim = call_events._Claim(record.id, stale_token, 1)
+    assert await call_events._ack_claim(stale_claim) is False
+    assert await call_events._retry_claim(stale_claim, "stale", delay_seconds=1) is False
+    assert await call_events._block_claim(stale_claim, "stale") is False
+    assert await call_events._ack_claim(claim) is True
+
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "sent"
+    assert row.claim_token is None
+
+
+@pytest.mark.asyncio
+async def test_worker_start_is_idempotent_and_stop_cancels_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_worker(*, interval_seconds: float) -> None:
+        assert interval_seconds == call_events._WORKER_POLL_SECONDS
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(call_events, "_worker_loop", fake_worker)
+    await call_events.start_call_event_worker()
+    first_task = call_events._worker_task
+    await entered.wait()
+    await call_events.start_call_event_worker()
+
+    assert first_task is not None
+    assert call_events._worker_task is first_task
+
+    await call_events.stop_call_event_worker()
+    assert call_events._worker_task is None
+    assert first_task.cancelled()
 
 
 # ---------------------------------------------------------------------------
-# Wiring: telephony status callbacks emit on terminal status only
+# Callback and media-teardown transaction wiring
 # ---------------------------------------------------------------------------
 
 
@@ -233,17 +585,29 @@ def make_callback_record(**overrides: Any) -> MagicMock:
     return record
 
 
-async def run_twilio_status_callback(record: MagicMock | None, call_status: str) -> MagicMock:
+async def run_twilio_status_callback(
+    record: MagicMock | None, call_status: str
+) -> tuple[AsyncMock, MagicMock, list[str]]:
+    events: list[str] = []
     result = MagicMock()
     result.scalars.return_value.all.return_value = [record] if record else []
+
+    async def commit() -> None:
+        events.append("commit")
+
+    async def stage(*_args: Any, **_kwargs: Any) -> None:
+        events.append("stage")
+
     db = MagicMock(
         execute=AsyncMock(return_value=result),
-        commit=AsyncMock(),
+        commit=AsyncMock(side_effect=commit),
         rollback=AsyncMock(),
     )
+    stage_mock = AsyncMock(side_effect=stage)
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
-        patch("app.api.telephony.schedule_call_ended_event") as schedule,
+        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
+        patch("app.api.telephony.stage_terminal_call_event", stage_mock),
     ):
         await twilio_status_callback(
             request=MagicMock(),
@@ -255,37 +619,75 @@ async def run_twilio_status_callback(record: MagicMock | None, call_status: str)
             from_number="+15550000001",
             to_number="+15550000002",
         )
-    return schedule
+    return stage_mock, db, events
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("call_status", ["completed", "no-answer", "busy", "failed", "canceled"])
-async def test_twilio_terminal_status_emits_call_ended(call_status: str) -> None:
+async def test_twilio_terminal_stage_precedes_same_transaction_commit(
+    call_status: str,
+) -> None:
     record = make_callback_record()
-    schedule = await run_twilio_status_callback(record, call_status)
-    schedule.assert_called_once_with(record)
+    stage, db, events = await run_twilio_status_callback(record, call_status)
+
+    stage.assert_awaited_once()
+    assert stage.await_args.args == (db, record)
+    assert isinstance(stage.await_args.kwargs["observed_at"], datetime)
+    assert events == ["stage", "commit"]
 
 
 @pytest.mark.asyncio
-async def test_twilio_non_terminal_status_does_not_emit() -> None:
+async def test_twilio_non_terminal_status_does_not_stage() -> None:
     record = make_callback_record()
-    schedule = await run_twilio_status_callback(record, "ringing")
-    schedule.assert_not_called()
+    stage, _db, events = await run_twilio_status_callback(record, "ringing")
+
+    stage.assert_not_awaited()
+    assert events == ["commit"]
 
 
 @pytest.mark.asyncio
-async def test_twilio_inbound_terminal_status_does_not_emit() -> None:
+async def test_twilio_inbound_terminal_status_does_not_stage() -> None:
     record = make_callback_record(direction="inbound")
-    schedule = await run_twilio_status_callback(record, "completed")
-    schedule.assert_not_called()
+    stage, _db, events = await run_twilio_status_callback(record, "completed")
+
+    stage.assert_not_awaited()
+    assert events == ["commit"]
 
 
 @pytest.mark.asyncio
-async def test_telnyx_hangup_callback_emits_call_ended() -> None:
-    record = make_callback_record(provider="telnyx", provider_call_id="call-sid-9")
+async def test_twilio_stage_failure_prevents_state_commit() -> None:
+    record = make_callback_record()
     result = MagicMock()
     result.scalars.return_value.all.return_value = [record]
-    db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock())
+    db = MagicMock(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    with (
+        patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
+        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
+        patch(
+            "app.api.telephony.stage_terminal_call_event",
+            AsyncMock(side_effect=RuntimeError("outbox write failed")),
+        ),
+        pytest.raises(RuntimeError, match="outbox write failed"),
+    ):
+        await twilio_status_callback(
+            request=MagicMock(),
+            db=db,
+            call_record_id="",
+            call_sid="CA-wiring-1",
+            call_status="completed",
+            call_duration="17",
+            from_number="+15550000001",
+            to_number="+15550000002",
+        )
+
+    db.commit.assert_not_awaited()
+
+
+def make_telnyx_request() -> MagicMock:
     request = MagicMock()
     request.json = AsyncMock(side_effect=ValueError("not json"))
     request.form = AsyncMock(
@@ -295,66 +697,138 @@ async def test_telnyx_hangup_callback_emits_call_ended() -> None:
             "CallDuration": "33",
         }
     )
+    return request
 
+
+@pytest.mark.asyncio
+async def test_telnyx_hangup_stage_precedes_same_transaction_commit() -> None:
+    events: list[str] = []
+    record = make_callback_record(provider="telnyx", provider_call_id="call-sid-9")
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [record]
+
+    async def commit() -> None:
+        events.append("commit")
+
+    async def stage(*_args: Any, **_kwargs: Any) -> None:
+        events.append("stage")
+
+    db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock(side_effect=commit))
+    stage_mock = AsyncMock(side_effect=stage)
     with (
         patch("app.api.telephony.verify_telnyx_webhook", AsyncMock()),
-        patch("app.api.telephony.schedule_call_ended_event") as schedule,
+        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
+        patch("app.api.telephony.stage_terminal_call_event", stage_mock),
     ):
-        await telnyx_status_callback(request=request, db=db)
+        await telnyx_status_callback(request=make_telnyx_request(), db=db)
 
-    schedule.assert_called_once_with(record)
+    stage_mock.assert_awaited_once()
+    assert stage_mock.await_args.args == (db, record)
+    assert isinstance(stage_mock.await_args.kwargs["observed_at"], datetime)
+    assert events == ["stage", "commit"]
     assert record.status == "completed"
     assert record.duration_seconds == 33
 
 
-# ---------------------------------------------------------------------------
-# Delivery retry semantics
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_telnyx_stage_failure_prevents_state_commit() -> None:
+    record = make_callback_record(provider="telnyx", provider_call_id="call-sid-9")
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [record]
+    db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock())
+    with (
+        patch("app.api.telephony.verify_telnyx_webhook", AsyncMock()),
+        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
+        patch(
+            "app.api.telephony.stage_terminal_call_event",
+            AsyncMock(side_effect=RuntimeError("outbox write failed")),
+        ),
+        pytest.raises(RuntimeError, match="outbox write failed"),
+    ):
+        await telnyx_status_callback(request=make_telnyx_request(), db=db)
+
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("statuses", "expected_attempts"),
-    [
-        ((204,), 1),  # success first try
-        ((500, 200), 2),  # one retry on 5xx, then success
-        ((400,), 1),  # non-5xx rejection is terminal, no retry
-        ((500, 500), 2),  # retry budget is exactly one extra attempt
-    ],
-)
-async def test_http_retry_semantics(statuses: tuple[int, ...], expected_attempts: int) -> None:
-    context, client = make_http_context(*statuses)
+async def test_media_finalization_stages_before_commit_even_when_artifacts_unchanged() -> None:
+    events: list[str] = []
+    owner_user_id = uuid.uuid4()
+    record = MagicMock(
+        id=uuid.uuid4(),
+        transcript="already saved",
+        booking_attempts=None,
+        variables={},
+        share_token="tr_existing",  # noqa: S106 - inert public-token-shaped fixture
+        direction="outbound",
+        media_finalized_at=None,
+    )
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = [record]
 
-    with (
-        patch("app.services.call_events.httpx.AsyncClient", return_value=context),
-        patch("app.services.call_events.asyncio.sleep", AsyncMock()),
-    ):
-        await call_events._deliver(
-            "https://router.test/webhooks/call-ended",
-            {"call_id": "retry-test"},
-            "retry-test",
-            delay_seconds=0.0,
+    async def commit() -> None:
+        events.append("commit")
+
+    async def stage(*_args: Any, **_kwargs: Any) -> None:
+        events.append("stage")
+
+    db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock(side_effect=commit))
+    stage_mock = AsyncMock(side_effect=stage)
+    with patch("app.api.telephony_ws.stage_media_finalized_call_event", stage_mock):
+        saved = await save_transcript_to_call_record(
+            "CA-media-final",
+            "already saved",
+            db,
+            MagicMock(),
+            owner_user_id=owner_user_id,
+            workspace_id=None,
+            provider="twilio",
+            media_finalized=True,
         )
 
-    assert client.post.await_count == expected_attempts
+    assert saved is record
+    stage_mock.assert_awaited_once()
+    assert stage_mock.await_args.args == (db, record)
+    assert isinstance(stage_mock.await_args.kwargs["observed_at"], datetime)
+    assert events == ["stage", "commit"]
 
 
 @pytest.mark.asyncio
-async def test_timeout_retries_once_and_never_raises() -> None:
-    client = MagicMock(post=AsyncMock(side_effect=httpx.TimeoutException("boom")))
-    context = MagicMock()
-    context.__aenter__ = AsyncMock(return_value=client)
-    context.__aexit__ = AsyncMock(return_value=None)
+async def test_persisted_payload_hash_mismatch_blocks_instead_of_retrying_forever(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
 
-    with (
-        patch("app.services.call_events.httpx.AsyncClient", return_value=context),
-        patch("app.services.call_events.asyncio.sleep", AsyncMock()),
-    ):
-        await call_events._deliver(
-            "https://router.test/webhooks/call-ended",
-            {"call_id": "timeout-test"},
-            "timeout-test",
-            delay_seconds=0.0,
-        )
+    with patch.object(call_events, "_post_once", AsyncMock(return_value=503)):
+        assert await call_events.dispatch_due_call_event() is True
 
-    assert client.post.await_count == 2
+    async with outbox_session_factory() as db:
+        row = await db.get(CallEventOutbox, record.id)
+        assert row is not None
+        assert row.payload_body is not None
+        original_body = row.payload_body
+        row.payload_sha256 = "0" * 64
+        row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+
+    post = AsyncMock()
+    with patch.object(call_events, "_post_once", post):
+        assert await call_events.dispatch_due_call_event() is True
+
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "blocked"
+    assert row.payload_body == original_body
+    assert row.payload_sha256 == "0" * 64
+    assert row.last_error == ("_PayloadIntegrityError: persisted call-event body hash mismatch")
+    post.assert_not_awaited()
+    assert "call_ended_event_payload_integrity_blocked" in capsys.readouterr().out

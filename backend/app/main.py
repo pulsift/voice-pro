@@ -53,6 +53,10 @@ from app.db.session import AsyncSessionLocal, engine
 from app.middleware.request_tracing import RequestTracingMiddleware
 from app.middleware.security import SecurityHeadersMiddleware
 from app.models.user import User
+from app.services.call_events import (
+    start_call_event_worker,
+    stop_call_event_worker,
+)
 from app.services.campaign_worker import start_campaign_worker, stop_campaign_worker
 
 # Configure structured logging with async processors
@@ -79,7 +83,7 @@ logger = structlog.get_logger()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912, PLR0915
     """Lifespan context manager for startup and shutdown events."""
     # Startup
     logger.info("Starting application", app_name=settings.APP_NAME)
@@ -141,6 +145,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
     except Exception:
         logger.exception("Failed to start campaign worker - campaigns will not process")
 
+    # Start durable call-ended delivery (non-fatal; pending rows remain in Postgres).
+    try:
+        await start_call_event_worker()
+    except Exception:
+        logger.exception("Failed to start call-event outbox worker - events remain pending")
+
     # Start transcript retention sweep (non-fatal)
     try:
         await start_transcript_retention_worker()
@@ -162,6 +172,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
         logger.info("Campaign worker stopped")
     except Exception:
         logger.exception("Error stopping campaign worker")
+
+    # Stop durable call-ended delivery before disposing the database engine.
+    try:
+        await stop_call_event_worker()
+    except Exception:
+        logger.exception("Error stopping call-event outbox worker")
 
     # Stop transcript retention sweep
     try:

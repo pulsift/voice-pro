@@ -23,10 +23,10 @@ from app.core.config import settings
 from app.core.public_id import SHARE_TOKEN_LENGTH, generate_public_id
 from app.db.session import get_db
 from app.models.agent import Agent
-from app.models.call_record import CallDirection, CallRecord, CallStatus
+from app.models.call_record import CallRecord, CallStatus
 from app.models.workspace import AgentWorkspace
 from app.services.amd import MACHINE_VERDICTS, classify_greeting
-from app.services.call_events import FALLBACK_DELAY_SECONDS, schedule_call_ended_event
+from app.services.call_events import stage_media_finalized_call_event
 from app.services.gpt_realtime import GPTRealtimeSession
 from app.services.telephony.media_grant import consume_twilio_media_grant
 
@@ -359,6 +359,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
     provider: str | None = None,
     expected_to_number: str | None = None,
     amd_verdict: str | None = None,
+    media_finalized: bool = False,
 ) -> CallRecord | None:
     """Save transcript and sanitized booking diagnostics to the call record.
 
@@ -375,12 +376,13 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
         expected_to_number: Destination number, when known, for fallback matching
         amd_verdict: Answering-machine verdict for this call (C2), stored under
             variables["amd"] so downstream consumers can see it was a machine
+        media_finalized: Whether this save is the terminal media teardown
 
     Returns:
         The matched call record (artifacts now merged), or None when no
         unambiguous record was found.
     """
-    if not transcript.strip() and booking_attempts is None:
+    if not transcript.strip() and booking_attempts is None and not media_finalized:
         log.debug("empty_call_artifacts_skipped")
         return None
 
@@ -415,8 +417,6 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
     # every stable identity dimension is available and exactly one fresh record
     # matches. Existing artifacts are merged below; never guess between concurrent calls.
     if not call_record and not exact_match_ambiguous and agent_id and owner_user_id and provider:
-        from datetime import UTC, datetime, timedelta
-
         cutoff = datetime.now(UTC) - timedelta(minutes=20)
         filters = [
             CallRecord.agent_id == uuid.UUID(agent_id),
@@ -445,7 +445,9 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
 
     if call_record:
         changed = _merge_call_artifacts(call_record, transcript, booking_attempts, amd_verdict)
-        if changed:
+        if media_finalized:
+            await stage_media_finalized_call_event(db, call_record, observed_at=datetime.now(UTC))
+        if changed or media_finalized:
             await db.commit()
         log.info(
             "call_artifacts_saved",
@@ -668,14 +670,8 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                     workspace_id=workspace_id,
                     provider="twilio",
                     amd_verdict=amd_state.get("verdict"),
+                    media_finalized=True,
                 )
-                # B4 fallback: if the terminal status callback never arrives, still
-                # emit one call-ended event after a grace period (the callback path
-                # wins the single-shot guard when it does arrive).
-                if call_record is not None and call_record.direction == (
-                    CallDirection.OUTBOUND.value
-                ):
-                    schedule_call_ended_event(call_record, delay_seconds=FALLBACK_DELAY_SECONDS)
 
     except WebSocketDisconnect:
         log.info("twilio_websocket_disconnected")
@@ -982,7 +978,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
 
 
 @router.websocket("/telnyx/{agent_id}")
-async def telnyx_media_stream(  # noqa: PLR0912, PLR0915
+async def telnyx_media_stream(  # noqa: PLR0915
     websocket: WebSocket,
     agent_id: str,
     db: AsyncSession = Depends(get_db),
@@ -1129,7 +1125,7 @@ async def telnyx_media_stream(  # noqa: PLR0912, PLR0915
             if call_control_id:
                 await update_media_lifecycle_safely(call_control_id, ended=True)
                 transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
-                call_record = await save_transcript_to_call_record(
+                await save_transcript_to_call_record(
                     call_control_id,
                     transcript,
                     db,
@@ -1140,14 +1136,8 @@ async def telnyx_media_stream(  # noqa: PLR0912, PLR0915
                     workspace_id=workspace_id,
                     provider="telnyx",
                     expected_to_number=expected_to_number,
+                    media_finalized=True,
                 )
-                # B4 fallback: if the terminal status callback never arrives, still
-                # emit one call-ended event after a grace period (the callback path
-                # wins the single-shot guard when it does arrive).
-                if call_record is not None and call_record.direction == (
-                    CallDirection.OUTBOUND.value
-                ):
-                    schedule_call_ended_event(call_record, delay_seconds=FALLBACK_DELAY_SECONDS)
 
     except WebSocketDisconnect:
         log.info("telnyx_websocket_disconnected")

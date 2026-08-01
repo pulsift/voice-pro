@@ -44,6 +44,7 @@ COLUMN_RECONCILE = (
     ("call_records", "media_grant_cv_sha256", "VARCHAR(64)"),
     ("call_records", "media_grant_expires_at", "TIMESTAMPTZ"),
     ("call_records", "media_grant_consumed_at", "TIMESTAMPTZ"),
+    ("call_records", "media_finalized_at", "TIMESTAMPTZ"),
     ("call_records", "dial_attempt_id", "UUID"),
     ("call_records", "dial_request_sha256", "VARCHAR(64)"),
     ("call_records", "dial_attempt_state", "VARCHAR(32)"),

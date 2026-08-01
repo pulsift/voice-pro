@@ -1,51 +1,52 @@
-"""Signed call-ended events fired when an outbound call reaches a terminal state (B4).
+"""Durable signed call-ended delivery for outbound calls.
 
 Without this, nothing downstream ever learns what happened after a call: a
 no-answer never becomes a retry, and an answered-but-unbooked lead is stranded.
-When CALL_EVENTS_URL is configured, every call that reaches a terminal state
-POSTs one JSON event to f"{CALL_EVENTS_URL}/webhooks/call-ended" so the
-reply-router can advance the lead's post-call status machine. Unset = silent no-op.
+Carrier callbacks and media teardown upsert one database outbox row per call.
+Delivery waits until both signals exist, or until a bounded one-signal grace
+expires. A leased worker then locks and rereads the CallRecord, persists the exact
+serialized body before HTTP, and retries those immutable bytes until a 2xx.
 
-Fired from the telephony status callbacks on terminal status (primary, carries
-the authoritative carrier outcome) with the media-WS teardown as a delayed
-fallback for calls whose status callback never arrives. An in-process per-call
-guard keeps it to one event per call; a duplicate across a redeploy race is
-acceptable — the receiver dedupes on call_id.
-
-Authenticity: the body is signed with `X-VoicePro-Signature: sha256=<hex>` — an
+Authenticity: each request is signed with `X-VoicePro-Signature: sha256=<hex>` — an
 HMAC-SHA256 over the raw JSON bytes — keyed by CALL_EVENTS_SECRET. Unset secret
 = send unsigned, with a one-time warning.
-
-Delivery is fire-and-forget: failures log loudly but never break call teardown.
-One retry on 5xx/timeout/transport error; any other response is terminal.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
-import time
 import uuid
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, NamedTuple
 
 import httpx
 import structlog
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.call_record import CallRecord
+from app.db.session import AsyncSessionLocal
+from app.models.call_event_outbox import CallEventOutbox
+from app.models.call_record import CallDirection, CallRecord
 
 logger = structlog.get_logger()
 
 _TIMEOUT_SECONDS = 10.0
-_MAX_ATTEMPTS = 2  # one retry on 5xx/timeout
-_RETRY_DELAY_SECONDS = 1.0
 _HTTP_SUCCESS_MIN = 200
 _HTTP_SUCCESS_MAX = 300
-_HTTP_SERVER_ERROR = 500
-_SENT_GUARD_TTL_SECONDS = 24 * 60 * 60
-# The media-WS teardown fallback waits this long so the provider's own terminal
-# status callback (the authoritative carrier outcome) can claim the send first.
+_HTTP_CONFLICT = 409
+_WORKER_POLL_SECONDS = 1.0
+_LEASE_SECONDS = 60
+_INITIAL_BACKOFF_SECONDS = 5
+_MAX_BACKOFF_SECONDS = 30 * 60
+# Preserve the existing provider/media race grace. Both signals make a row
+# immediately eligible; either signal alone waits this long before fallback.
 FALLBACK_DELAY_SECONDS = 20.0
+_MISSING_URL_ERROR = "CALL_EVENTS_URL not configured"
 
 # Booking-attempt categories that prove a real Cal.com booking exists (a direct
 # create success, or a transient POST later reconciled as landed).
@@ -57,20 +58,15 @@ _TRANSCRIPT_PATH_PREFIX = "/api/public/transcripts"
 # AMD verdicts (C2) that mean no human ever heard the pitch.
 _MACHINE_AMD_VERDICTS = {"machine-vm", "machine-ivr"}
 
-# Keep references to in-flight background tasks so they aren't garbage-collected
-# mid-flight (asyncio only holds a weak reference to a bare create_task() result).
-_background_tasks: set[asyncio.Task[None]] = set()
-
-# Per-call single-shot guard (in-process). Never released on delivery failure:
-# exactly one event per call from this process, by design.
-_sent_call_ids: dict[str, float] = {}
+_worker_task: asyncio.Task[None] | None = None
 
 # Warn only once per process when the event goes out unsigned.
 _warned_unsigned = False
+_warned_missing_url = False
 
 
 def extract_booking_outcome(
-    booking_attempts: list[dict[str, Any]] | None,
+    booking_attempts: list[Any] | None,
 ) -> tuple[bool, str | None]:
     """Return (booked, booking_uid) from the call's booking-attempt diagnostics.
 
@@ -139,10 +135,13 @@ def build_call_ended_payload(record: CallRecord) -> dict[str, Any]:
     }
 
 
-def _signed_request_parts(payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
-    """Serialize the payload once and sign those exact bytes (raw-bytes HMAC)."""
+def _serialize_payload(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _headers_for_body(body: bytes) -> dict[str, str]:
+    """Sign the exact persisted bytes that will be sent."""
     global _warned_unsigned
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     secret = settings.CALL_EVENTS_SECRET
     if secret:
@@ -154,87 +153,389 @@ def _signed_request_parts(payload: dict[str, Any]) -> tuple[bytes, dict[str, str
             "call_ended_event_unsigned",
             reason="CALL_EVENTS_SECRET unset - sending without X-VoicePro-Signature",
         )
-    return body, headers
+    return headers
 
 
-async def _post_once(url: str, body: bytes, headers: dict[str, str]) -> tuple[bool, bool]:
-    """POST the event once; return (delivered, retryable)."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-        resp = await client.post(url, content=body, headers=headers)
-    if _HTTP_SUCCESS_MIN <= resp.status_code < _HTTP_SUCCESS_MAX:
-        return True, False
-    return False, resp.status_code >= _HTTP_SERVER_ERROR
+def _signed_request_parts(payload: dict[str, Any]) -> tuple[bytes, dict[str, str]]:
+    """Compatibility helper used by direct signature tests."""
+    body = _serialize_payload(payload)
+    return body, _headers_for_body(body)
 
 
-async def _deliver(
-    url: str,
-    payload: dict[str, Any],
-    call_id: str,
+def _outbox_upsert(
+    db: AsyncSession,
     *,
-    delay_seconds: float,
+    call_id: uuid.UUID,
+    observed_at: datetime,
+    carrier_terminal_at: datetime | None,
+) -> Any:
+    values = {
+        "call_id": call_id,
+        "state": "pending",
+        "carrier_terminal_at": carrier_terminal_at,
+        "available_at": observed_at + timedelta(seconds=FALLBACK_DELAY_SECONDS),
+        "next_attempt_at": observed_at,
+        "attempts": 0,
+        "last_error": None if settings.CALL_EVENTS_URL else _MISSING_URL_ERROR,
+    }
+    if db.get_bind().dialect.name == "sqlite":
+        sqlite_statement = sqlite_insert(CallEventOutbox).values(**values)
+        return sqlite_statement.on_conflict_do_update(
+            index_elements=[CallEventOutbox.call_id],
+            set_={
+                "carrier_terminal_at": func.coalesce(
+                    CallEventOutbox.carrier_terminal_at,
+                    sqlite_statement.excluded.carrier_terminal_at,
+                ),
+                "updated_at": func.now(),
+            },
+        )
+
+    postgresql_statement = postgresql_insert(CallEventOutbox).values(**values)
+    return postgresql_statement.on_conflict_do_update(
+        index_elements=[CallEventOutbox.call_id],
+        set_={
+            "carrier_terminal_at": func.coalesce(
+                CallEventOutbox.carrier_terminal_at,
+                postgresql_statement.excluded.carrier_terminal_at,
+            ),
+            "updated_at": func.now(),
+        },
+    )
+
+
+async def stage_terminal_call_event(
+    db: AsyncSession,
+    record: CallRecord,
+    *,
+    observed_at: datetime,
 ) -> None:
-    """Claim the per-call guard (after any fallback delay) and deliver the event."""
-    log = logger.bind(component="call_events", call_id=call_id)
-    if delay_seconds > 0:
-        await asyncio.sleep(delay_seconds)
-    # Claim after the delay so a primary (status-callback) send wins the guard.
-    # Single-threaded event loop + no await between check and set = race-free.
-    if call_id in _sent_call_ids:
-        log.info("call_ended_event_skipped_already_sent")
+    """Stage the carrier signal in the caller's terminal-state transaction."""
+    if record.direction != CallDirection.OUTBOUND.value:
         return
-    _sent_call_ids[call_id] = time.monotonic()
-
-    body, headers = _signed_request_parts(payload)
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        try:
-            delivered, retryable = await _post_once(url, body, headers)
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            log.warning("call_ended_event_transport_error", error=str(e), attempt=attempt)
-            retryable = True
-        except Exception:
-            # Unexpected/programming error - never break call teardown over telemetry.
-            log.exception("call_ended_event_unexpected_error", attempt=attempt)
-            return
-        else:
-            if delivered:
-                log.info("call_ended_event_delivered", attempt=attempt)
-                return
-            if not retryable:
-                log.error("call_ended_event_rejected", attempt=attempt)
-                return
-            log.warning("call_ended_event_retryable_response", attempt=attempt)
-        if attempt < _MAX_ATTEMPTS:
-            await asyncio.sleep(_RETRY_DELAY_SECONDS)
-
-    log.error("call_ended_event_failed_all_attempts", attempts=_MAX_ATTEMPTS)
+    await db.execute(
+        _outbox_upsert(
+            db,
+            call_id=record.id,
+            observed_at=observed_at,
+            carrier_terminal_at=observed_at,
+        )
+    )
 
 
-def schedule_call_ended_event(record: CallRecord, *, delay_seconds: float = 0.0) -> None:
-    """Schedule the call-ended event as a background task; returns immediately.
+async def stage_media_finalized_call_event(
+    db: AsyncSession,
+    record: CallRecord,
+    *,
+    observed_at: datetime,
+) -> None:
+    """Persist media finalization and its outbox signal in one transaction."""
+    if record.media_finalized_at is None:
+        record.media_finalized_at = observed_at
+    if record.direction != CallDirection.OUTBOUND.value:
+        return
+    await db.execute(
+        _outbox_upsert(
+            db,
+            call_id=record.id,
+            observed_at=observed_at,
+            carrier_terminal_at=None,
+        )
+    )
 
-    Safe to call unconditionally at any terminal point - if CALL_EVENTS_URL isn't
-    configured this just logs and returns, and the per-call guard makes repeated
-    calls (status callback + media-WS fallback) send exactly one event. Call this
-    BEFORE the session commits/expires the record: the payload is built from the
-    record's in-memory state right here.
-    """
+
+class _Claim(NamedTuple):
+    call_id: uuid.UUID
+    token: uuid.UUID
+    attempts: int
+
+
+class _PayloadIntegrityError(RuntimeError):
+    """The immutable serialized body no longer matches its persisted digest."""
+
+
+async def _claim_due_event(*, now: datetime | None = None) -> _Claim | None:
+    now = now or datetime.now(UTC)
+    expired_before = now - timedelta(seconds=_LEASE_SECONDS)
+    async with AsyncSessionLocal() as db, db.begin():
+        result = await db.execute(
+            select(CallEventOutbox)
+            .join(CallRecord, CallRecord.id == CallEventOutbox.call_id)
+            .where(
+                or_(
+                    and_(
+                        CallEventOutbox.state == "pending",
+                        CallEventOutbox.next_attempt_at <= now,
+                    ),
+                    and_(
+                        CallEventOutbox.state == "sending",
+                        or_(
+                            CallEventOutbox.claimed_at.is_(None),
+                            CallEventOutbox.claimed_at <= expired_before,
+                        ),
+                    ),
+                ),
+                and_(
+                    CallEventOutbox.carrier_terminal_at.is_not(None),
+                    or_(
+                        CallRecord.media_finalized_at.is_not(None),
+                        CallEventOutbox.available_at <= now,
+                    ),
+                ),
+            )
+            .order_by(CallEventOutbox.next_attempt_at, CallEventOutbox.created_at)
+            .limit(1)
+            .with_for_update(of=CallEventOutbox, skip_locked=True)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        token = uuid.uuid4()
+        row.state = "sending"
+        row.claimed_at = now
+        row.claim_token = token
+        row.attempts += 1
+        row.last_error = None
+        return _Claim(row.call_id, token, row.attempts)
+
+
+async def _materialize_claimed_body(claim: _Claim) -> bytes | None:
+    """Lock call then outbox, and freeze one exact body before any HTTP."""
+    async with AsyncSessionLocal() as db, db.begin():
+        # Signal paths already hold CallRecord before their outbox UPSERT. Use
+        # that same explicit order here so Postgres cannot form a lock cycle.
+        record_result = await db.execute(
+            select(CallRecord)
+            .where(CallRecord.id == claim.call_id)
+            .with_for_update(of=CallRecord)
+            .execution_options(populate_existing=True)
+        )
+        record = record_result.scalar_one_or_none()
+        if record is None:
+            return None
+
+        outbox_result = await db.execute(
+            select(CallEventOutbox)
+            .where(
+                CallEventOutbox.call_id == claim.call_id,
+                CallEventOutbox.state == "sending",
+                CallEventOutbox.claim_token == claim.token,
+            )
+            .with_for_update(of=CallEventOutbox)
+            .execution_options(populate_existing=True)
+        )
+        outbox = outbox_result.scalar_one_or_none()
+        if outbox is None:
+            return None
+        if outbox.payload_body is None:
+            body = _serialize_payload(build_call_ended_payload(record))
+            outbox.payload_body = body.decode("utf-8")
+            outbox.payload_sha256 = hashlib.sha256(body).hexdigest()
+            return body
+
+        body = outbox.payload_body.encode("utf-8")
+        digest = hashlib.sha256(body).hexdigest()
+        if outbox.payload_sha256 != digest:
+            raise _PayloadIntegrityError("persisted call-event body hash mismatch")
+        return body
+
+
+async def _ack_claim(claim: _Claim) -> bool:
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as db, db.begin():
+        result = await db.execute(
+            update(CallEventOutbox)
+            .where(
+                CallEventOutbox.call_id == claim.call_id,
+                CallEventOutbox.state == "sending",
+                CallEventOutbox.claim_token == claim.token,
+            )
+            .values(
+                state="sent",
+                sent_at=now,
+                claimed_at=None,
+                claim_token=None,
+                last_error=None,
+                updated_at=now,
+            )
+        )
+        return bool(getattr(result, "rowcount", 0))
+
+
+async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool:
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as db, db.begin():
+        result = await db.execute(
+            update(CallEventOutbox)
+            .where(
+                CallEventOutbox.call_id == claim.call_id,
+                CallEventOutbox.state == "sending",
+                CallEventOutbox.claim_token == claim.token,
+            )
+            .values(
+                state="pending",
+                next_attempt_at=now + timedelta(seconds=delay_seconds),
+                claimed_at=None,
+                claim_token=None,
+                last_error=error[:1000],
+                updated_at=now,
+            )
+        )
+        return bool(getattr(result, "rowcount", 0))
+
+
+async def _block_claim(claim: _Claim, error: str) -> bool:
+    """Permanently expose an immutable-payload or integrity conflict."""
+    now = datetime.now(UTC)
+    async with AsyncSessionLocal() as db, db.begin():
+        result = await db.execute(
+            update(CallEventOutbox)
+            .where(
+                CallEventOutbox.call_id == claim.call_id,
+                CallEventOutbox.state == "sending",
+                CallEventOutbox.claim_token == claim.token,
+            )
+            .values(
+                state="blocked",
+                claimed_at=None,
+                claim_token=None,
+                last_error=error[:1000],
+                updated_at=now,
+            )
+        )
+        return bool(getattr(result, "rowcount", 0))
+
+
+async def _mark_missing_url() -> None:
+    async with AsyncSessionLocal() as db, db.begin():
+        await db.execute(
+            update(CallEventOutbox)
+            .where(
+                CallEventOutbox.state.in_(("pending", "sending")),
+                or_(
+                    CallEventOutbox.last_error.is_(None),
+                    CallEventOutbox.last_error != _MISSING_URL_ERROR,
+                ),
+            )
+            .values(last_error=_MISSING_URL_ERROR, updated_at=datetime.now(UTC))
+        )
+
+
+def _retry_delay(attempts: int) -> int:
+    exponent = min(max(attempts - 1, 0), 8)
+    return int(min(_INITIAL_BACKOFF_SECONDS * (2**exponent), _MAX_BACKOFF_SECONDS))
+
+
+async def _post_once(url: str, body: bytes, headers: dict[str, str]) -> int:
+    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+        response = await client.post(url, content=body, headers=headers)
+    return response.status_code
+
+
+async def dispatch_due_call_event() -> bool:  # noqa: PLR0911
+    """Attempt one due row; return whether a row was claimed."""
+    global _warned_missing_url
     base_url = settings.CALL_EVENTS_URL
     if not base_url:
-        logger.debug("call_ended_event_skipped_not_configured")
-        return
+        if not _warned_missing_url:
+            _warned_missing_url = True
+            logger.error(
+                "call_ended_event_worker_unconfigured",
+                reason=_MISSING_URL_ERROR,
+            )
+        await _mark_missing_url()
+        return False
+    _warned_missing_url = False
 
-    call_id = str(record.id)
-    now = time.monotonic()
-    expired_before = now - _SENT_GUARD_TTL_SECONDS
-    for seen_id, sent_at in list(_sent_call_ids.items()):
-        if sent_at < expired_before:
-            _sent_call_ids.pop(seen_id, None)
-    if call_id in _sent_call_ids:
-        logger.info("call_ended_event_skipped_already_sent", call_id=call_id)
-        return
+    claim = await _claim_due_event()
+    if claim is None:
+        return False
 
-    url = base_url.rstrip("/") + "/webhooks/call-ended"
-    payload = build_call_ended_payload(record)
-    task = asyncio.create_task(_deliver(url, payload, call_id, delay_seconds=delay_seconds))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    log = logger.bind(component="call_events", call_id=str(claim.call_id))
+    try:
+        body = await _materialize_claimed_body(claim)
+        if body is None:
+            log.warning("call_ended_event_claim_lost_before_materialize")
+            return True
+        status_code = await _post_once(
+            base_url.rstrip("/") + "/webhooks/call-ended",
+            body,
+            _headers_for_body(body),
+        )
+    except asyncio.CancelledError:
+        raise
+    except _PayloadIntegrityError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        blocked = await _block_claim(claim, error)
+        log.exception(
+            "call_ended_event_payload_integrity_blocked",
+            error=error,
+            attempt=claim.attempts,
+            claim_blocked=blocked,
+        )
+        return True
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        await _retry_claim(claim, error, delay_seconds=_retry_delay(claim.attempts))
+        log.warning("call_ended_event_delivery_error", error=error, attempt=claim.attempts)
+        return True
+
+    if _HTTP_SUCCESS_MIN <= status_code < _HTTP_SUCCESS_MAX:
+        acknowledged = await _ack_claim(claim)
+        log.info(
+            "call_ended_event_delivered",
+            attempt=claim.attempts,
+            claim_acknowledged=acknowledged,
+        )
+        return True
+
+    if status_code == _HTTP_CONFLICT:
+        error = "HTTP 409: immutable call-event payload conflict"
+        blocked = await _block_claim(claim, error)
+        log.error(
+            "call_ended_event_payload_conflict_blocked",
+            attempt=claim.attempts,
+            claim_blocked=blocked,
+        )
+        return True
+
+    error = f"HTTP {status_code}"
+    await _retry_claim(claim, error, delay_seconds=_retry_delay(claim.attempts))
+    log.warning("call_ended_event_retryable_response", status=status_code, attempt=claim.attempts)
+    return True
+
+
+async def _worker_loop(*, interval_seconds: float) -> None:
+    while True:
+        try:
+            processed = await dispatch_due_call_event()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("call_ended_event_worker_error")
+            processed = False
+        if not processed:
+            await asyncio.sleep(interval_seconds)
+
+
+async def start_call_event_worker() -> None:
+    global _worker_task
+    if _worker_task is not None and not _worker_task.done():
+        return
+    _worker_task = asyncio.create_task(
+        _worker_loop(interval_seconds=_WORKER_POLL_SECONDS),
+        name="call-event-outbox",
+    )
+    logger.info("call_ended_event_worker_started")
+
+
+async def stop_call_event_worker() -> None:
+    global _worker_task
+    task = _worker_task
+    _worker_task = None
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    logger.info("call_ended_event_worker_stopped")

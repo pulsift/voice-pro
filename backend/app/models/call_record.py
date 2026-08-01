@@ -170,6 +170,9 @@ class CallRecord(Base):
         nullable=True,
         comment="When the single-use Twilio media grant was consumed",
     )
+    media_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="When media teardown artifacts committed"
+    )
 
     # Timestamps
     started_at: Mapped[datetime] = mapped_column(
