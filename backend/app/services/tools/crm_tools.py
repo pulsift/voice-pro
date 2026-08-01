@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,6 +21,7 @@ from app.models.contact import Contact
 from app.services.availability import (
     CALCOM_REQUIRED_BACKEND,
     CALENDAR_BACKEND_VARIABLE,
+    AvailabilityResult,
 )
 from app.services.fulfilment_webhook import schedule_fulfilment_webhook
 
@@ -28,6 +30,9 @@ MAX_BOOKING_ATTEMPTS = 2
 MIN_SLOTS_FOR_SECOND_SELECTION = 2
 MAX_12_HOUR = 12
 MAX_MINUTE = 59
+
+AvailabilityLoader = Callable[[str, str], Awaitable[AvailabilityResult | None]]
+AvailabilityInvalidator = Callable[[str], Awaitable[None]]
 
 
 class CRMTools:
@@ -82,6 +87,62 @@ class CRMTools:
         # True once times have actually been said out loud (any tool-driven offer).
         # A pre-loaded menu starts False — see seed_offered_slots.
         self._menu_announced = True
+        self._live_availability_loader: AvailabilityLoader | None = None
+        self._live_availability_invalidator: AvailabilityInvalidator | None = None
+        self._timezone_clarification_required = False
+
+    def set_live_availability_loader(self, loader: AvailabilityLoader) -> None:
+        """Delegate live calendar publication to the owning Realtime session."""
+        self._live_availability_loader = loader
+
+    def set_live_availability_invalidator(
+        self, invalidator: AvailabilityInvalidator
+    ) -> None:
+        """Clear stale prompt availability when a correction cannot be resolved."""
+        self._live_availability_invalidator = invalidator
+
+    async def _load_availability_menu(
+        self, lead_tz: str, *, origin: str
+    ) -> AvailabilityResult | None:
+        if self._live_availability_loader:
+            return await self._live_availability_loader(lead_tz, origin)
+
+        from app.services.availability import fetch_menu
+
+        menu = await fetch_menu(lead_tz)
+        self.apply_availability_menu(menu, origin=origin)
+        return menu
+
+    def apply_availability_menu(
+        self, menu: AvailabilityResult, *, origin: str
+    ) -> int:
+        """Adopt one typed calendar result into the transcript-bound slot gate."""
+        status = menu["status"]
+        timezone = str(menu.get("timezone") or "UTC")
+        if status == "available":
+            adopted = self.seed_offered_slots(
+                menu.get("slots") or [], timezone, origin=origin
+            )
+            if adopted or origin == "preloaded":
+                return adopted
+            status = "unavailable"
+
+        self._replace_offered_slots([], timezone)
+        self._booking_attempts[-1]["category"] = status
+        return 0
+
+    async def _invalidate_unresolved_timezone(self) -> None:
+        if self._live_availability_invalidator:
+            try:
+                await self._live_availability_invalidator("timezone_unresolved")
+                return
+            except Exception as exc:
+                self.logger.warning(
+                    "availability_invalidation_failed",
+                    error_type=type(exc).__name__,
+                )
+        self._replace_offered_slots([], self._normalized_timezone or "UTC")
+        self._booking_attempts[-1]["category"] = "timezone_unresolved"
 
     def seed_offered_slots(
         self,
@@ -988,43 +1049,52 @@ class CRMTools:
         if self._calcom_enabled():
             from app.services.calcom_client import normalize_timezone
 
+            spoken_timezone = str(time_zone or "").strip()
+            if self._timezone_clarification_required and not spoken_timezone:
+                return {
+                    "success": False,
+                    "error": "timezone_unresolved",
+                    "message": "Use the caller's clarified US state or standard time zone; do not fall back.",
+                }
             lead_tz = normalize_timezone(
                 spoken=time_zone,
                 fallback=self.variables.get("tzName"),
                 team_default=settings.BOOKING_TEAM_TIMEZONE,
             )
             if lead_tz is None:
-                self._offered_slots = []
-                self._selected_slot_id = None
-                self._selected_start = None
+                self._timezone_clarification_required = True
+                await self._invalidate_unresolved_timezone()
                 self._normalized_timezone = None
                 return {
                     "success": False,
                     "error": "timezone_unresolved",
-                    "message": "Ask for their city once before checking the calendar.",
+                    "message": "Ask once for their US state or standard time zone, such as Eastern or Pacific.",
                 }
             try:
                 # Same menu shape the pre-call load produces, so a refresh mid-call
                 # (their timezone differed, or a slot was taken) replaces the menu
                 # like-for-like instead of shrinking it to two times.
-                from app.services.availability import fetch_menu
-
-                menu = await fetch_menu(lead_tz)
+                menu = await self._load_availability_menu(lead_tz, origin="offered")
+                if menu is None:
+                    return {
+                        "success": False,
+                        "error": "availability_superseded",
+                        "message": "Use the newer calendar refresh result.",
+                    }
+                if spoken_timezone:
+                    self.variables["tzName"] = lead_tz
+                    self._timezone_clarification_required = False
                 if menu["status"] == "unavailable":
-                    self._replace_offered_slots([], lead_tz)
                     return {"success": False, "error": "calendar_unavailable"}
                 if menu["status"] == "empty":
-                    self._replace_offered_slots([], lead_tz)
                     return {
                         "success": True,
+                        "timezone": menu["timezone"],
                         "slots": [],
+                        "menu": menu["block"],
                         "message": "No open business-hours slots in the next two weeks - ask the lead for a preferred day.",
                     }
-                adopted = self.seed_offered_slots(
-                    menu["slots"], menu["timezone"], origin="offered"
-                )
-                if not adopted:
-                    self._replace_offered_slots([], lead_tz)
+                if not self._offered_slots:
                     return {"success": False, "error": "calendar_unavailable"}
                 return {
                     "success": True,
@@ -1353,39 +1423,40 @@ class CRMTools:
                 }
                 return deepcopy(self._booking_completed)
             if booking_result.get("category") == "conflict":
-                from app.services.availability import fetch_menu
-
                 try:
-                    fresh_menu = await fetch_menu(lead_tz)
+                    fresh_menu = await self._load_availability_menu(
+                        lead_tz, origin="offered"
+                    )
                 except Exception as e:
                     self._replace_offered_slots([], lead_tz)
                     self.logger.exception(
                         "calcom_conflict_refresh_failed", error_type=type(e).__name__
                     )
                     return {"success": False, "error": "calendar_unavailable"}
+                if fresh_menu is None:
+                    return {"success": False, "error": "availability_superseded"}
                 if fresh_menu["status"] == "unavailable":
-                    self._replace_offered_slots([], lead_tz)
                     return {"success": False, "error": "calendar_unavailable"}
                 if fresh_menu["status"] == "empty":
-                    self._replace_offered_slots([], lead_tz)
                     return {
                         "success": False,
                         "error": "slot_conflict",
+                        "timezone": fresh_menu["timezone"],
                         "slots": [],
+                        "menu": fresh_menu["block"],
                         "message": "That time was just taken and the calendar has no current openings. End without booking.",
                     }
-                if not self.seed_offered_slots(
-                    fresh_menu["slots"], fresh_menu["timezone"], origin="offered"
-                ):
-                    self._replace_offered_slots([], lead_tz)
+                if not self._offered_slots:
                     return {"success": False, "error": "calendar_unavailable"}
                 return {
                     "success": False,
                     "error": "slot_conflict",
+                    "timezone": fresh_menu["timezone"],
                     "slots": [
                         {"slot_id": s["slot_id"], "when": s["label"], "start": s["start"]}
                         for s in self._offered_slots
                     ],
+                    "menu": fresh_menu["block"],
                     "message": "That time was just taken. Offer these fresh times without choosing one automatically.",
                 }
             if booking_result.get("category") == "rejected":

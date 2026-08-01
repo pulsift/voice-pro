@@ -33,9 +33,29 @@ def make_tools(**variables: str) -> CRMTools:
 def test_normalize_timezone_contract() -> None:
     assert normalize_timezone("Europe/Stockholm", None, "UTC") == "Europe/Stockholm"
     assert normalize_timezone("  Syrian TIME-zone. ", None, "UTC") == "Asia/Damascus"
-    assert normalize_timezone("unknown place", "America/New_York", "UTC") == "America/New_York"
-    assert normalize_timezone("unknown", "also unknown", "UTC") == "UTC"
+    assert normalize_timezone("Arizona", None, "UTC") == "America/Phoenix"
+    assert normalize_timezone("unknown place", "America/New_York", "UTC") is None
+    assert normalize_timezone(None, "America/New_York", "UTC") == "America/New_York"
+    assert normalize_timezone(None, "also unknown", "UTC") == "UTC"
     assert normalize_timezone("unknown", "also unknown", "bad/default") is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_explicit_timezone_requests_clarification_without_fetching() -> None:
+    tools = make_tools(tzName="America/New_York")
+    invalidator = AsyncMock()
+    tools.set_live_availability_invalidator(invalidator)
+
+    with patch("app.services.calcom_client.get_open_slots", new=AsyncMock()) as get_slots:
+        result = await tools.check_availability(time_zone="somewhere near Atlantis")
+        without_clarification = await tools.check_availability()
+
+    assert result["error"] == "timezone_unresolved"
+    assert "standard time zone" in result["message"]
+    assert without_clarification["error"] == "timezone_unresolved"
+    assert "do not fall back" in without_clarification["message"]
+    invalidator.assert_awaited_once_with("timezone_unresolved")
+    get_slots.assert_not_awaited()
 
 
 def test_tool_schema_makes_email_optional_and_select_slot_transcript_free() -> None:

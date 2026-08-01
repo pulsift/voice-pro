@@ -86,6 +86,57 @@ _STATE_NAMES: Final[dict[str, str]] = {
 
 _STATE_CODE_LENGTH: Final = 2
 
+_EXPLICIT_ZONE_ALIASES: Final[dict[str, str]] = {
+    "et": EASTERN,
+    "est": EASTERN,
+    "edt": EASTERN,
+    "eastern": EASTERN,
+    "eastern time": EASTERN,
+    "eastern time zone": EASTERN,
+    "eastern standard time": EASTERN,
+    "eastern daylight time": EASTERN,
+    "ct": CENTRAL,
+    "cst": CENTRAL,
+    "cdt": CENTRAL,
+    "central": CENTRAL,
+    "central time": CENTRAL,
+    "central time zone": CENTRAL,
+    "central standard time": CENTRAL,
+    "central daylight time": CENTRAL,
+    "mt": MOUNTAIN,
+    "mst": MOUNTAIN,
+    "mdt": MOUNTAIN,
+    "mountain": MOUNTAIN,
+    "mountain time": MOUNTAIN,
+    "mountain time zone": MOUNTAIN,
+    "mountain standard time": MOUNTAIN,
+    "mountain daylight time": MOUNTAIN,
+    "pt": PACIFIC,
+    "pst": PACIFIC,
+    "pdt": PACIFIC,
+    "pacific": PACIFIC,
+    "pacific time": PACIFIC,
+    "pacific time zone": PACIFIC,
+    "pacific standard time": PACIFIC,
+    "pacific daylight time": PACIFIC,
+    "arizona time": "America/Phoenix",
+    "alaska time": "America/Anchorage",
+    "hawaii time": "Pacific/Honolulu",
+    "new york city": EASTERN,
+    "new york": EASTERN,
+    "chicago": CENTRAL,
+    "denver": MOUNTAIN,
+    "los angeles": PACIFIC,
+    "phoenix": "America/Phoenix",
+    "stockholm": "Europe/Stockholm",
+    "london": "Europe/London",
+    "damascus": "Asia/Damascus",
+    "syria": "Asia/Damascus",
+    "syrian time": "Asia/Damascus",
+    "syrian time zone": "Asia/Damascus",
+    "syrian timezone": "Asia/Damascus",
+}
+
 # Variable keys that may carry a state, in the order we trust them.
 _STATE_KEYS: Final = ("state", "leadState", "region", "companyState")
 _TZ_KEYS: Final = ("tzName", "timezone", "leadTimezone", "timeZone")
@@ -93,13 +144,19 @@ _TZ_KEYS: Final = ("tzName", "timezone", "leadTimezone", "timeZone")
 
 def _valid_zone(value: Any) -> str | None:
     candidate = str(value or "").strip()
-    if not candidate or "/" not in candidate:
+    if not candidate:
         return None
     try:
         ZoneInfo(candidate)
     except Exception:
         return None
     return candidate
+
+
+def _spoken_key(value: Any) -> str:
+    return " ".join(
+        str(value or "").lower().replace("-", " ").replace("_", " ").split()
+    ).strip(" .,!?:;")
 
 
 def state_code(value: Any) -> str | None:
@@ -115,6 +172,17 @@ def state_code(value: Any) -> str | None:
 def timezone_for_state(value: Any) -> str | None:
     code = state_code(value)
     return STATE_TO_TIMEZONE.get(code) if code else None
+
+
+def resolve_explicit(value: Any) -> str | None:
+    """Resolve caller-supplied timezone text without consulting a fallback."""
+    state_zone = timezone_for_state(value)
+    if state_zone:
+        return state_zone
+    alias = _EXPLICIT_ZONE_ALIASES.get(_spoken_key(value))
+    if alias:
+        return alias
+    return _valid_zone(value)
 
 
 def timezone_for_number(number: str | None) -> str | None:
@@ -161,7 +229,7 @@ def resolve(variables: dict[str, Any] | None) -> tuple[str, str]:
     data = variables or {}
 
     for key in _TZ_KEYS:
-        zone = _valid_zone(data.get(key))
+        zone = resolve_explicit(data.get(key))
         if zone:
             return zone, "variable"
 

@@ -1,5 +1,6 @@
 """GPT Realtime API service for Premium tier voice agents."""
 
+import asyncio
 import json
 import re
 import types
@@ -15,6 +16,7 @@ from app.api.integrations import get_workspace_integrations
 from app.api.settings import get_user_api_keys
 from app.core.auth import user_id_to_uuid
 from app.core.config import settings
+from app.services.availability import AvailabilityResult
 from app.services.tools.registry import ToolRegistry
 
 logger = structlog.get_logger()
@@ -128,6 +130,7 @@ def build_instructions_with_language(
     language: str,
     enabled_tools: list[str] | None = None,
     timezone: str | None = None,
+    runtime_rules: list[str] | None = None,
 ) -> str:
     """Build comprehensive voice agent instructions.
 
@@ -139,6 +142,7 @@ def build_instructions_with_language(
         language: Language code (e.g., "en-US", "es-ES")
         enabled_tools: List of enabled tool IDs (optional, for context)
         timezone: Workspace timezone (e.g., "America/New_York", "UTC")
+        runtime_rules: Code-owned state overrides appended to the RULES block
 
     Returns:
         Complete instructions string optimized for voice conversations
@@ -159,6 +163,10 @@ def build_instructions_with_language(
         # Fallback if timezone is invalid
         current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
 
+    runtime_rule_block = "".join(
+        f"\n- {rule}" for rule in (runtime_rules or [])
+    )
+
     # Build the complete voice agent instructions
     instructions = f"""[CONTEXT]
 Language: {language_name}
@@ -169,7 +177,7 @@ Current: {current_datetime}
 - Speak ONLY in {language_name}
 - Any time you are given without a timezone is in {tz_name}
 - Keep responses concise - this is voice, not text
-- Never speak a tool name, an id, a timestamp or a field name out loud
+- Never speak a tool name, an id, a timestamp or a field name out loud{runtime_rule_block}
 
 [YOUR ROLE]
 {system_prompt}"""
@@ -261,7 +269,9 @@ class GPTRealtimeSession:
         # the availability menu arrives.
         self._instructions_language: str = "en-US"
         self._instructions_timezone: str = "UTC"
-        self._availability_loaded: bool = False
+        self._availability_lock = asyncio.Lock()
+        self._availability_revision = 0
+        self._availability_preload_started = False
         self.realtime_model = settings.OPENAI_REALTIME_MODEL
         self.realtime_reasoning_effort = settings.OPENAI_REALTIME_REASONING_EFFORT
         self.logger = logger.bind(
@@ -319,6 +329,12 @@ class GPTRealtimeSession:
             integrations=integrations,
             workspace_id=self.workspace_id,
             variables=self.variables,
+        )
+        self.tool_registry.crm_tools.set_live_availability_loader(
+            self._refresh_live_availability
+        )
+        self.tool_registry.crm_tools.set_live_availability_invalidator(
+            self._invalidate_live_availability
         )
 
         # Connect to OpenAI Realtime API
@@ -603,11 +619,161 @@ class GPTRealtimeSession:
             self.agent_config.get("system_prompt", "You are a helpful voice assistant."),
             self.variables,
         )
+        runtime_rules = None
+        if self._instructions_timezone == "unresolved":
+            runtime_rules = [
+                (
+                    "TIMEZONE CORRECTION OVERRIDE: the caller's timezone is "
+                    "unresolved. This supersedes any normal-case statement in "
+                    "YOUR ROLE that says it is known."
+                ),
+                (
+                    "Ask exactly one clarification: their US state or a standard "
+                    "time zone such as Eastern, Central, Mountain, or Pacific."
+                ),
+                (
+                    "Until it resolves, do not offer or book any time and do not "
+                    "reuse earlier calendar times."
+                ),
+            ]
         return build_instructions_with_language(
             system_prompt,
             self._instructions_language,
             timezone=self._instructions_timezone,
+            runtime_rules=runtime_rules,
         )
+
+    def _availability_session_update(self) -> dict[str, Any]:
+        if not self.tool_registry:
+            raise RuntimeError("Tool registry not initialized")
+        enabled_tools = self.agent_config.get("enabled_tools", [])
+        return {
+            "type": "realtime",
+            "instructions": self._render_instructions(),
+            "tools": self.tool_registry.get_all_tool_definitions(enabled_tools),
+            "tool_choice": "auto",
+        }
+
+    async def _apply_availability_menu_locked(
+        self,
+        menu: AvailabilityResult,
+        lead_tz: str,
+        *,
+        origin: str,
+        revision: int,
+        apply_timezone: bool = True,
+    ) -> tuple[AvailabilityResult, int] | None:
+        """Publish one revision to Realtime and the booking gate under the lock."""
+        if revision != self._availability_revision:
+            self.logger.info(
+                "availability_result_discarded_stale",
+                origin=origin,
+                revision=revision,
+                current_revision=self._availability_revision,
+            )
+            return None
+        if not self.connection or not self.tool_registry:
+            return None
+
+        status = menu["status"]
+        from app.services import lead_timezone
+
+        timezone = str(menu.get("timezone") or lead_tz)
+        if origin == "preloaded" and status == "unavailable":
+            self.variables["tzName"] = timezone
+            self.variables["tz_spoken"] = lead_timezone.spoken_zone_name(timezone)
+            self._instructions_timezone = timezone
+            self.logger.warning("availability_preload_unavailable", timezone=timezone)
+            return menu, 0
+        previous_timezone = self._instructions_timezone
+        missing = object()
+        previous_values = {
+            key: self.variables.get(key, missing)
+            for key in ("tzName", "tz_spoken", "availability_block")
+        }
+        if apply_timezone:
+            self.variables["tzName"] = timezone
+            self.variables["tz_spoken"] = lead_timezone.spoken_zone_name(timezone)
+            self._instructions_timezone = timezone
+        else:
+            self.variables["tzName"] = "unresolved"
+            self.variables["tz_spoken"] = "unresolved"
+            self._instructions_timezone = "unresolved"
+        self.variables["availability_block"] = str(menu["block"])
+
+        try:
+            await self.connection.session.update(
+                session=self._availability_session_update()
+            )
+        except Exception:
+            self._instructions_timezone = previous_timezone
+            for key, value in previous_values.items():
+                if value is missing:
+                    self.variables.pop(key, None)
+                else:
+                    self.variables[key] = value
+            raise
+
+        adopted = self.tool_registry.crm_tools.apply_availability_menu(
+            menu, origin=origin
+        )
+        self.logger.info(
+            "availability_applied",
+            origin=origin,
+            revision=revision,
+            status=status,
+            slot_count=adopted,
+            timezone=timezone,
+        )
+        return menu, adopted
+
+    async def _refresh_live_availability(
+        self, lead_tz: str, origin: str
+    ) -> AvailabilityResult | None:
+        """Serialize a caller-driven read and publish one authoritative revision."""
+        from app.services.availability import fetch_menu
+
+        async with self._availability_lock:
+            self._availability_revision += 1
+            revision = self._availability_revision
+            menu = await fetch_menu(lead_tz)
+            if menu["status"] == "unavailable":
+                menu["block"] = (
+                    "The calendar is unavailable right now. Do not invent, offer, "
+                    "or book a time, and do not call refresh_availability again on "
+                    "this call. Tell the caller the team will follow up."
+                )
+            applied = await self._apply_availability_menu_locked(
+                menu,
+                lead_tz,
+                origin=origin,
+                revision=revision,
+            )
+            return applied[0] if applied else None
+
+    async def _invalidate_live_availability(self, reason: str) -> None:
+        """Invalidate old prompt and tool state after an unresolved correction."""
+        from app.services.availability import empty_menu
+
+        async with self._availability_lock:
+            self._availability_revision += 1
+            revision = self._availability_revision
+            menu = empty_menu(self._instructions_timezone)
+            menu["block"] = (
+                "The caller corrected their timezone, but it could not be resolved. "
+                "Do not offer or book any previously shown time. Ask once for their "
+                "US state or a standard time zone such as Eastern, Central, "
+                "Mountain, or Pacific."
+            )
+            applied = await self._apply_availability_menu_locked(
+                menu,
+                self._instructions_timezone,
+                origin="offered",
+                revision=revision,
+                apply_timezone=False,
+            )
+            if applied is None:
+                raise RuntimeError(f"Availability invalidation failed: {reason}")
 
     async def load_availability(self) -> bool:
         """Pre-load the calendar into the agent's head, not into a mid-call tool call.
@@ -621,48 +787,34 @@ class GPTRealtimeSession:
 
         Returns True when a non-empty menu was applied. Never raises.
         """
-        if self._availability_loaded or not self.connection:
+        if not self.connection or not self.tool_registry:
             return False
         try:
             from app.services import lead_timezone
             from app.services.availability import fetch_menu
 
+            async with self._availability_lock:
+                if self._availability_preload_started or self._availability_revision:
+                    return False
+                self._availability_preload_started = True
+                revision = self._availability_revision
+
             # Derived, not asked for: an explicit timezone on the record, else the
             # lead's state, else the area code of the number we are calling.
             lead_tz, tz_source = lead_timezone.resolve(self.variables)
-            self.variables["tzName"] = lead_tz
-            self.variables["tz_spoken"] = lead_timezone.spoken_zone_name(lead_tz)
-            # The wrapper's CONTEXT/RULES block must agree with the offered labels.
-            # Leaving it on the workspace timezone told the agent that times are
-            # team-local while every time it could see was lead-local — and it also
-            # makes "now" the caller's clock, which is the one that matters on a call.
-            self._instructions_timezone = lead_tz
             self.logger.info(
                 "lead_timezone_resolved", timezone=lead_tz, source=tz_source
             )
 
             menu = await fetch_menu(lead_tz)
-            if menu["status"] == "unavailable":
-                self.logger.warning("availability_preload_unavailable")
-                return False
-
-            self._availability_loaded = True
-            adopted = 0
-            if self.tool_registry:
-                adopted = self.tool_registry.crm_tools.seed_offered_slots(
-                    menu["slots"], menu["timezone"]
+            async with self._availability_lock:
+                applied = await self._apply_availability_menu_locked(
+                    menu,
+                    lead_tz,
+                    origin="preloaded",
+                    revision=revision,
                 )
-            self.variables["availability_block"] = menu["block"]
-            await self.connection.session.update(
-                session={"type": "realtime", "instructions": self._render_instructions()}
-            )
-            self.logger.info(
-                "availability_preloaded",
-                status=menu["status"],
-                slot_count=adopted,
-                timezone=menu["timezone"],
-            )
-            return adopted > 0
+            return bool(applied and applied[1] > 0)
         except Exception as e:
             # A calendar hiccup must never cost us the call: the agent keeps the
             # default block, which tells it to call refresh_availability instead.

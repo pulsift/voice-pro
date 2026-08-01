@@ -20,6 +20,7 @@ import httpx
 import structlog
 
 from app.core.config import settings
+from app.services import lead_timezone
 
 logger = structlog.get_logger()
 
@@ -38,13 +39,6 @@ class CalendarAvailabilityError(RuntimeError):
     """Cal.com did not return a trustworthy availability document."""
 
 
-
-_TIMEZONE_ALIASES = {
-    "syria": "Asia/Damascus",
-    "syrian time": "Asia/Damascus",
-    "syrian time zone": "Asia/Damascus",
-    "syrian timezone": "Asia/Damascus",
-}
 _SENSITIVE_RESPONSE_KEYS = {
     "apikey",
     "attendee",
@@ -117,23 +111,15 @@ def normalize_timezone(
     fallback: str | None,
     team_default: str | None,
 ) -> str | None:
-    """Resolve spoken/seeded timezone input to one validated IANA timezone.
+    """Resolve a caller correction strictly, or use seeded defaults when absent.
 
-    Spoken aliases are deliberately narrow. Unknown spoken text falls back to the
-    seeded timezone, then the configured team default. None means no safe timezone
-    could be produced and callers must not contact Cal.com.
+    A non-empty spoken value is authoritative. If it cannot be resolved, return
+    ``None`` so the agent asks one clarification instead of silently keeping the
+    inferred pre-call timezone.
     """
-    normalized_spoken = " ".join(
-        (spoken or "").lower().replace("-", " ").replace("_", " ").split()
-    ).strip(" .,!?:;")
-    alias = _TIMEZONE_ALIASES.get(normalized_spoken)
-    if alias:
-        return alias
-    return (
-        _valid_timezone((spoken or "").strip())
-        or _valid_timezone(fallback)
-        or _valid_timezone(team_default)
-    )
+    if str(spoken or "").strip():
+        return lead_timezone.resolve_explicit(spoken)
+    return _valid_timezone(fallback) or _valid_timezone(team_default)
 
 
 def _parse_iso(value: str) -> datetime:

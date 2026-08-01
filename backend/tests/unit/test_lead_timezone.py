@@ -38,6 +38,30 @@ def test_state_names_and_codes_both_resolve() -> None:
     assert lead_timezone.timezone_for_state("Atlantis") is None
 
 
+@pytest.mark.parametrize(
+    ("spoken", "expected"),
+    [
+        ("UTC", "UTC"),
+        ("EST", "America/New_York"),
+        ("PDT", "America/Los_Angeles"),
+        ("CT", "America/New_York"),
+        ("America/Los_Angeles", "America/Los_Angeles"),
+        ("Arizona", "America/Phoenix"),
+        ("Pacific time", "America/Los_Angeles"),
+        ("eastern time zone", "America/New_York"),
+        ("Chicago", "America/Chicago"),
+        ("  Syrian TIME-zone. ", "Asia/Damascus"),
+        ("syrian timezone", "Asia/Damascus"),
+    ],
+)
+def test_explicit_spoken_timezone_resolution(spoken: str, expected: str) -> None:
+    assert lead_timezone.resolve_explicit(spoken) == expected
+
+
+def test_unrecognized_explicit_timezone_has_no_fallback() -> None:
+    assert lead_timezone.resolve_explicit("somewhere near Atlantis") is None
+
+
 def test_resolution_order_explicit_then_state_then_number() -> None:
     assert lead_timezone.resolve({"tzName": "America/Denver", "state": "CA"}) == (
         "America/Denver",
