@@ -126,7 +126,7 @@ def test_late_nonterminal_status_cannot_regress_live_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_first_terminal_callback_runs_side_effects() -> None:
+async def test_only_first_terminal_callback_mutates_lifecycle_while_each_signal_repairs_outbox() -> None:
     record = make_record(status=CallStatus.IN_PROGRESS.value, answered_at=datetime.now(UTC))
     result = candidate_result(record)
     db = MagicMock(
@@ -138,7 +138,7 @@ async def test_only_first_terminal_callback_runs_side_effects() -> None:
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
         patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()) as update,
-        patch("app.api.telephony.schedule_call_ended_event") as schedule,
+        patch("app.api.telephony.stage_terminal_call_event", AsyncMock()) as stage,
     ):
         await twilio_status_callback(
             request=MagicMock(),
@@ -167,7 +167,8 @@ async def test_only_first_terminal_callback_runs_side_effects() -> None:
     assert record.duration_seconds == 17
     assert record.ended_at == first_ended_at
     update.assert_awaited_once()
-    schedule.assert_called_once_with(record)
+    assert stage.await_count == 2
+    assert all(awaited.args == (db, record) for awaited in stage.await_args_list)
     assert db.commit.await_count == 2
     db.rollback.assert_not_awaited()
 

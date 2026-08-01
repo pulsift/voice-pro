@@ -15,6 +15,18 @@ from app.services.tools.crm_tools import CRMTools
 def configured_calcom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "CALCOM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "CALCOM_EVENT_TYPE_ID", 42)
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.stage_fulfilment_intent",
+        AsyncMock(return_value="intent-key"),
+    )
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.claim_fulfilment_booking",
+        AsyncMock(return_value="claim-token"),
+    )
+    monkeypatch.setattr(
+        "app.services.tools.crm_tools.authorize_fulfilment_booking",
+        AsyncMock(return_value=True),
+    )
 
 
 def menu(timezone: str, start: str, label: str) -> dict[str, object]:

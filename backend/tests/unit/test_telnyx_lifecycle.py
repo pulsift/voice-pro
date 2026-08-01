@@ -417,7 +417,7 @@ async def test_timeout_after_possible_accept_stays_pending_and_callback_repairs(
     locked = MagicMock()
     locked.scalar_one.return_value = record
     callback_db = MagicMock(
-        execute=AsyncMock(side_effect=[empty, pending, locked]),
+        execute=AsyncMock(side_effect=[empty, pending, locked, MagicMock()]),
         commit=AsyncMock(),
         rollback=AsyncMock(),
     )

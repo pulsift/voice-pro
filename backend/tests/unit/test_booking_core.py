@@ -313,7 +313,7 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
         name="Sami",
         email="seeded@example.com",
         lead_tz="Europe/Stockholm",
-        notes='ICP: {"offer_types": ["commercial solar"], "min_kw": 50, "states": ["Texas"]}',
+        notes='ICP: {"offer_types": ["commercial solar"], "states": ["Texas"], "min_kw": 50}',
     )
     webhook.assert_awaited_once()
     assert any(
