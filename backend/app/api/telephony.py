@@ -62,6 +62,24 @@ _TERMINAL_CALL_STATUSES = {
     CallStatus.CANCELED.value,
 }
 
+_TWILIO_STATUS_MAP = {
+    "queued": CallStatus.INITIATED.value,
+    "initiated": CallStatus.INITIATED.value,
+    "ringing": CallStatus.RINGING.value,
+    "answered": CallStatus.IN_PROGRESS.value,
+    "in-progress": CallStatus.IN_PROGRESS.value,
+    "completed": CallStatus.COMPLETED.value,
+    "busy": CallStatus.BUSY.value,
+    "failed": CallStatus.FAILED.value,
+    "no-answer": CallStatus.NO_ANSWER.value,
+    "canceled": CallStatus.CANCELED.value,
+}
+_TWILIO_NONTERMINAL_RANK = {
+    CallStatus.INITIATED.value: 0,
+    CallStatus.RINGING.value: 1,
+    CallStatus.IN_PROGRESS.value: 2,
+}
+
 _TWILIO_REJECT_TWIML = """<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>"""
 
@@ -69,6 +87,95 @@ _TWILIO_REJECT_TWIML = """<?xml version="1.0" encoding="UTF-8"?>
 def _twilio_reject_response() -> Response:
     """Fail closed without opening a media stream."""
     return Response(content=_TWILIO_REJECT_TWIML, media_type="application/xml")
+
+
+def _parse_twilio_duration(value: str) -> int | None:
+    """Return a non-negative Twilio duration, or None when absent or invalid."""
+    if not value:
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return None
+
+
+def _apply_twilio_lifecycle_status(
+    call_record: CallRecord,
+    mapped_status: str,
+    *,
+    event_at: datetime,
+    provider_duration: int | None,
+) -> bool:
+    """Apply one known status monotonically; return the first terminal edge."""
+    if call_record.status in _TERMINAL_CALL_STATUSES:
+        return False
+
+    if mapped_status in _TERMINAL_CALL_STATUSES:
+        call_record.status = mapped_status
+        if not call_record.ended_at:
+            call_record.ended_at = event_at
+        if provider_duration is not None:
+            call_record.duration_seconds = provider_duration
+        return True
+
+    incoming_rank = _TWILIO_NONTERMINAL_RANK[mapped_status]
+    current_rank = _TWILIO_NONTERMINAL_RANK.get(call_record.status, -1)
+    if incoming_rank >= current_rank:
+        call_record.status = mapped_status
+        if mapped_status == CallStatus.IN_PROGRESS.value and not call_record.answered_at:
+            call_record.answered_at = event_at
+    return False
+
+
+async def _find_twilio_lifecycle_record(
+    *,
+    call_record_id: str,
+    call_sid: str,
+    from_number: str,
+    to_number: str,
+    db: AsyncSession,
+) -> tuple[CallRecord | None, int]:
+    """Lock and reconcile the outbound row authorized by a signed Twilio callback."""
+    if not call_sid:
+        return None, 0
+
+    if call_record_id:
+        if not from_number or not to_number:
+            return None, 0
+        try:
+            record_id = uuid.UUID(call_record_id)
+        except (TypeError, ValueError):
+            return None, 0
+        statement = select(CallRecord).where(
+            CallRecord.id == record_id,
+            CallRecord.provider == "twilio",
+            CallRecord.direction == CallDirection.OUTBOUND.value,
+            CallRecord.from_number == from_number,
+            CallRecord.to_number == to_number,
+            or_(
+                CallRecord.provider_call_id == call_sid,
+                CallRecord.provider_call_id.like("pending:%"),
+            ),
+        )
+    else:
+        # Rolling compatibility for callback URLs created before call_record_id.
+        # An exact provider SID is safe; guessing among pending rows is not.
+        statement = select(CallRecord).where(
+            CallRecord.provider == "twilio",
+            CallRecord.provider_call_id == call_sid,
+        )
+
+    result = await db.execute(
+        statement.limit(2).with_for_update().execution_options(populate_existing=True)
+    )
+    candidates = result.scalars().all()
+    if len(candidates) != 1:
+        return None, len(candidates)
+
+    call_record = candidates[0]
+    if call_record.provider_call_id.startswith("pending:"):
+        call_record.provider_call_id = call_sid
+    return call_record, 1
 
 
 def _parse_telnyx_timestamp(value: Any) -> datetime | None:
@@ -1364,6 +1471,7 @@ async def twilio_voice_webhook(
 async def twilio_status_callback(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    call_record_id: str = Query(default=""),
     call_sid: str = Form(default="", alias="CallSid"),
     call_status: str = Form(default="", alias="CallStatus"),
     call_duration: str = Form(default="0", alias="CallDuration"),
@@ -1385,34 +1493,30 @@ async def twilio_status_callback(
     )
     log.info("twilio_status_update")
 
-    # Find and update call record
-    result = await db.execute(select(CallRecord).where(CallRecord.provider_call_id == call_sid))
-    call_record = result.scalar_one_or_none()
+    call_record, candidate_count = await _find_twilio_lifecycle_record(
+        call_record_id=call_record_id,
+        call_sid=call_sid,
+        from_number=from_number,
+        to_number=to_number,
+        db=db,
+    )
 
     if call_record:
-        # Map Twilio status to our status
-        status_map = {
-            "initiated": CallStatus.INITIATED.value,
-            "ringing": CallStatus.RINGING.value,
-            "in-progress": CallStatus.IN_PROGRESS.value,
-            "completed": CallStatus.COMPLETED.value,
-            "busy": CallStatus.BUSY.value,
-            "failed": CallStatus.FAILED.value,
-            "no-answer": CallStatus.NO_ANSWER.value,
-            "canceled": CallStatus.CANCELED.value,
-        }
+        normalized_status = call_status.strip().lower().replace("_", "-")
+        mapped_status = _TWILIO_STATUS_MAP.get(normalized_status)
+        entered_terminal = False
 
-        call_record.status = status_map.get(call_status, call_status)
+        if mapped_status is None:
+            log.warning("twilio_status_unrecognized")
+        else:
+            entered_terminal = _apply_twilio_lifecycle_status(
+                call_record,
+                mapped_status,
+                event_at=datetime.now(UTC),
+                provider_duration=_parse_twilio_duration(call_duration),
+            )
 
-        # Update timestamps based on status
-        if call_status == "in-progress" and not call_record.answered_at:
-            call_record.answered_at = datetime.now(UTC)
-        elif call_status in ("completed", "busy", "failed", "no-answer", "canceled"):
-            call_record.ended_at = datetime.now(UTC)
-            if call_duration:
-                call_record.duration_seconds = int(call_duration)
-
-            # Update campaign contact status if this was a campaign call
+        if entered_terminal:
             await update_campaign_contact_from_call(
                 call_record=call_record,
                 call_status=call_record.status,
@@ -1421,17 +1525,18 @@ async def twilio_status_callback(
             )
 
         await db.commit()
-        log.info("call_record_updated", record_id=str(call_record.id), status=call_status)
+        log.info("call_record_updated", record_id=str(call_record.id), status=call_record.status)
 
-        # B4: a terminal carrier status is the authoritative "what happened after
-        # the call" moment — emit the (guarded, single-shot) call-ended event.
-        if (
-            call_record.direction == CallDirection.OUTBOUND.value
-            and call_record.status in _TERMINAL_CALL_STATUSES
-        ):
+        if entered_terminal and call_record.direction == CallDirection.OUTBOUND.value:
             schedule_call_ended_event(call_record)
     else:
-        log.warning("call_record_not_found", call_sid=call_sid)
+        await db.rollback()
+        log.warning(
+            "call_record_not_found_or_ambiguous",
+            call_sid=call_sid,
+            candidate_count=candidate_count,
+            has_call_record_id=bool(call_record_id),
+        )
 
     return {"status": "received"}
 

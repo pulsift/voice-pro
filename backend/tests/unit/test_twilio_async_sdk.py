@@ -6,6 +6,7 @@ import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from requests.exceptions import Timeout as RequestsTimeout
@@ -352,8 +353,13 @@ async def test_campaign_twilio_unknown_outcome_keeps_calling_state_and_pending_r
     service = TwilioService("AC-test", "token-test")
     unknown = TwilioDialOutcomeUnknownError("unknown")
 
+    async def raise_after_precommit(**_: object) -> None:
+        db.commit.assert_awaited_once()
+        raise unknown
+
+    initiate_call_mock = AsyncMock(side_effect=raise_after_precommit)
     with (
-        patch.object(service, "initiate_call", new=AsyncMock(side_effect=unknown)),
+        patch.object(service, "initiate_call", new=initiate_call_mock),
         pytest.raises(CampaignDialOutcomeUnknownError),
     ):
         await worker._initiate_call(  # noqa: SLF001
@@ -365,6 +371,9 @@ async def test_campaign_twilio_unknown_outcome_keeps_calling_state_and_pending_r
         )
 
     record = db.add.call_args.args[0]
+    callback_url = initiate_call_mock.await_args.kwargs["webhook_url"]
+    callback_query = parse_qs(urlsplit(callback_url).query)
+    assert callback_query["call_record_id"] == [str(record.id)]
     assert record.provider_call_id.startswith("pending:")
     assert record.status == CallStatus.INITIATED.value
     assert record.ended_at is None

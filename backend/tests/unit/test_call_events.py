@@ -234,8 +234,12 @@ def make_callback_record(**overrides: Any) -> MagicMock:
 
 async def run_twilio_status_callback(record: MagicMock | None, call_status: str) -> MagicMock:
     result = MagicMock()
-    result.scalar_one_or_none.return_value = record
-    db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock())
+    result.scalars.return_value.all.return_value = [record] if record else []
+    db = MagicMock(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
         patch("app.api.telephony.schedule_call_ended_event") as schedule,
@@ -243,6 +247,7 @@ async def run_twilio_status_callback(record: MagicMock | None, call_status: str)
         await twilio_status_callback(
             request=MagicMock(),
             db=db,
+            call_record_id="",
             call_sid="CA-wiring-1",
             call_status=call_status,
             call_duration="17",

@@ -376,6 +376,7 @@ class CampaignWorker:
 
         # Build webhook URL for when call is answered
         provider = "telnyx" if isinstance(telephony_service, TelnyxService) else "twilio"
+        call_record_id = uuid.uuid4()
         webhook_url = (
             f"{self.base_url}/webhooks/{provider}/answer"
             f"?agent_id={campaign.agent_id}"
@@ -383,10 +384,13 @@ class CampaignWorker:
             f"&campaign_id={campaign.id}"
             f"&campaign_contact_id={campaign_contact.id}"
         )
+        if provider == "twilio":
+            webhook_url = f"{webhook_url}&call_record_id={call_record_id}"
 
         log.info("Initiating campaign call", webhook_url=webhook_url)
 
         call_record = CallRecord(
+            id=call_record_id,
             user_id=campaign.user_id,
             workspace_id=campaign.workspace_id,
             provider=provider,
