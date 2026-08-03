@@ -96,9 +96,14 @@ def _fulfilment_promise_key(conversation_id: Any, generation: Any) -> str | None
     genuinely available; the receiver is backward compatible and falls back
     to booking_id in that case.
     """
-    conv_id = str(conversation_id or "").strip()
-    if not conv_id or type(generation) is not int or generation < 1:
+    conv_id = str(conversation_id or "")
+    if not conv_id.strip() or type(generation) is not int or generation < 1:
         return None
+    # Deliberately NOT stripped before formatting: the router does not strip
+    # either, and the only thing that matters is that both sides derive the
+    # IDENTICAL string. Stripping on one side alone would give one promise two
+    # keys for an id carrying stray whitespace - the exact double-paid-build
+    # bug this key exists to close. Emptiness is still rejected above.
     return f"{conv_id}:g{generation}"
 
 
