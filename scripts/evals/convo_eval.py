@@ -43,6 +43,9 @@ MODEL = os.environ.get("EVAL_REALTIME_MODEL", "gpt-realtime-2.1")
 MAX_RESPONSES_PER_SCENARIO = 30
 MAX_RATE_LIMIT_RETRIES = 12
 INTER_TURN_SLEEP_SECONDS = 3.0
+# early_time_jump needs the greeting, the jumped-time turn, and the reply that
+# follows it before there is anything to check.
+MIN_CALLER_TURNS_FOR_EARLY_JUMP_CHECK = 3
 
 VARS = {
     "agentName": "Dave",
@@ -91,6 +94,12 @@ FORBIDDEN_SPOKEN = (
     "can't take",
     "a clear choice",
     "i'll go with",
+    # Process narration while making the offer (live call, 2026-08-02): the agent
+    # reads the pre-chosen OFFER FIRST line, it does not describe searching or
+    # matching for one live on the call.
+    "line that up",
+    "moment while i match",
+    "closest slot we have",
 )
 
 # "The agent has just offered times." Deliberately broad: every scenario keys off
@@ -450,16 +459,82 @@ def check_garbled_line(convo: Conversation, violations: list[str]) -> None:
         violations.append("never offered the email fallback before bailing")
 
 
+def check_questions_before_booking(convo: Conversation, violations: list[str]) -> None:
+    """The two fit questions must be asked - and answered - before any time is
+    offered. This is what changed on 2026-08-02: the old flow offered a time
+    first and asked after; this pins the reorder so it can never quietly slide
+    back."""
+    check_booked(convo, violations)
+    offer_index = next(
+        (
+            i
+            for i, e in enumerate(convo.events)
+            if e[0] == "assistant" and re.search(OFFER_PATTERN, normalize_spoken(e[1]))
+        ),
+        None,
+    )
+    if offer_index is None:
+        violations.append("never offered a time at all")
+        return
+    caller_said_before_offer = " ".join(
+        e[1].lower() for e in convo.events[:offer_index] if e[0] == "caller"
+    )
+    if "rooftop" not in caller_said_before_offer:
+        violations.append("offered a time before the install-type question was answered")
+    if not any(word in caller_said_before_offer for word in ("texas", "arizona")):
+        violations.append("offered a time before the coverage-area question was answered")
+
+
+def check_early_time_jump(convo: Conversation, violations: list[str]) -> None:
+    """A time named before the questions must be served, not brushed off - and
+    the two fit questions must still get asked afterward (live prompt rewrite,
+    2026-08-02 - this is the order this scenario pins)."""
+    check_booked(convo, violations)
+    caller_positions = [i for i, e in enumerate(convo.events) if e[0] == "caller"]
+    if len(caller_positions) < MIN_CALLER_TURNS_FOR_EARLY_JUMP_CHECK:
+        violations.append("scenario ended before the early time could be served")
+        return
+    # Between the caller naming "Tuesday at ten" and their next turn, the agent's
+    # reply must actually engage with it - not ignore it and open with a
+    # question of its own instead.
+    span = convo.events[caller_positions[1] : caller_positions[2]]
+    reply_to_jump = " ".join(normalize_spoken(e[1]) for e in span if e[0] == "assistant")
+    if not any(word in reply_to_jump for word in ("tuesday", "ten")):
+        violations.append(f"ignored the early time instead of serving it: {reply_to_jump[:160]!r}")
+
+    select_turn = next(
+        (
+            i
+            for i, e in enumerate(convo.events)
+            if e[0] == "tool" and e[1] == "select_slot" and e[2]
+        ),
+        None,
+    )
+    if select_turn is None:
+        violations.append("never locked in the early time at all")
+        return
+    asked_after = " ".join(
+        normalize_spoken(e[1]) for e in convo.events[select_turn:] if e[0] == "assistant"
+    )
+    if not any(
+        word in asked_after for word in ("install", "rooftop", "ground", "carport", "kind of work")
+    ):
+        violations.append("never came back to ask about the kind of installs after locking the time")
+    if not any(word in asked_after for word in ("area", "cover", "state")):
+        violations.append("never came back to ask about the areas covered after locking the time")
+
+
 SCENARIOS: dict[str, dict[str, Any]] = {
     "happy_natural": {
+        # 2026-08-02 reorder: the two fit questions are answered before any time
+        # is even offered, and the old separate audit question no longer exists.
         "turns": [
             "Hello?",
             "Yeah hi, who's this?",
             "Oh right, yeah now's fine.",
-            "No that's fine, include it.",
-            "Tuesday at 1 works for me.",
             "Mostly rooftop residential, nothing under 50 kilowatts.",
             "Texas and Arizona.",
+            "Tuesday at 1 works for me.",
             "Perfect, thanks. Bye!",
         ],
         "final": check_booked,
@@ -467,14 +542,15 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "vague_then_first": {
         "rules": [
             (r"okay time|caught you|good time", ["Hey. Sure, I have a minute."]),
-            (r"audit|includ|shouldn't", ["Go ahead, why not."]),
+            (r"solar work|smallest|mainly|kind of work|installs", [
+                "Commercial solar, hundred kilowatts minimum."
+            ]),
+            (r"states|areas|cover", ["Just Texas."]),
             (OFFER_PATTERN, [
                 "Yeah.",  # a vague yes is NOT a pick - the agent must ask which
                 "The later one on Friday then.",
                 "Friday at six in the evening.",
             ]),
-            (r"solar work|smallest|mainly|kind of work", ["Commercial solar, hundred kilowatts minimum."]),
-            (r"states|areas|cover", ["Just Texas."]),
             (r"you're set|invite|anything else|booked", ["Great, sounds good, bye."]),
             (r".", ["Okay."]),
         ],
@@ -486,14 +562,15 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # conversation. Rules are checked in order; each reply is used once.
         "rules": [
             (r"okay time|caught you|good time", ["Yes, fine."]),
-            (r"audit|includ|shouldn't", ["Sure, include it."]),
+            (r"solar work|smallest|mainly|kind of work|installs|ground.mount", [
+                "Ground mount, fifty kilowatts and up."
+            ]),
+            (r"states|areas|cover", ["Nevada."]),
             (OFFER_PATTERN, [
                 "Have you got anything on Wednesday instead?",
                 "Alright then, Friday at half past four in the afternoon.",
                 "The Friday at half past four.",
             ]),
-            (r"solar work|smallest|mainly|kind of work", ["Ground mount, fifty kilowatts and up."]),
-            (r"states|areas|cover", ["Nevada."]),
             (r"you're set|invite|anything else|booked", ["Perfect, thanks, bye."]),
             (r".", ["Okay.", "Go ahead."]),
         ],
@@ -502,16 +579,16 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     "recovering_pick": {
         # Live call 7: a cut-off answer followed by a CLEAR one must select and
         # book - the bad-line bailout must not fire (clear answers reset it,
-        # and the caller's Wednesday question is engagement, not failure).
+        # and the caller's Wednesday question is engagement, not failure). Fit
+        # answers now come first, then the offer/pick.
         "turns": [
             "Hello?",
             "Yeah, now works.",
-            "Sure, include it.",
+            "Rooftop residential, fifty kilowatts minimum.",
+            "Texas.",
             "Do you have anything on Wednesday?",
             "Let's go for Tuesday on",
             "Tuesday at one.",
-            "Rooftop residential, fifty kilowatts minimum.",
-            "Texas.",
             "Perfect, bye!",
         ],
         "final": check_booked,
@@ -524,7 +601,6 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "turns": [
             "Hello?",
             "Yeah, now's fine.",
-            "No that's fine, include it.",
             "Thank you for watching.",
             "13 14 15 16.",
             "Subtitles by the Amara community.",
@@ -532,7 +608,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         ],
         "final": check_garbled_line,
         "mid_checks": {
-            3: lambda convo, violations: (
+            2: lambda convo, violations: (
                 violations.append("selected a time off Whisper noise")
                 if "selected"
                 in [a.get("category") for a in convo.crm.get_booking_attempts()]
@@ -548,18 +624,46 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # alternatives - never the question bounced back.
         "rules": [
             (r"okay time|caught you|good time", ["Yeah, go ahead."]),
-            (r"audit|includ|shouldn't", ["Sure, include it."]),
+            (r"solar work|smallest|mainly|kind of work|installs|carports|rooftop", [
+                "Carports, hundred kilowatts up."
+            ]),
+            (r"states|areas|cover", ["California."]),
             (r"tuesday|friday|which (suits|works|one)|got", [
                 "What have you got on Friday?",
                 "Hmm, what about Wednesday?",
                 "Fine, Friday at half past four then.",
             ]),
-            (r"solar work|smallest|mainly|kind of work", ["Carports, hundred kilowatts up."]),
-            (r"states|areas|cover", ["California."]),
             (r"you're set|invite|anything else", ["Great, thanks, bye."]),
             (r".", ["Okay."]),
         ],
         "final": check_day_probe,
+    },
+    "questions_before_booking": {
+        # Pins the 2026-08-02 reorder itself: both fit questions must be
+        # answered before the agent ever offers a time.
+        "turns": [
+            "Hello?",
+            "Sure, go ahead.",
+            "Rooftop residential, fifty kilowatts minimum.",
+            "Texas and Arizona.",
+            "Tuesday at one works.",
+            "Perfect, thanks, bye!",
+        ],
+        "final": check_questions_before_booking,
+    },
+    "early_time_jump": {
+        # The caller names a time on their SECOND turn, before either question.
+        # The agent must serve it (lock it in) first, then come back for the
+        # two questions - never ignore the time, never skip the questions.
+        "turns": [
+            "Hello?",
+            "Can you do Tuesday at ten?",
+            "Yeah, ten works, lock it in.",
+            "Rooftop residential, fifty kilowatts minimum.",
+            "Texas and Arizona.",
+            "Perfect, thanks, bye!",
+        ],
+        "final": check_early_time_jump,
     },
     "not_interested": {
         "turns": [
