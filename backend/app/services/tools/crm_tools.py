@@ -82,6 +82,26 @@ def _normalize_fulfilment_icp(value: dict[str, Any] | str) -> dict[str, Any]:
     return normalized
 
 
+def _fulfilment_promise_key(conversation_id: Any, generation: Any) -> str | None:
+    """f"{conversation_id}:g{generation}" - the true launch boundary shared with
+    pulsift-reply-router's other fulfilment sender (see
+    reply_router/factory.py's fulfilment_aggregate_id, reimplemented here since
+    that repo is not a dependency). One promised list has two senders: this
+    booking tool sends the Cal.com UID as booking_id, the reply router sends a
+    synthetic magnet-<conversation_id>[-gN] - keying the paid build on
+    booking_id let one promise launch two paid builds. `promise_key` is the
+    receiver's real dedupe key now; booking_id is kept only for display.
+
+    Returns None - never a guessed or fabricated key - when either half isn't
+    genuinely available; the receiver is backward compatible and falls back
+    to booking_id in that case.
+    """
+    conv_id = str(conversation_id or "").strip()
+    if not conv_id or type(generation) is not int or generation < 1:
+        return None
+    return f"{conv_id}:g{generation}"
+
+
 class CRMTools:
     """Internal CRM tools for voice agents.
 
@@ -1316,6 +1336,13 @@ class CRMTools:
                 full_notes = f"{service_type}. {full_notes}".strip()
             full_notes = f"{full_notes}\nICP: {icp_str}".strip()
 
+            conversation_id = self.variables.get("conversation_id") or self.variables.get(
+                "conversationId"
+            )
+            conversation_generation = self.variables.get(
+                "conversation_generation"
+            ) or self.variables.get("conversationGeneration")
+
             fulfilment_payload = {
                 "name": name,
                 "company": str(self.variables.get("company") or ""),
@@ -1324,9 +1351,11 @@ class CRMTools:
                 "icp": fulfilment_icp,
                 "campaign_id": self.variables.get("campaign_id")
                 or self.variables.get("campaignId"),
-                "conversation_id": self.variables.get("conversation_id")
-                or self.variables.get("conversationId"),
+                "conversation_id": conversation_id,
             }
+            promise_key = _fulfilment_promise_key(conversation_id, conversation_generation)
+            if promise_key is not None:
+                fulfilment_payload["promise_key"] = promise_key
             try:
                 intent_key = await stage_fulfilment_intent(
                     start_iso=self._selected_start,

@@ -9,6 +9,7 @@ import pytest
 from app.core.config import settings
 from app.services.availability import LOOKAHEAD_DAYS
 from app.services.calcom_client import create_booking, normalize_timezone
+from app.services.tools import crm_tools
 from app.services.tools.crm_tools import CRMTools
 
 SLOT_1 = {"start": "2026-07-13T09:00:00Z", "label": "Monday 11:00 AM"}
@@ -45,6 +46,20 @@ def make_tools(**variables: str) -> CRMTools:
         user_id=1,
         variables={"leadName": "Sami", "leadEmail": "seeded@example.com", **variables},
     )
+
+
+def test_fulfilment_promise_key_helper_matches_reply_router_format() -> None:
+    # f"{conversation_id}:g{generation}" - byte-for-byte the same shape as
+    # reply_router/factory.py's fulfilment_aggregate_id().
+    assert crm_tools._fulfilment_promise_key("conv-1", 1) == "conv-1:g1"
+    assert crm_tools._fulfilment_promise_key("conv-1", 5) == "conv-1:g5"
+    assert crm_tools._fulfilment_promise_key("", 1) is None
+    assert crm_tools._fulfilment_promise_key(None, 1) is None
+    assert crm_tools._fulfilment_promise_key("conv-1", None) is None
+    assert crm_tools._fulfilment_promise_key("conv-1", 0) is None
+    assert crm_tools._fulfilment_promise_key("conv-1", -1) is None
+    assert crm_tools._fulfilment_promise_key("conv-1", True) is None  # bool is not int here
+    assert crm_tools._fulfilment_promise_key("conv-1", "2") is None
 
 
 def test_normalize_timezone_contract() -> None:
@@ -320,6 +335,97 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
         attempt.get("operation") == "create" and attempt.get("category") == "success"
         for attempt in tools.get_booking_attempts()
     )
+
+
+async def _book_and_capture_fulfilment_payload(tools: CRMTools) -> dict:
+    """Drive one booking through to the fulfilment payload the tool stages,
+    and return exactly that payload for inspection."""
+    create_booking_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "category": "success",
+            "status_code": 201,
+            "raw_body": '{"ok":true}',
+            "uid": "booking-1",
+        }
+    )
+    with (
+        patch(
+            "app.services.calcom_client.get_open_slots",
+            AsyncMock(return_value=[SLOT_1]),
+        ),
+        patch("app.services.calcom_client.create_booking", create_booking_mock),
+        patch(
+            "app.services.calcom_client.find_existing_booking",
+            AsyncMock(return_value={"success": False, "category": "not_found"}),
+        ),
+        patch("app.services.tools.crm_tools.finalize_fulfilment_intent", AsyncMock(return_value=True)),
+    ):
+        await tools.check_availability(time_zone="UTC")
+        tools.observe_user_utterance("the first one")
+        await tools.select_slot("slot_1")
+        result = await tools.book_appointment(SLOT_1["start"], icp=ICP)
+
+    assert result["uid"] == "booking-1"
+    return crm_tools.stage_fulfilment_intent.call_args.kwargs["payload"]
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_carries_promise_key_for_generation_1() -> None:
+    tools = make_tools(conversation_id="conv-abc123", conversation_generation=1)
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert payload["promise_key"] == "conv-abc123:g1"
+    assert payload["conversation_id"] == "conv-abc123"
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_carries_promise_key_for_generation_2() -> None:
+    tools = make_tools(conversation_id="conv-abc123", conversation_generation=2)
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert payload["promise_key"] == "conv-abc123:g2"
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_reads_camelcase_aliases() -> None:
+    tools = make_tools(conversationId="conv-camel", conversationGeneration=3)
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert payload["promise_key"] == "conv-camel:g3"
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_omits_promise_key_without_a_conversation_id() -> None:
+    tools = make_tools(conversation_generation=1)
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert "promise_key" not in payload
+    assert payload["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_omits_promise_key_without_a_resolvable_generation() -> None:
+    tools = make_tools(conversation_id="conv-abc123")
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert "promise_key" not in payload
+
+
+@pytest.mark.asyncio
+async def test_fulfilment_payload_never_fabricates_a_generation() -> None:
+    # A non-integer generation (e.g. sent as a string) is not coerced or
+    # guessed - it is treated as unresolvable, same as if it were absent.
+    tools = make_tools(conversation_id="conv-abc123", conversation_generation="2")
+
+    payload = await _book_and_capture_fulfilment_payload(tools)
+
+    assert "promise_key" not in payload
 
 
 @pytest.mark.asyncio
