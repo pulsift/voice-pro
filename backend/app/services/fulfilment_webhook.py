@@ -36,8 +36,15 @@ from app.services.durable_events import (
     stop_worker_task,
     transition_claim,
 )
+from app.services.operator_alerts import stage_operator_alert
 
 logger = structlog.get_logger()
+
+# A stuck handover alerts once around this many attempts or this much elapsed
+# time since the promise was made, whichever comes first - then at most once
+# per further hour, via one dedup key per elapsed-hour bucket.
+_ALERT_ATTEMPT_THRESHOLD = 8
+_ALERT_ELAPSED_THRESHOLD = timedelta(hours=1)
 
 _TIMEOUT_SECONDS = 10.0
 _HTTP_UNAUTHORIZED = 401
@@ -463,6 +470,59 @@ async def _claim_due_event(*, now: datetime | None = None) -> _Claim | None:
     )
 
 
+async def _fulfilment_prospect_identity(db: AsyncSession, intent_key: str) -> str:
+    result = await db.execute(
+        select(FulfilmentOutbox.booking_email).where(FulfilmentOutbox.intent_key == intent_key)
+    )
+    return result.scalar_one_or_none() or "an unknown prospect"
+
+
+async def _stage_fulfilment_terminal_alert(db: AsyncSession, intent_key: str) -> None:
+    """One immediate, deduplicated alert the moment a handover is stuck for good."""
+    identity = await _fulfilment_prospect_identity(db, intent_key)
+    await stage_operator_alert(
+        db,
+        dedup_key=f"fulfilment-handover-blocked:{intent_key}",
+        message=(
+            f"{identity}'s promised list could not be delivered. It needs handling by hand."
+        ),
+    )
+
+
+async def _maybe_stage_fulfilment_stuck_alert(db: AsyncSession, claim: _Claim) -> None:
+    """Alert once around the retry threshold, then at most hourly after.
+
+    One dedup key per elapsed-hour bucket since the intent was staged: the
+    first bucket a threshold is crossed in fires the single early alert:
+    further buckets are each still-later real time, so nothing fires more
+    than once per hour.
+    """
+    result = await db.execute(
+        select(FulfilmentOutbox.created_at, FulfilmentOutbox.booking_email).where(
+            FulfilmentOutbox.intent_key == claim.intent_key
+        )
+    )
+    row = result.one_or_none()
+    if row is None:
+        return
+    created_at, email = row
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    elapsed = datetime.now(UTC) - created_at
+    if claim.attempts < _ALERT_ATTEMPT_THRESHOLD and elapsed < _ALERT_ELAPSED_THRESHOLD:
+        return
+    hour_bucket = int(elapsed.total_seconds() // 3600)
+    identity = email or "an unknown prospect"
+    await stage_operator_alert(
+        db,
+        dedup_key=f"fulfilment-handover-stuck:{claim.intent_key}:hour:{hour_bucket}",
+        message=(
+            f"{identity}'s promised list handover is stuck and hasn't gone out yet. "
+            "It needs handling by hand."
+        ),
+    )
+
+
 async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool:
     sending_state = "reconciling" if claim.action == "reconcile" else "sending"
     pending_state = "awaiting_booking" if claim.action == "reconcile" else "pending"
@@ -475,6 +535,7 @@ async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool
         target_state=pending_state,
         error=error,
         delay_seconds=delay_seconds,
+        on_commit=lambda db: _maybe_stage_fulfilment_stuck_alert(db, claim),
     )
 
 
@@ -488,6 +549,7 @@ async def _block_claim(claim: _Claim, error: str) -> bool:
         expected_state=expected_state,
         target_state="blocked",
         error=error,
+        on_commit=lambda db: _stage_fulfilment_terminal_alert(db, claim.intent_key),
     )
 
 
@@ -500,6 +562,7 @@ async def _cancel_reconcile_claim(claim: _Claim, reason: str) -> bool:
         expected_state="reconciling",
         target_state="cancelled",
         error=reason,
+        on_commit=lambda db: _stage_fulfilment_terminal_alert(db, claim.intent_key),
     )
 
 

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import settings
 from app.models.fulfilment_outbox import FulfilmentOutbox
+from app.models.operator_alert import OperatorAlert
 from app.services import fulfilment_webhook
 from app.services.tools.crm_tools import CRMTools
 
@@ -60,7 +61,7 @@ async def outbox_engine(tmp_path: Path) -> AsyncGenerator[AsyncEngine, None]:
     def create_table(connection: Connection) -> None:
         FulfilmentOutbox.metadata.create_all(
             connection,
-            tables=[FulfilmentOutbox.__table__],
+            tables=[FulfilmentOutbox.__table__, OperatorAlert.__table__],
         )
 
     async with engine.begin() as connection:
@@ -352,6 +353,196 @@ async def test_http_outcomes_are_classified_durably(
     row = await load_row(outbox_session_factory, key)
     assert row.state == expected_state
     assert row.attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# Operator alerts on a stuck promised-list handover (finding #8)
+# ---------------------------------------------------------------------------
+
+
+async def load_alert(
+    factory: async_sessionmaker[AsyncSession], dedup_key: str
+) -> OperatorAlert | None:
+    async with factory() as db:
+        return await db.get(OperatorAlert, dedup_key)
+
+
+@pytest.mark.asyncio
+async def test_terminal_block_stages_immediate_plain_english_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    assert await fulfilment_webhook.finalize_fulfilment_intent(key, "booking-blocked")
+
+    with patch.object(fulfilment_webhook, "_post_once", AsyncMock(return_value=400)):
+        assert await fulfilment_webhook.dispatch_due_fulfilment() is True
+
+    row = await load_row(outbox_session_factory, key)
+    assert row.state == "blocked"
+    alert = await load_alert(outbox_session_factory, f"fulfilment-handover-blocked:{key}")
+    assert alert is not None
+    assert alert.message == (
+        "ada@example.com's promised list could not be delivered. It needs handling by hand."
+    )
+    assert key not in alert.message
+    assert "400" not in alert.message
+
+
+@pytest.mark.asyncio
+async def test_terminal_cancel_stages_immediate_plain_english_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+        row.reconcile_until = datetime.now(UTC) - timedelta(seconds=1)
+        await db.commit()
+
+    reconcile = AsyncMock(return_value={"success": False, "category": "not_found"})
+    with patch("app.services.calcom_client.find_existing_booking", reconcile):
+        assert await fulfilment_webhook.dispatch_due_fulfilment() is True
+
+    row = await load_row(outbox_session_factory, key)
+    assert row.state == "cancelled"
+    alert = await load_alert(outbox_session_factory, f"fulfilment-handover-blocked:{key}")
+    assert alert is not None
+    assert alert.message == (
+        "ada@example.com's promised list could not be delivered. It needs handling by hand."
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_alerts_once_at_attempt_threshold_before_one_hour_elapses(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    token = uuid.uuid4()
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = token
+        row.claimed_at = datetime.now(UTC)
+        row.created_at = datetime.now(UTC)  # just staged - well under one hour
+        await db.commit()
+
+    claim = fulfilment_webhook._Claim(key, token, 8, "deliver")
+    assert await fulfilment_webhook._retry_claim(claim, "boom", delay_seconds=5) is True
+
+    alert = await load_alert(
+        outbox_session_factory, f"fulfilment-handover-stuck:{key}:hour:0"
+    )
+    assert alert is not None
+    assert alert.message == (
+        "ada@example.com's promised list handover is stuck and hasn't gone out yet. "
+        "It needs handling by hand."
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_below_threshold_and_under_one_hour_stages_no_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    token = uuid.uuid4()
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = token
+        row.claimed_at = datetime.now(UTC)
+        row.created_at = datetime.now(UTC)
+        await db.commit()
+
+    claim = fulfilment_webhook._Claim(key, token, 2, "deliver")
+    assert await fulfilment_webhook._retry_claim(claim, "boom", delay_seconds=5) is True
+
+    alert = await load_alert(
+        outbox_session_factory, f"fulfilment-handover-stuck:{key}:hour:0"
+    )
+    assert alert is None
+
+
+@pytest.mark.asyncio
+async def test_retry_alerts_at_one_hour_elapsed_even_under_attempt_threshold(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    token = uuid.uuid4()
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = token
+        row.claimed_at = datetime.now(UTC)
+        row.created_at = datetime.now(UTC) - timedelta(hours=1, minutes=5)
+        await db.commit()
+
+    claim = fulfilment_webhook._Claim(key, token, 2, "deliver")
+    assert await fulfilment_webhook._retry_claim(claim, "boom", delay_seconds=5) is True
+
+    alert = await load_alert(
+        outbox_session_factory, f"fulfilment-handover-stuck:{key}:hour:1"
+    )
+    assert alert is not None
+
+
+@pytest.mark.asyncio
+async def test_retry_alert_never_fires_more_than_once_per_hour_bucket(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    token = uuid.uuid4()
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = token
+        row.claimed_at = datetime.now(UTC)
+        row.created_at = datetime.now(UTC) - timedelta(minutes=5)
+        await db.commit()
+
+    claim = fulfilment_webhook._Claim(key, token, 8, "deliver")
+    assert await fulfilment_webhook._retry_claim(claim, "boom-1", delay_seconds=5) is True
+
+    async with outbox_session_factory() as db:
+        row = await db.get(FulfilmentOutbox, key)
+        assert row is not None
+        row.state = "sending"
+        row.claim_token = token
+        row.claimed_at = datetime.now(UTC)
+        await db.commit()
+
+    claim2 = fulfilment_webhook._Claim(key, token, 9, "deliver")
+    assert await fulfilment_webhook._retry_claim(claim2, "boom-2", delay_seconds=5) is True
+
+    async with outbox_session_factory() as db:
+        found = await db.get(OperatorAlert, f"fulfilment-handover-stuck:{key}:hour:0")
+        assert found is not None
+        # Only the one dedup key for this hour bucket exists - no duplicate row.
+        count = await db.get(OperatorAlert, f"fulfilment-handover-stuck:{key}:hour:1")
+        assert count is None
+
+
+@pytest.mark.asyncio
+async def test_healthy_delivery_stages_no_operator_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    key = await stage()
+    assert await fulfilment_webhook.finalize_fulfilment_intent(key, "booking-healthy")
+
+    with patch.object(fulfilment_webhook, "_post_once", AsyncMock(return_value=204)):
+        assert await fulfilment_webhook.dispatch_due_fulfilment() is True
+
+    row = await load_row(outbox_session_factory, key)
+    assert row.state == "sent"
+    assert await load_alert(outbox_session_factory, f"fulfilment-handover-blocked:{key}") is None
+    assert (
+        await load_alert(outbox_session_factory, f"fulfilment-handover-stuck:{key}:hour:0")
+        is None
+    )
 
 
 @pytest.mark.asyncio
