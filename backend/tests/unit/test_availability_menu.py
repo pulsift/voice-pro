@@ -438,6 +438,123 @@ async def test_swapping_to_another_time_is_still_a_choice() -> None:
     assert selected["when"] == "Tuesday at midday"
 
 
+# --- the two-slot OFFER FIRST line: chosen in code, never worked out live ------
+# Live call 2026-08-02. The agent offered two slots on the SAME day and narrated
+# its own picking process out loud three times ("let me line that up with what
+# we've got available"). A realtime speech model has no silent scratchpad — its
+# output tokens ARE the audio — so choosing a spread live always leaks into
+# speech. The fix moves the choice into code and hands the model a finished
+# sentence.
+
+
+def test_fallback_1_morning_and_midday_on_different_days() -> None:
+    # Monday nine in the morning, Tuesday one in the afternoon (inside the
+    # midday/early-afternoon band) -- the preferred shape.
+    raw = [{"start": iso(13, 9)}, {"start": iso(14, 13)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    offer = menu["offer_slots"]
+    assert [s["day"] for s in offer] == ["Monday", "Tuesday"]
+    assert offer[0]["label"] == "Monday at nine in the morning"
+    assert offer[1]["label"] == "Tuesday at one in the afternoon"
+    assert (
+        "OFFER FIRST: Monday at nine in the morning, or Tuesday at one in the "
+        "afternoon." in menu["block"]
+    )
+
+
+def test_fallback_2_same_two_bands_on_the_only_available_day() -> None:
+    # Only Monday is open, but it has both a morning and a midday opening.
+    raw = [{"start": iso(13, 9)}, {"start": iso(13, 13)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    offer = menu["offer_slots"]
+    assert [s["day"] for s in offer] == ["Monday", "Monday"]
+    assert [s["time"] for s in offer] == ["9:00 AM", "1:00 PM"]
+    assert (
+        "OFFER FIRST: Monday at nine in the morning, or Monday at one in the "
+        "afternoon." in menu["block"]
+    )
+
+
+def test_fallback_3_two_earliest_slots_on_different_days() -> None:
+    # Two evening slots on different days -- neither band matches, so the
+    # earliest-per-day fallback takes over.
+    raw = [{"start": iso(13, 18)}, {"start": iso(14, 19)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    offer = menu["offer_slots"]
+    assert [s["day"] for s in offer] == ["Monday", "Tuesday"]
+    assert [s["time"] for s in offer] == ["6:00 PM", "7:00 PM"]
+
+
+def test_fallback_4_two_earliest_slots_outright_when_only_one_day_has_no_bands() -> None:
+    # A single day, both slots outside both bands: nothing left to prefer.
+    raw = [{"start": iso(13, 18)}, {"start": iso(13, 19)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    offer = menu["offer_slots"]
+    assert [s["day"] for s in offer] == ["Monday", "Monday"]
+    assert [s["time"] for s in offer] == ["6:00 PM", "7:00 PM"]
+
+
+def test_fallback_5_a_single_slot_renders_the_one_slot_line() -> None:
+    raw = [{"start": iso(13, 9)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    assert [s["day"] for s in menu["offer_slots"]] == ["Monday"]
+    assert "OFFER FIRST: Monday at nine in the morning." in menu["block"]
+    assert " or " not in menu["block"].split("\n")[0]
+
+
+def test_fallback_6_no_slots_renders_no_offer_line() -> None:
+    menu = availability.build_menu([], "UTC")
+    assert menu["offer_slots"] == []
+    assert "OFFER FIRST" not in menu["block"]
+
+
+def test_offer_first_line_is_spoken_words_naming_only_day_and_time() -> None:
+    raw = [{"start": iso(13, 9)}, {"start": iso(14, 13, 30)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    offer_line = menu["block"].splitlines()[0]
+    assert offer_line.startswith("OFFER FIRST: ")
+    assert not any(char.isdigit() for char in offer_line)
+    # Day name only -- never a calendar date.
+    assert "2026" not in offer_line
+    assert "Monday" in offer_line
+    assert "Tuesday" in offer_line
+
+
+def test_full_menu_still_follows_the_offer_first_line() -> None:
+    raw = [{"start": iso(13, 9)}, {"start": iso(14, 13)}]
+    menu = availability.build_menu(raw, "UTC")
+
+    assert menu["block"].startswith("OFFER FIRST: ")
+    assert "- Monday:" in menu["block"]
+    assert "- Tuesday:" in menu["block"]
+    assert "[slot_1]" in menu["block"]
+    assert "[slot_2]" in menu["block"]
+
+
+def test_empty_calendar_block_is_unchanged_by_the_offer_first_feature() -> None:
+    menu = availability.build_menu([], "UTC")
+    assert menu["status"] == "empty"
+    assert menu["offer_slots"] == []
+    assert menu["block"] == (
+        "The calendar has no open business-hours times in the current window. "
+        "Do not invent or promise a time."
+    )
+
+
+def test_unavailable_calendar_block_is_unchanged_by_the_offer_first_feature() -> None:
+    menu = availability.empty_menu("UTC")
+    assert menu["status"] == "unavailable"
+    assert menu["offer_slots"] == []
+    assert "OFFER FIRST" not in menu["block"]
+    assert "refresh_availability" in menu["block"]
+
+
 @pytest.mark.asyncio
 async def test_call_me_back_another_time_books_nothing() -> None:
     tools = make_tools()

@@ -57,10 +57,13 @@ class AvailabilityResult(TypedDict):
     generated_at: str
     slots: list[dict[str, str]]
     block: str
+    offer_slots: list[dict[str, str]]
 
 _NOON: Final = 12
 _EVENING_HOUR: Final = 17
 _MINUTES_PER_HOUR: Final = 60
+# The midday/early-afternoon band's upper edge: 14:30 as (hour, minute).
+_MIDDAY_BAND_END: Final = (14, 30)
 
 _HOUR_WORDS: Final = {
     1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
@@ -121,6 +124,88 @@ def _thin(day_slots: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     return [day_slots[index] for index in picked_indexes]
 
 
+def _is_morning(local: datetime) -> bool:
+    """Before 12:00 local to the lead."""
+    return local.hour < _NOON
+
+
+def _is_midday_band(local: datetime) -> bool:
+    """12:00 through about 14:30 local — midday to early afternoon."""
+    return (_NOON, 0) <= (local.hour, local.minute) <= _MIDDAY_BAND_END
+
+
+def _day_key(local: datetime) -> str:
+    return local.strftime("%Y-%m-%d")
+
+
+def _choose_offer_slots(
+    ordered: list[tuple[dict[str, str], datetime]],
+) -> list[dict[str, str]]:
+    """Pick exactly two slots to lead with, so the agent reads a finished choice
+    instead of computing a spread live on the call (see module docstring header
+    on this file's fix commit for why that computation must never happen aloud).
+
+    `ordered` is the flat slot list paired with its local datetime, already sorted
+    day-major then time-minor (build_menu's construction order). Fallback order,
+    most-preferred first:
+      1. one morning slot + one midday/early-afternoon slot, on two different
+         days, earliest suitable days first.
+      2. the same two bands on the only available day, when there is only one.
+      3. the two earliest slots that land on different days.
+      4. the two earliest slots outright (may share a day).
+      5. one slot.
+      6. none.
+    """
+    if not ordered:
+        return []
+    if len(ordered) == 1:
+        return [ordered[0][0]]
+
+    distinct_days = {_day_key(local) for _, local in ordered}
+
+    if len(distinct_days) > 1:
+        morning = next((pair for pair in ordered if _is_morning(pair[1])), None)
+        if morning is not None:
+            midday = next(
+                (
+                    pair
+                    for pair in ordered
+                    if _is_midday_band(pair[1]) and _day_key(pair[1]) != _day_key(morning[1])
+                ),
+                None,
+            )
+            if midday is not None:
+                chosen = sorted((morning, midday), key=lambda pair: pair[1])
+                return [chosen[0][0], chosen[1][0]]
+    else:
+        morning = next((pair for pair in ordered if _is_morning(pair[1])), None)
+        midday = next((pair for pair in ordered if _is_midday_band(pair[1])), None)
+        if morning is not None and midday is not None:
+            chosen = sorted((morning, midday), key=lambda pair: pair[1])
+            return [chosen[0][0], chosen[1][0]]
+
+    for index, (_entry, local) in enumerate(ordered):
+        for later_entry, later_local in ordered[index + 1 :]:
+            if _day_key(local) != _day_key(later_local):
+                return [ordered[index][0], later_entry]
+
+    return [ordered[0][0], ordered[1][0]]
+
+
+def _render_offer_first_line(offer_slots: list[dict[str, str]]) -> str | None:
+    """The finished sentence the agent reads verbatim as its first offer.
+
+    Built from the same `label` the full menu uses ("<Day> at <spoken time>"),
+    so wording stays in house style automatically — words not digits, day name
+    only, never a date.
+    """
+    if not offer_slots:
+        return None
+    if len(offer_slots) == 1:
+        return f"OFFER FIRST: {offer_slots[0]['label']}."
+    return f"OFFER FIRST: {offer_slots[0]['label']}, or {offer_slots[1]['label']}."
+
+
 def build_menu(
     raw_slots: list[dict[str, str]],
     lead_tz: str,
@@ -158,6 +243,7 @@ def build_menu(
         )
 
     slots: list[dict[str, str]] = []
+    slot_locals: list[tuple[dict[str, str], datetime]] = []
     days: list[dict[str, Any]] = []
     for day_key in sorted(by_day)[:max_days]:
         day_slots = sorted(by_day[day_key], key=lambda item: item["local"])
@@ -177,19 +263,22 @@ def build_menu(
                 "timezone": lead_tz,
             }
             slots.append(entry)
+            slot_locals.append((entry, local))
             entries.append(entry)
         if entries:
             days.append({"day": entries[0]["day"], "slots": entries})
         if len(slots) >= max_slots:
             break
 
+    offer_slots = _choose_offer_slots(slot_locals)
     status: AvailabilityStatus = "available" if slots else "empty"
     return {
         "status": status,
         "timezone": lead_tz,
         "generated_at": datetime.now(UTC).isoformat(),
         "slots": slots,
-        "block": render_block(days, lead_tz),
+        "block": render_block(days, lead_tz, offer_slots=offer_slots),
+        "offer_slots": offer_slots,
     }
 
 
@@ -215,21 +304,38 @@ def empty_menu(
         "generated_at": datetime.now(UTC).isoformat(),
         "slots": [],
         "block": block,
+        "offer_slots": [],
     }
 
 
-def render_block(days: list[dict[str, Any]], lead_tz: str) -> str:
-    """Render the menu as the prompt block the agent reads its times from."""
+def render_block(
+    days: list[dict[str, Any]],
+    lead_tz: str,
+    *,
+    offer_slots: list[dict[str, str]] | None = None,
+) -> str:
+    """Render the menu as the prompt block the agent reads its times from.
+
+    When `offer_slots` is given, a pre-worded "OFFER FIRST" line is placed ahead
+    of the full menu so the agent reads a finished choice instead of picking a
+    spread live on the call — see `_choose_offer_slots`. The full menu stays
+    exactly as before it, unchanged, so the agent can still answer "what about
+    Friday?" from it.
+    """
     if not days:
         return empty_menu(lead_tz, status="empty")["block"]
     # Spoken form, never the IANA path: an agent that can read "Asia/Damascus" is an
     # agent that will eventually say "Asia slash Damascus" down a phone line.
     from app.services.lead_timezone import spoken_zone_name
 
-    lines = [
+    lines = []
+    offer_line = _render_offer_first_line(offer_slots or [])
+    if offer_line:
+        lines.append(offer_line)
+    lines.append(
         f"These are the open times on our calendar, already in the lead's own clock "
         f"({spoken_zone_name(lead_tz)}). Say the words, never the id:"
-    ]
+    )
     for day in days:
         times = " / ".join(f"{slot['label'].split(' at ', 1)[-1]} [{slot['slot_id']}]"
                            for slot in day["slots"])
