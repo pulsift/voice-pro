@@ -952,7 +952,7 @@ class CRMTools:
                         },
                         "icp": {
                             "type": "object",
-                            "description": "REQUIRED. Quick fit-check captured on the call, in 2-3 brief questions.",
+                            "description": "REQUIRED. The two fit answers captured on the call: the kind of installs they take on, and the areas they cover.",
                             "additionalProperties": False,
                             "properties": {
                                 "offer_types": {
@@ -977,7 +977,7 @@ class CRMTools:
                         },
                         "notes": {
                             "type": "string",
-                            "description": "Notes for the team: write 'AUDIT: yes' or 'AUDIT: no' plus any context about their business.",
+                            "description": "Notes for the team: what they said about their business - the installs they take on, the areas they cover, and anything else they volunteered.",
                         },
                         "contact_phone": {
                             "type": "string",
@@ -1357,7 +1357,7 @@ class CRMTools:
             contact_phone: Customer phone (internal fallback only)
             duration_minutes: Duration
             service_type: Service type
-            notes: Notes for the team (e.g. "AUDIT: yes" + context)
+            notes: Notes for the team - what they said about their business
             time_zone: Lead's IANA timezone
 
         Returns:
@@ -1402,7 +1402,7 @@ class CRMTools:
                 return {
                     "success": False,
                     "error": "missing_icp",
-                    "message": "Ask the lead the quick fit questions (what they install, minimum project size in kW, target states) before booking, then call book_appointment again with icp filled in.",
+                    "message": "Ask the lead the two fit questions (what kind of installs they take on, and which areas they cover) before booking, then call book_appointment again with icp filled in.",
                 }
 
             try:
@@ -1415,7 +1415,7 @@ class CRMTools:
                     "success": False,
                     "error": "invalid_icp",
                     "message": (
-                        "Ask the fit questions again, then call book_appointment with "
+                        "Ask the two fit questions again, then call book_appointment with "
                         "offer_types and states as lists, plus min_kw as a number."
                     ),
                 }

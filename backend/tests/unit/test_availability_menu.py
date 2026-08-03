@@ -564,3 +564,24 @@ async def test_call_me_back_another_time_books_nothing() -> None:
     tools.observe_user_utterance("Call me back another time.")
 
     assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+
+
+def test_a_repeated_start_never_becomes_two_menu_entries():
+    """Codex review 2026-08-03: a provider that repeats a start could make the
+    offer picker name the same time as BOTH of its two choices, asking the
+    caller to choose between a slot and itself. Same instant, two spellings."""
+    from app.services import availability as av
+
+    raw = [
+        {"start": "2026-08-04T15:00:00Z"},
+        {"start": "2026-08-04T15:00:00+00:00"},  # identical instant, written differently
+        {"start": "2026-08-04T15:00:00Z"},       # literal duplicate
+        {"start": "2026-08-05T16:00:00Z"},
+    ]
+    menu = av.build_menu(raw, "America/New_York")
+    starts = [s["start"] for s in menu["slots"]]
+    assert len(starts) == 2, f"duplicates survived: {starts}"
+
+    offered = menu.get("offer_slots") or []
+    if len(offered) == 2:
+        assert offered[0]["start"] != offered[1]["start"]

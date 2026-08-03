@@ -227,6 +227,7 @@ def build_menu(
         return empty_menu(lead_tz)
 
     by_day: dict[str, list[dict[str, Any]]] = {}
+    seen_starts: set[datetime] = set()
     for slot in raw_slots:
         iso = slot.get("start") if isinstance(slot, dict) else slot
         if not iso:
@@ -237,6 +238,14 @@ def build_menu(
             continue
         if start.tzinfo is None:
             start = start.replace(tzinfo=UTC)
+        # One real appointment must never become two menu entries. If the
+        # provider repeats a start - twice, or the same instant written two
+        # ways - the offer picker could name the SAME time as both of its two
+        # choices, and the caller would be asked to choose between a slot and
+        # itself. Compare the parsed instant, never the raw string.
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
         local = start.astimezone(zone)
         by_day.setdefault(local.strftime("%Y-%m-%d"), []).append(
             {"start": str(iso), "local": local}
