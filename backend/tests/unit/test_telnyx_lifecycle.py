@@ -674,8 +674,33 @@ async def test_caller_id_ownership_rejects_number_outside_workspace() -> None:
 
 
 @pytest.mark.asyncio
-async def test_caller_id_ownership_rejects_unscoped_call_without_query() -> None:
-    db = MagicMock(execute=AsyncMock())
+async def test_caller_id_without_a_workspace_is_checked_against_the_owner() -> None:
+    """No workspace is NOT grounds for refusal on its own.
+
+    `PhoneNumber.workspace_id` is nullable and this deployment is single-tenant
+    with no workspace rows at all, so an earlier "no workspace -> 403 without
+    even querying" rule made the gate unsatisfiable and refused every outbound
+    call. The number must still be OWNED; ownership is what gets checked.
+    """
+    owned = MagicMock()
+    owned.scalar_one_or_none.return_value = uuid.uuid4()
+    db = MagicMock(execute=AsyncMock(return_value=owned))
+
+    await require_owned_caller_id(
+        from_number="+14085550100",
+        workspace_id=None,
+        owner_user_id=1,
+        db=db,
+    )
+
+    db.execute.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unowned_caller_id_is_still_refused_without_a_workspace() -> None:
+    unowned = MagicMock()
+    unowned.scalar_one_or_none.return_value = None
+    db = MagicMock(execute=AsyncMock(return_value=unowned))
 
     with pytest.raises(HTTPException) as exc_info:
         await require_owned_caller_id(
@@ -686,7 +711,6 @@ async def test_caller_id_ownership_rejects_unscoped_call_without_query() -> None
         )
 
     assert exc_info.value.status_code == 403
-    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

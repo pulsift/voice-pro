@@ -942,21 +942,28 @@ async def require_owned_caller_id(
     owner_user_id: int,
     db: AsyncSession,
 ) -> None:
-    """Refuse outbound caller IDs not registered to the resolved workspace owner."""
-    if workspace_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Caller ID is not owned by the selected workspace",
-        )
+    """Refuse outbound caller IDs not registered to the resolved owner.
+
+    The security property is OWNERSHIP: the caller ID must be a number this
+    user has registered. Workspace scoping is an ADDITIONAL constraint, applied
+    only when a workspace was actually resolved.
+
+    It must not be a precondition. `PhoneNumber.workspace_id` is nullable by
+    design, and this deployment is single-tenant with no workspace rows at all,
+    so demanding a workspace made the gate unsatisfiable: it 403'd every
+    outbound call, including every call the reply machine placed. Found by a
+    live seeded call on 2026-08-03, hours after the gate first shipped —
+    no test caught it because the suites never populate this table.
+    """
+    conditions = [
+        StoredPhoneNumber.phone_number == from_number,
+        StoredPhoneNumber.user_id == user_id_to_uuid(owner_user_id),
+    ]
+    if workspace_id is not None:
+        conditions.append(StoredPhoneNumber.workspace_id == workspace_id)
 
     result = await db.execute(
-        select(StoredPhoneNumber.id)
-        .where(
-            StoredPhoneNumber.phone_number == from_number,
-            StoredPhoneNumber.workspace_id == workspace_id,
-            StoredPhoneNumber.user_id == user_id_to_uuid(owner_user_id),
-        )
-        .limit(1)
+        select(StoredPhoneNumber.id).where(*conditions).limit(1)
     )
     if result.scalar_one_or_none() is None:
         raise HTTPException(
