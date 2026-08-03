@@ -275,10 +275,15 @@ async def test_repeated_signals_upsert_one_row_and_preserve_both_facts(
 
 
 @pytest.mark.asyncio
-async def test_media_only_never_dispatches_even_after_grace(
+async def test_media_only_dispatches_exactly_once_once_grace_elapses(
     outbox_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    observed_at = datetime.now(UTC) - timedelta(hours=2)
+    """A lost or delayed carrier terminal callback must not strand a
+    media-only row forever - the router still needs to learn the call ended.
+    Before the fallback grace elapses the row stays pending; once it elapses
+    the row becomes due and is delivered exactly once.
+    """
+    observed_at = datetime.now(UTC) - timedelta(seconds=call_events.FALLBACK_DELAY_SECONDS + 1)
     record = make_record()
     await stage_signals(
         outbox_session_factory,
@@ -288,13 +293,24 @@ async def test_media_only_never_dispatches_even_after_grace(
         media=True,
     )
 
-    claim = await call_events._claim_due_event(now=datetime.now(UTC) + timedelta(days=1))
+    before_grace = await call_events._claim_due_event(
+        now=observed_at + timedelta(seconds=call_events.FALLBACK_DELAY_SECONDS - 1)
+    )
+    assert before_grace is None
     row = await load_outbox(outbox_session_factory, record.id)
-
-    assert claim is None
     assert row is not None
     assert row.state == "pending"
     assert row.carrier_terminal_at is None
+
+    with patch.object(call_events, "_post_once", AsyncMock(return_value=204)) as post:
+        assert await call_events.dispatch_due_call_event() is True
+        # No second row is due - the media-only event was delivered exactly once.
+        assert await call_events.dispatch_due_call_event() is False
+
+    post.assert_awaited_once()
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "sent"
 
 
 @pytest.mark.asyncio

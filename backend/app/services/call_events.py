@@ -279,12 +279,12 @@ async def _claim_due_event(*, now: datetime | None = None) -> _Claim | None:
                     ),
                 ),
             ),
-            and_(
-                CallEventOutbox.carrier_terminal_at.is_not(None),
-                or_(
+            or_(
+                and_(
+                    CallEventOutbox.carrier_terminal_at.is_not(None),
                     CallRecord.media_finalized_at.is_not(None),
-                    CallEventOutbox.available_at <= now,
                 ),
+                CallEventOutbox.available_at <= now,
             ),
         )
         .order_by(CallEventOutbox.next_attempt_at, CallEventOutbox.created_at)
