@@ -195,9 +195,12 @@ class Settings(BaseSettings):
 
     # Operator alerts (Slack). The one durable, deduplicated notification lane a
     # human acts on - a finished call that could never reach the reply system, or
-    # a promised list handover stuck for good. Posted as a plain incoming-webhook
-    # JSON body ({"text": ...}); unset URL = alerts stay queued, never dropped.
-    OPERATOR_ALERTS_SLACK_WEBHOOK_URL: str | None = None
+    # a promised list handover stuck for good. Delivered on the house Slack
+    # contract (see app/services/operator_alerts.py): a bot token
+    # (SLACK_BOT_TOKEN + SLACK_CHANNEL, read straight from the environment, not
+    # a settings field - matching pulsift-reply-router's reply_router/slack.py)
+    # preferred, a legacy SLACK_WEBHOOK_URL a fallback. Nothing configured =
+    # alerts stay queued, never dropped.
 
     # Public transcript share links (B2). The backend's own public origin, used to
     # build the shareable transcript URL carried in the call-ended event

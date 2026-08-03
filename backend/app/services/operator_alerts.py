@@ -16,16 +16,18 @@ own `last_error`.
 
 import asyncio
 import json
+import os
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import structlog
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.operator_alert import OperatorAlert
 from app.services.durable_events import (
@@ -34,7 +36,6 @@ from app.services.durable_events import (
     classify_delivery_status,
     exponential_backoff,
     lease_one,
-    post_once,
     run_worker_loop,
     start_worker_task,
     stop_worker_task,
@@ -46,10 +47,76 @@ logger = structlog.get_logger()
 _TIMEOUT_SECONDS = 10.0
 _WORKER_POLL_SECONDS = 1.0
 _LEASE_SECONDS = DEFAULT_LEASE_SECONDS
-_MISSING_URL_ERROR = "OPERATOR_ALERTS_SLACK_WEBHOOK_URL not configured"
+_MISSING_DESTINATION_ERROR = (
+    "no Slack destination configured "
+    "(SLACK_BOT_TOKEN+SLACK_CHANNEL, or SLACK_WEBHOOK_URL)"
+)
+_SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+
+
+# --------------------------------------------------------------------------
+# Destination resolution — the house Slack contract, reimplemented from
+# pulsift-reply-router's reply_router/slack.py (not imported, that repo is
+# not a dependency; kept in step by eye instead). A bot token is preferred
+# (real Web API delivery); a legacy incoming-webhook URL is the fallback for
+# a workspace that hasn't been handed a bot token yet. Operator alerts only
+# ever stage into the OPS lane, but the LOGS fallback is reimplemented too
+# so the resolution order matches the router's exactly, not just the part
+# this caller happens to exercise today.
+# --------------------------------------------------------------------------
+
+OPS = "ops"
+LOGS = "logs"
+
+
+def _first_env(*names: str) -> str:
+    """First non-empty env var among aliases (Sami's local `SLACK_[PULSIFT]_*`
+    names, or Railway's canonical `SLACK_*`)."""
+    for name in names:
+        val = os.environ.get(name)
+        if val:
+            return val
+    return ""
+
+
+def _channel_for(lane: str) -> str:
+    """The logs lane falls back to the ops channel when unset, so a
+    half-configured workspace never silently drops a message."""
+    ops = _first_env("SLACK_CHANNEL", "SLACK_[PULSIFT]_CHANNEL")
+    if lane == LOGS:
+        return _first_env("SLACK_LOGS_CHANNEL", "SLACK_[PULSIFT]_LOGS_CHANNEL") or ops
+    return ops
+
+
+def _webhook_for(lane: str) -> str:
+    if lane == LOGS:
+        hook = _first_env("SLACK_LOGS_WEBHOOK_URL", "SLACK_[PULSIFT]_LOGS_WEBHOOK_URL")
+        if hook:
+            return hook
+    return _first_env("SLACK_WEBHOOK_URL", "SLACK_[PULSIFT]_WEBHOOK_URL")
+
+
+@dataclass(frozen=True)
+class _Destination:
+    mode: str  # "bot" | "webhook"
+    token: str = ""
+    channel: str = ""
+    url: str = ""
+
+
+def _resolve_destination(lane: str = OPS) -> _Destination | None:
+    token = _first_env("SLACK_BOT_TOKEN", "SLACK_[PULSIFT]_BOT_TOKEN")
+    channel = _channel_for(lane)
+    if token and channel:
+        return _Destination(mode="bot", token=token, channel=channel)
+    url = _webhook_for(lane)
+    if url:
+        return _Destination(mode="webhook", url=url)
+    return None
+
 
 _worker_task: asyncio.Task[None] | None = None
-_warned_missing_url = False
+_warned_missing_destination = False
 
 
 def _alert_insert(db: AsyncSession, *, dedup_key: str, message: str, now: datetime) -> object:
@@ -156,7 +223,7 @@ async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool
     )
 
 
-async def _mark_missing_url() -> None:
+async def _mark_missing_destination() -> None:
     async with AsyncSessionLocal() as db, db.begin():
         await db.execute(
             update(OperatorAlert)
@@ -164,10 +231,10 @@ async def _mark_missing_url() -> None:
                 OperatorAlert.state.in_(("pending", "sending")),
                 or_(
                     OperatorAlert.last_error.is_(None),
-                    OperatorAlert.last_error != _MISSING_URL_ERROR,
+                    OperatorAlert.last_error != _MISSING_DESTINATION_ERROR,
                 ),
             )
-            .values(last_error=_MISSING_URL_ERROR, updated_at=datetime.now(UTC))
+            .values(last_error=_MISSING_DESTINATION_ERROR, updated_at=datetime.now(UTC))
         )
 
 
@@ -175,21 +242,39 @@ def _retry_delay(attempts: int) -> int:
     return exponential_backoff(attempts)
 
 
-async def _post_once(url: str, body: bytes) -> int:
-    return await post_once(url, body, {"Content-Type": "application/json"}, timeout_seconds=_TIMEOUT_SECONDS)
+async def _post_once(url: str, body: bytes, headers: dict[str, str]) -> int:
+    """POST immutable bytes once; returns the effective status.
+
+    Slack's `chat.postMessage` replies HTTP 200 even when it silently
+    declined the message (`{"ok": false, "error": "..."}`) - fold that into
+    a synthetic non-2xx so `classify_delivery_status` retries it exactly
+    like any other failed delivery instead of falsely acking. Bypasses the
+    shared `durable_events.post_once` (status-only) because that detection
+    needs the response body.
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+        response = await client.post(url, content=body, headers=headers)
+    if url == _SLACK_POST_MESSAGE_URL:
+        try:
+            ok = response.json().get("ok") is True
+        except ValueError:
+            ok = False
+        if not ok:
+            return 599
+    return response.status_code
 
 
 async def dispatch_due_operator_alert() -> bool:
     """Attempt one due alert; return whether a row was claimed."""
-    global _warned_missing_url
-    webhook_url = settings.OPERATOR_ALERTS_SLACK_WEBHOOK_URL
-    if not webhook_url:
-        if not _warned_missing_url:
-            _warned_missing_url = True
-            logger.error("operator_alert_worker_unconfigured", reason=_MISSING_URL_ERROR)
-        await _mark_missing_url()
+    global _warned_missing_destination
+    destination = _resolve_destination()
+    if destination is None:
+        if not _warned_missing_destination:
+            _warned_missing_destination = True
+            logger.error("operator_alert_worker_unconfigured", reason=_MISSING_DESTINATION_ERROR)
+        await _mark_missing_destination()
         return False
-    _warned_missing_url = False
+    _warned_missing_destination = False
 
     claim = await _claim_due_alert()
     if claim is None:
@@ -209,9 +294,21 @@ async def dispatch_due_operator_alert() -> bool:
         log.warning("operator_alert_claim_lost")
         return True
 
-    body = json.dumps({"text": message}, separators=(",", ":")).encode("utf-8")
+    if destination.mode == "bot":
+        url = _SLACK_POST_MESSAGE_URL
+        payload: dict[str, str] = {"channel": destination.channel, "text": message}
+        headers = {
+            "Authorization": f"Bearer {destination.token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+    else:
+        url = destination.url
+        payload = {"text": message}
+        headers = {"Content-Type": "application/json"}
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
     try:
-        status_code = await _post_once(webhook_url, body)
+        status_code = await _post_once(url, body, headers)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
