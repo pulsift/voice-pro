@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     CALL_EVENTS_URL: str | None = None
     CALL_EVENTS_SECRET: str | None = None
 
+    # Operator alerts (Slack). The one durable, deduplicated notification lane a
+    # human acts on - a finished call that could never reach the reply system, or
+    # a promised list handover stuck for good. Posted as a plain incoming-webhook
+    # JSON body ({"text": ...}); unset URL = alerts stay queued, never dropped.
+    OPERATOR_ALERTS_SLACK_WEBHOOK_URL: str | None = None
+
     # Public transcript share links (B2). The backend's own public origin, used to
     # build the shareable transcript URL carried in the call-ended event
     # (f"{base}/api/public/transcripts/{share_token}"). Falls back to PUBLIC_URL —

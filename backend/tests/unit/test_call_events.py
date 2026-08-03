@@ -29,6 +29,7 @@ from app.api.telephony_ws import save_transcript_to_call_record
 from app.core.config import settings
 from app.models.call_event_outbox import CallEventOutbox
 from app.models.call_record import CallRecord
+from app.models.operator_alert import OperatorAlert
 from app.services import call_events
 
 BOOKED_ATTEMPTS = [
@@ -79,7 +80,7 @@ async def outbox_engine(tmp_path: Path) -> AsyncGenerator[AsyncEngine, None]:
     def create_tables(connection: Connection) -> None:
         CallRecord.metadata.create_all(
             connection,
-            tables=[CallRecord.__table__, CallEventOutbox.__table__],
+            tables=[CallRecord.__table__, CallEventOutbox.__table__, OperatorAlert.__table__],
         )
 
     async with engine.begin() as connection:
@@ -115,6 +116,13 @@ async def load_outbox(
 ) -> CallEventOutbox | None:
     async with factory() as db:
         return await db.get(CallEventOutbox, call_id)
+
+
+async def load_operator_alert(
+    factory: async_sessionmaker[AsyncSession], dedup_key: str
+) -> OperatorAlert | None:
+    async with factory() as db:
+        return await db.get(OperatorAlert, dedup_key)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +469,96 @@ async def test_http_409_blocks_and_retains_payload_for_operator_action(
     assert row.payload_sha256 is not None
     assert row.last_error == "HTTP 409: immutable call-event payload conflict"
     assert await call_events._claim_due_event(now=datetime.now(UTC) + timedelta(days=1)) is None
+
+
+# ---------------------------------------------------------------------------
+# Operator alert on a permanent block (finding #2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_permanent_block_stages_exactly_one_plain_english_operator_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+
+    with patch.object(call_events, "_post_once", AsyncMock(return_value=409)):
+        assert await call_events.dispatch_due_call_event() is True
+
+    alert = await load_operator_alert(
+        outbox_session_factory, f"call-handoff-blocked:{record.id}"
+    )
+    assert alert is not None
+    assert alert.state == "pending"
+    assert alert.message == (
+        "A finished call with Ada could not be handed to the reply system. Check it by hand."
+    )
+    # Operator lane: no ids, hashes, or HTTP codes - those stay in the logs lane.
+    assert str(record.id) not in alert.message
+    assert "409" not in alert.message
+
+
+@pytest.mark.asyncio
+async def test_permanent_block_is_not_committed_unless_its_alert_commits(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    observed_at = datetime.now(UTC) - timedelta(seconds=1)
+    record = make_record()
+    await stage_signals(
+        outbox_session_factory,
+        record,
+        observed_at=observed_at,
+        terminal=True,
+        media=True,
+    )
+
+    with (
+        patch.object(call_events, "_post_once", AsyncMock(return_value=409)),
+        patch.object(
+            call_events,
+            "stage_operator_alert",
+            AsyncMock(side_effect=RuntimeError("slack outage")),
+        ),
+        pytest.raises(RuntimeError, match="slack outage"),
+    ):
+        await call_events.dispatch_due_call_event()
+
+    row = await load_outbox(outbox_session_factory, record.id)
+    assert row is not None
+    assert row.state == "sending"  # the block itself never committed either
+    assert (
+        await load_operator_alert(outbox_session_factory, f"call-handoff-blocked:{record.id}")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeat_block_of_the_same_call_stages_no_second_alert(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    record = make_record()
+    dedup_key = f"call-handoff-blocked:{record.id}"
+    await persist_record(outbox_session_factory, record)
+
+    async with outbox_session_factory() as db:
+        await call_events._stage_call_handoff_blocked_alert(db, record.id)
+        await db.commit()
+    async with outbox_session_factory() as db:
+        await call_events._stage_call_handoff_blocked_alert(db, record.id)
+        await db.commit()
+
+    async with outbox_session_factory() as db:
+        result = await db.execute(select(OperatorAlert).where(OperatorAlert.dedup_key == dedup_key))
+        rows = result.scalars().all()
+    assert len(rows) == 1
 
 
 @pytest.mark.asyncio

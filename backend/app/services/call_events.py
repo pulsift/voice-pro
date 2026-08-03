@@ -42,6 +42,7 @@ from app.services.durable_events import (
     stop_worker_task,
     transition_claim,
 )
+from app.services.operator_alerts import stage_operator_alert
 
 logger = structlog.get_logger()
 
@@ -366,6 +367,30 @@ async def _retry_claim(claim: _Claim, error: str, *, delay_seconds: int) -> bool
     )
 
 
+async def _stage_call_handoff_blocked_alert(db: AsyncSession, call_id: uuid.UUID) -> None:
+    """Plain-English operator alert, staged atomically with the permanent block.
+
+    One deduplicated alert per call: repeat blocks of the same call (the
+    integrity path and the 409-conflict path both land here) key off the
+    same call_id and never stage a second notification.
+    """
+    record = await db.get(CallRecord, call_id)
+    variables = record.variables if record is not None and isinstance(record.variables, dict) else {}
+    identity = (
+        str(variables.get("leadName") or "").strip()
+        or (record.to_number if record is not None else None)
+        or "an unknown prospect"
+    )
+    await stage_operator_alert(
+        db,
+        dedup_key=f"call-handoff-blocked:{call_id}",
+        message=(
+            f"A finished call with {identity} could not be handed to the reply "
+            "system. Check it by hand."
+        ),
+    )
+
+
 async def _block_claim(claim: _Claim, error: str) -> bool:
     """Permanently expose an immutable-payload or integrity conflict."""
     return await transition_claim(
@@ -376,6 +401,7 @@ async def _block_claim(claim: _Claim, error: str) -> bool:
         expected_state="sending",
         target_state="blocked",
         error=error,
+        on_commit=lambda db: _stage_call_handoff_blocked_alert(db, claim.call_id),
     )
 
 

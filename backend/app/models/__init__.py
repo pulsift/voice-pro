@@ -8,6 +8,7 @@ from app.models.call_record import CallRecord
 from app.models.campaign import Campaign, CampaignContact
 from app.models.contact import Contact
 from app.models.fulfilment_outbox import FulfilmentOutbox
+from app.models.operator_alert import OperatorAlert
 from app.models.phone_number import PhoneNumber
 from app.models.privacy_settings import ConsentRecord, PrivacySettings
 from app.models.sms_contact import SmsContact
@@ -28,6 +29,7 @@ __all__ = [
     "ConsentRecord",
     "Contact",
     "FulfilmentOutbox",
+    "OperatorAlert",
     "PhoneNumber",
     "PrivacySettings",
     "SmsContact",

@@ -96,8 +96,15 @@ async def transition_claim(
     error: str | None = None,
     delay_seconds: int | None = None,
     mark_sent: bool = False,
+    on_commit: Callable[[AsyncSession], Awaitable[None]] | None = None,
 ) -> bool:
-    """Mutate only the exact live lease; stale workers cannot overwrite a successor."""
+    """Mutate only the exact live lease; stale workers cannot overwrite a successor.
+
+    `on_commit`, when given, runs inside the same transaction right after a
+    successful transition (never after a lost race) - so a caller can stage a
+    side effect, such as a deduplicated operator alert, that lives or dies
+    with the transition it belongs to.
+    """
     now = datetime.now(UTC)
     values: dict[str, Any] = {
         "state": target_state,
@@ -120,7 +127,10 @@ async def transition_claim(
             )
             .values(**values)
         )
-        return bool(getattr(result, "rowcount", 0))
+        transitioned = bool(getattr(result, "rowcount", 0))
+        if transitioned and on_commit is not None:
+            await on_commit(db)
+        return transitioned
 
 
 async def post_once(

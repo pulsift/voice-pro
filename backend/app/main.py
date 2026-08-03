@@ -62,6 +62,10 @@ from app.services.fulfilment_webhook import (
     start_fulfilment_worker,
     stop_fulfilment_worker,
 )
+from app.services.operator_alerts import (
+    start_operator_alert_worker,
+    stop_operator_alert_worker,
+)
 
 # Configure structured logging with async processors
 structlog.configure(
@@ -161,6 +165,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
     except Exception:
         logger.exception("Failed to start fulfilment outbox worker - jobs remain pending")
 
+    # Start durable operator-alert delivery (non-fatal; alerts remain in Postgres).
+    try:
+        await start_operator_alert_worker()
+    except Exception:
+        logger.exception("Failed to start operator-alert outbox worker - alerts remain pending")
+
     # Start transcript retention sweep (non-fatal)
     try:
         await start_transcript_retention_worker()
@@ -188,6 +198,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
         await stop_fulfilment_worker()
     except Exception:
         logger.exception("Error stopping fulfilment outbox worker")
+
+    # Stop durable operator-alert delivery before disposing the database engine.
+    try:
+        await stop_operator_alert_worker()
+    except Exception:
+        logger.exception("Error stopping operator-alert outbox worker")
 
     # Stop durable call-ended delivery before disposing the database engine.
     try:
