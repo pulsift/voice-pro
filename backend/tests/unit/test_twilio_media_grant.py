@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException, Response
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from structlog.testing import capture_logs
 
 from app.api.telephony import (
@@ -16,7 +17,10 @@ from app.api.telephony import (
     twilio_answer_webhook,
     twilio_voice_webhook,
 )
+from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
+from app.models.contact import Contact
+from app.models.workspace import Workspace
 from app.services.telephony.media_grant import (
     arm_twilio_media_grant,
     consume_twilio_media_grant,
@@ -132,6 +136,93 @@ async def test_grant_atomic_update_binds_every_identity_and_commits() -> None:
     assert record.agent_id in params
     assert record.workspace_id in params
     assert cv_sha256("bound-cv") in params
+
+
+@pytest.mark.asyncio
+async def test_consumed_grant_is_evidence_of_answer_when_no_callback_ever_arrived() -> None:
+    """finding #1 residual: a consumed media grant is independent proof the call
+    was answered, same principle as fcf2d99's carrier-callback fix - so a call
+    whose only answered-evidence is the media grant must still report answered.
+    """
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            lambda conn: CallRecord.metadata.create_all(
+                conn,
+                # CallRecord.agent/contact/workspace load lazy="selectin" - these
+                # tables just need to exist (empty) for that load to succeed.
+                tables=[
+                    CallRecord.__table__,
+                    Agent.__table__,
+                    Contact.__table__,
+                    Workspace.__table__,
+                ],
+            )
+        )
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    now = datetime.now(UTC)
+    record = _transient_record(call_sid="CA-media-only-evidence")
+    record.answered_at = None
+    token = arm_twilio_media_grant(record, "cv-media", now=now)
+    assert token is not None
+
+    async with factory() as db:
+        db.add(record)
+        await db.commit()
+
+    try:
+        async with factory() as db:
+            consumed = await consume_twilio_media_grant(
+                db=db,
+                token=token,
+                call_sid=record.provider_call_id,
+                agent_id=str(record.agent_id),
+                workspace_id=str(record.workspace_id),
+                cv="cv-media",
+                now=now + timedelta(seconds=1),
+            )
+
+        assert consumed is not None
+        assert consumed.answered_at is not None
+
+        async with factory() as db:
+            reloaded = await db.get(CallRecord, record.id)
+            assert reloaded is not None
+            assert reloaded.answered_at is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_consumed_grant_never_overwrites_an_earlier_answered_at() -> None:
+    """The coalesce is fill-if-null only - a real earlier answered signal (e.g.
+    the carrier callback) stays authoritative.
+    """
+    record = _transient_record(call_sid="CA-already-answered")
+    token = arm_twilio_media_grant(record, "cv", now=datetime.now(UTC))
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = record
+    db = MagicMock(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    consumed = await consume_twilio_media_grant(
+        db=db,
+        token=token or "",
+        call_sid=record.provider_call_id,
+        agent_id=str(record.agent_id),
+        workspace_id=str(record.workspace_id),
+        cv="cv",
+        now=datetime.now(UTC) + timedelta(seconds=1),
+    )
+
+    assert consumed is record
+    statement = db.execute.await_args.args[0]
+    sql = str(statement.compile())
+    assert "coalesce(call_records.answered_at" in sql.lower()
 
 
 @pytest.mark.asyncio

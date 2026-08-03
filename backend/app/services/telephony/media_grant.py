@@ -6,7 +6,7 @@ import hmac
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -118,7 +118,14 @@ async def consume_twilio_media_grant(
             CallRecord.media_grant_expires_at > current,
             CallRecord.media_grant_consumed_at.is_(None),
         )
-        .values(media_grant_consumed_at=current)
+        .values(
+            media_grant_consumed_at=current,
+            # Consuming an authenticated media grant is independent proof the
+            # call was answered - same evidence-of-answer principle as
+            # fcf2d99's carrier-callback fix, applied to this signal too. Only
+            # fill it if no earlier signal already did.
+            answered_at=func.coalesce(CallRecord.answered_at, current),
+        )
         .returning(CallRecord)
     )
     result = await db.execute(statement)
