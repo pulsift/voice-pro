@@ -14,6 +14,7 @@ from app.api.telephony import (
     twilio_status_callback,
 )
 from app.models.call_record import CallDirection, CallStatus
+from app.services.call_events import build_call_ended_payload
 
 
 def make_record(**overrides: object) -> SimpleNamespace:
@@ -171,6 +172,55 @@ async def test_only_first_terminal_callback_mutates_lifecycle_while_each_signal_
     assert all(awaited.args == (db, record) for awaited in stage.await_args_list)
     assert db.commit.await_count == 2
     db.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_before_answered_keeps_call_answered_and_reports_no_retry() -> None:
+    """A "completed" callback that lands before (or instead of) the "answered"
+    one must still leave the call answered. The frozen call-ended payload is
+    the router's sole signal for whether to redial - answered=false there is
+    read as a no-answer and triggers a retry (see call_events.py docstring),
+    so a lost/reordered answered callback must never surface as answered=false.
+    """
+    record = make_record(
+        status=CallStatus.RINGING.value,
+        answered_at=None,
+        booking_attempts=None,
+        variables=None,
+    )
+    result = candidate_result(record)
+    db = MagicMock(
+        execute=AsyncMock(return_value=result),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    with (
+        patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
+        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
+        patch("app.api.telephony.stage_terminal_call_event", AsyncMock()) as stage,
+    ):
+        await twilio_status_callback(
+            request=MagicMock(),
+            db=db,
+            call_record_id=str(record.id),
+            call_sid="CA-lifecycle-1",
+            call_status="completed",
+            call_duration="41",
+            from_number=record.from_number,
+            to_number=record.to_number,
+        )
+
+    assert record.status == CallStatus.COMPLETED.value
+    assert record.answered_at is not None
+    stage.assert_awaited_once()
+
+    payload = build_call_ended_payload(record)
+    # (a) the frozen call-ended event still reports answered=true ...
+    assert payload["answered"] is True
+    # (b) ... which is exactly what withholds a retry: the router only redials
+    # when answered is false, so this call is never re-dialled as a no-answer.
+    assert payload["status"] == CallStatus.COMPLETED.value
 
 
 @pytest.mark.parametrize(

@@ -122,6 +122,13 @@ def _apply_twilio_lifecycle_status(
         call_record.status = mapped_status
         if not call_record.ended_at:
             call_record.ended_at = event_at
+        # Twilio's "completed" is only reachable from a real answer - if the
+        # answered callback was lost or arrives after this one, the callback's
+        # own trusted timestamp is still authenticated carrier evidence that the
+        # call was answered. Set it before the call-ended payload is staged so
+        # the router never mistakes an answered call for a no-answer redial.
+        if mapped_status == CallStatus.COMPLETED.value and not call_record.answered_at:
+            call_record.answered_at = event_at
         if provider_duration is not None:
             call_record.duration_seconds = provider_duration
         return True
