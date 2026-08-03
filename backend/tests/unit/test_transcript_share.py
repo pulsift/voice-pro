@@ -149,6 +149,117 @@ def test_amd_verdict_rewrite_is_a_noop_when_unchanged() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fit answers, independent of booking (2026-08-02: the fit questions now come
+# before any offer, so a call that ends before book_appointment must still
+# hand the team what it heard)
+# ---------------------------------------------------------------------------
+
+BOOKED_ATTEMPT = {"operation": "create", "category": "success", "uid": "calcom-uid-9"}
+UNBOOKED_ATTEMPT = {"operation": "create", "category": "rejected", "uid": None}
+
+
+def test_fit_answers_merge_into_variables_without_clobbering() -> None:
+    record = MagicMock(
+        transcript=None,
+        booking_attempts=None,
+        variables={"leadName": "Ada"},
+        share_token=None,
+    )
+
+    changed = _merge_call_artifacts(
+        record, "", None, None, {"offer_types": ["rooftop"], "states": ["Texas"]}
+    )
+
+    assert changed is True
+    assert record.variables == {
+        "leadName": "Ada",
+        "fit_answers": {"offer_types": ["rooftop"], "states": ["Texas"]},
+    }
+
+
+def test_no_fit_answers_records_nothing_and_no_empty_keys() -> None:
+    record = MagicMock(
+        transcript=None,
+        booking_attempts=None,
+        variables={"leadName": "Ada"},
+        share_token=None,
+    )
+
+    changed = _merge_call_artifacts(record, "", None, None, {})
+
+    assert changed is False
+    assert "fit_answers" not in record.variables
+
+
+def test_fit_answers_reach_the_call_ended_payload_when_the_call_never_books() -> None:
+    record = make_record(
+        booking_attempts=[UNBOOKED_ATTEMPT],
+        variables={
+            "leadName": "Ada",
+            "fit_answers": {"offer_types": ["rooftop"], "states": ["Texas"]},
+        },
+    )
+
+    payload = build_call_ended_payload(record)
+
+    assert payload["booked"] is False
+    assert payload["variables"]["fit_answers"] == {
+        "offer_types": ["rooftop"],
+        "states": ["Texas"],
+    }
+
+
+def test_fit_answers_do_not_disturb_a_booked_calls_existing_payload() -> None:
+    record = make_record(
+        booking_attempts=[BOOKED_ATTEMPT],
+        variables={
+            "leadName": "Ada",
+            "fit_answers": {"offer_types": ["rooftop"], "states": ["Texas"]},
+        },
+    )
+
+    payload = build_call_ended_payload(record)
+
+    assert payload["booked"] is True
+    assert payload["booking_uid"] == "calcom-uid-9"
+    assert payload["variables"]["fit_answers"] == {
+        "offer_types": ["rooftop"],
+        "states": ["Texas"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_transcript_persists_fit_answers_for_an_unbooked_call() -> None:
+    record = MagicMock(
+        id=uuid.uuid4(),
+        transcript=None,
+        booking_attempts=None,
+        variables={},
+        share_token=None,
+    )
+    exact = MagicMock()
+    exact.scalars.return_value.all.return_value = [record]
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=exact)
+    db.commit = AsyncMock()
+
+    await save_transcript_to_call_record(
+        "CA-share-1",
+        "",
+        db,
+        MagicMock(),
+        booking_attempts=[],
+        owner_user_id=uuid.uuid4(),
+        workspace_id=None,
+        provider="twilio",
+        fit_answers={"offer_types": ["rooftop"]},
+    )
+
+    db.commit.assert_awaited_once_with()
+    assert record.variables == {"fit_answers": {"offer_types": ["rooftop"]}}
+
+
+# ---------------------------------------------------------------------------
 # call-ended payload
 # ---------------------------------------------------------------------------
 

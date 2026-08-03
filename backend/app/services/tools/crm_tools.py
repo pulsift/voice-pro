@@ -156,6 +156,11 @@ class CRMTools:
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
+        # Fit answers (what they install, areas they cover), captured the moment
+        # they're given - independent of booking, so a call that ends before
+        # book_appointment ever runs still hands the team something real. See
+        # record_fit_answers / get_fit_answers.
+        self._fit_answers: dict[str, Any] = {}
         # True once times have actually been said out loud (any tool-driven offer).
         # A pre-loaded menu starts False — see seed_offered_slots.
         self._menu_announced = True
@@ -306,6 +311,53 @@ class CRMTools:
     def get_booking_attempts(self) -> list[dict[str, Any]]:
         """Return a safe copy for later CallRecord persistence."""
         return deepcopy(self._booking_attempts)
+
+    def get_fit_answers(self) -> dict[str, Any]:
+        """Return a safe copy of the fit answers captured so far this call.
+
+        Populated by record_fit_answers as soon as the lead answers, independent
+        of whether the call ever reaches book_appointment. Empty when nothing has
+        been recorded - never a dict with empty/placeholder values.
+        """
+        return deepcopy(self._fit_answers)
+
+    async def record_fit_answers(
+        self,
+        offer_types: list[str] | None = None,
+        min_kw: float | None = None,
+        states: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Save whichever fit answers the lead has given so far.
+
+        Independent of select_slot/book_appointment on purpose: under the
+        current call order the two fit questions are asked before any time is
+        offered, so this is what keeps their answers for the team even if the
+        call ends before booking. Merges into whatever was already saved - only
+        the fields actually passed are touched, so calling it again with just
+        the second answer never wipes out the first, and a field never given is
+        never fabricated.
+        """
+        given: dict[str, Any] = {}
+        if offer_types is not None:
+            given["offer_types"] = offer_types
+        if min_kw is not None:
+            given["min_kw"] = min_kw
+        if states is not None:
+            given["states"] = states
+        if not given:
+            return {"success": True, "recorded": False}
+        try:
+            normalized = _normalize_fulfilment_icp(given)
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "invalid_fit_answers",
+                "message": (
+                    "Pass offer_types/states as lists of words, min_kw as a number."
+                ),
+            }
+        self._fit_answers.update(normalized)
+        return {"success": True, "recorded": True}
 
     def _replace_offered_slots(self, slots: list[dict[str, str]], timezone: str) -> None:
         self._offered_slots = [
@@ -844,6 +896,39 @@ class CRMTools:
                         },
                     },
                     "required": ["slot_id"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "record_fit_answers",
+                "description": (
+                    "Save what the lead has told you about their business so far - the kind of "
+                    "installs they take on and/or the areas they cover - the moment they answer, "
+                    "before you ever offer a time. This is what keeps their answers for the team "
+                    "even if the call ends before booking. Call it again for anything they add or "
+                    "correct later; it adds to what is already saved, never wipes it out. Only pass "
+                    "a field they actually answered - never guess or fill in one they did not "
+                    "address."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "offer_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "What they install/sell, in their own words, e.g. ['rooftop', 'ground-mount', 'carports'].",
+                        },
+                        "min_kw": {
+                            "type": "number",
+                            "description": "Minimum project size in kW they'll take on, only if volunteered.",
+                        },
+                        "states": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "The areas or states they cover, in their own words.",
+                        },
+                    },
+                    "required": [],
                 },
             },
             {
@@ -1941,6 +2026,8 @@ class CRMTools:
             return await self.check_availability(**arguments)
         if tool_name == "select_slot":
             return await self.select_slot(**arguments)
+        if tool_name == "record_fit_answers":
+            return await self.record_fit_answers(**arguments)
         if tool_name == "book_appointment":
             return await self.book_appointment(**arguments)
         if tool_name == "list_appointments":

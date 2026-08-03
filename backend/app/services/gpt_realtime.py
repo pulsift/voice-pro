@@ -1067,6 +1067,12 @@ class GPTRealtimeSession:
             return []
         return self.tool_registry.get_booking_attempts()
 
+    def get_fit_answers(self) -> dict[str, Any]:
+        """Return fit answers captured during this call, independent of booking."""
+        if not self.tool_registry:
+            return {}
+        return self.tool_registry.get_fit_answers()
+
     async def cleanup(self) -> None:
         """Cleanup resources."""
         self.logger.info("gpt_realtime_session_cleanup_started")

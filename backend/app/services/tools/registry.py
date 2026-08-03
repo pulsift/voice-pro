@@ -218,6 +218,10 @@ class ToolRegistry:
         """Return sanitized booking diagnostics from the per-call CRM state."""
         return self.crm_tools.get_booking_attempts()
 
+    def get_fit_answers(self) -> dict[str, Any]:
+        """Return the fit answers captured so far, independent of booking."""
+        return self.crm_tools.get_fit_answers()
+
     async def execute_tool(  # noqa: PLR0911
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
@@ -248,6 +252,7 @@ class ToolRegistry:
             "check_availability",
             "refresh_availability",
             "select_slot",
+            "record_fit_answers",
             "book_appointment",
             "list_appointments",
             "cancel_appointment",

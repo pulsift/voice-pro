@@ -303,6 +303,7 @@ def _merge_call_artifacts(
     transcript: str,
     booking_attempts: list[dict[str, Any]] | None,
     amd_verdict: str | None,
+    fit_answers: dict[str, Any] | None = None,
 ) -> bool:
     """Merge call artifacts onto the record in place; return whether anything changed.
 
@@ -333,11 +334,22 @@ def _merge_call_artifacts(
             call_record.booking_attempts = merged_attempts
             changed = True
 
-    if amd_verdict:
+    if amd_verdict or fit_answers:
         # Rebind (never mutate) so SQLAlchemy sees the JSON column change.
         existing_variables = call_record.variables if isinstance(call_record.variables, dict) else {}
-        if existing_variables.get("amd") != amd_verdict:
-            call_record.variables = {**existing_variables, "amd": amd_verdict}
+        updated_variables = dict(existing_variables)
+        variables_changed = False
+        if amd_verdict and existing_variables.get("amd") != amd_verdict:
+            updated_variables["amd"] = amd_verdict
+            variables_changed = True
+        # fit_answers rides the same call-ended payload (it just echoes
+        # record.variables) — this is what lets a call that never reaches
+        # book_appointment still hand the team something real.
+        if fit_answers and existing_variables.get("fit_answers") != fit_answers:
+            updated_variables["fit_answers"] = fit_answers
+            variables_changed = True
+        if variables_changed:
+            call_record.variables = updated_variables
             changed = True
 
     if (call_record.transcript or "").strip() and not call_record.share_token:
@@ -360,6 +372,7 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
     expected_to_number: str | None = None,
     amd_verdict: str | None = None,
     media_finalized: bool = False,
+    fit_answers: dict[str, Any] | None = None,
 ) -> CallRecord | None:
     """Save transcript and sanitized booking diagnostics to the call record.
 
@@ -377,12 +390,20 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
         amd_verdict: Answering-machine verdict for this call (C2), stored under
             variables["amd"] so downstream consumers can see it was a machine
         media_finalized: Whether this save is the terminal media teardown
+        fit_answers: ICP fit answers captured independent of booking, stored
+            under variables["fit_answers"] so a call that never reaches
+            book_appointment still hands the team something real
 
     Returns:
         The matched call record (artifacts now merged), or None when no
         unambiguous record was found.
     """
-    if not transcript.strip() and booking_attempts is None and not media_finalized:
+    if (
+        not transcript.strip()
+        and booking_attempts is None
+        and not media_finalized
+        and not fit_answers
+    ):
         log.debug("empty_call_artifacts_skipped")
         return None
 
@@ -444,7 +465,9 @@ async def save_transcript_to_call_record(  # noqa: PLR0912
             log.warning("call_record_fallback_not_found")
 
     if call_record:
-        changed = _merge_call_artifacts(call_record, transcript, booking_attempts, amd_verdict)
+        changed = _merge_call_artifacts(
+            call_record, transcript, booking_attempts, amd_verdict, fit_answers
+        )
         if media_finalized:
             await stage_media_finalized_call_event(db, call_record, observed_at=datetime.now(UTC))
         if changed or media_finalized:
@@ -671,6 +694,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                     provider="twilio",
                     amd_verdict=amd_state.get("verdict"),
                     media_finalized=True,
+                    fit_answers=realtime_session.get_fit_answers(),
                 )
 
     except WebSocketDisconnect:
@@ -1137,6 +1161,7 @@ async def telnyx_media_stream(  # noqa: PLR0915
                     provider="telnyx",
                     expected_to_number=expected_to_number,
                     media_finalized=True,
+                    fit_answers=realtime_session.get_fit_answers(),
                 )
 
     except WebSocketDisconnect:

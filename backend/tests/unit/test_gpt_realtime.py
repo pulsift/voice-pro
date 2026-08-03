@@ -83,6 +83,22 @@ def test_booking_attempts_delegate_from_session_to_crm_state() -> None:
     session.tool_registry.get_booking_attempts.assert_called_once_with()
 
 
+def test_fit_answers_delegate_from_session_to_crm_state() -> None:
+    answers = {"offer_types": ["rooftop"], "states": ["Texas"]}
+    session = make_session()
+    session.tool_registry = MagicMock()
+    session.tool_registry.get_fit_answers.return_value = answers
+
+    assert session.get_fit_answers() == answers
+    session.tool_registry.get_fit_answers.assert_called_once_with()
+
+
+def test_fit_answers_are_empty_before_the_tool_registry_exists() -> None:
+    session = make_session()
+
+    assert session.get_fit_answers() == {}
+
+
 @pytest.mark.asyncio
 async def test_call_artifacts_persist_booking_attempts_without_transcript() -> None:
     owner_id = uuid.uuid4()

@@ -96,6 +96,69 @@ def test_tool_schema_makes_email_optional_and_select_slot_transcript_free() -> N
     assert "email" not in definitions["book_appointment"]["parameters"]["required"]
     assert definitions["select_slot"]["parameters"]["required"] == ["slot_id"]
     assert set(definitions["select_slot"]["parameters"]["properties"]) == {"slot_id"}
+    assert definitions["record_fit_answers"]["parameters"]["required"] == []
+
+
+# ---------------------------------------------------------------------------
+# record_fit_answers - fit answers persisted independent of booking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_fit_answers_merges_only_the_fields_given() -> None:
+    tools = make_tools()
+
+    first = await tools.record_fit_answers(offer_types=["rooftop", "carports"])
+    assert first == {"success": True, "recorded": True}
+    assert tools.get_fit_answers() == {"offer_types": ["rooftop", "carports"]}
+
+    second = await tools.record_fit_answers(states=["Texas", "Arizona"])
+    assert second == {"success": True, "recorded": True}
+    assert tools.get_fit_answers() == {
+        "offer_types": ["rooftop", "carports"],
+        "states": ["Texas", "Arizona"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_record_fit_answers_never_fabricates_an_unanswered_field() -> None:
+    tools = make_tools()
+
+    result = await tools.record_fit_answers()
+
+    assert result == {"success": True, "recorded": False}
+    assert tools.get_fit_answers() == {}
+
+
+@pytest.mark.asyncio
+async def test_record_fit_answers_rejects_malformed_input_without_recording() -> None:
+    tools = make_tools()
+
+    result = await tools.record_fit_answers(offer_types=["fine", ""])
+
+    assert result["success"] is False
+    assert result["error"] == "invalid_fit_answers"
+    assert tools.get_fit_answers() == {}
+
+
+@pytest.mark.asyncio
+async def test_record_fit_answers_later_call_corrects_an_earlier_one() -> None:
+    tools = make_tools()
+    await tools.record_fit_answers(states=["Nevada"])
+
+    await tools.record_fit_answers(states=["Texas"])
+
+    assert tools.get_fit_answers() == {"states": ["Texas"]}
+
+
+def test_get_fit_answers_returns_an_isolated_copy() -> None:
+    tools = make_tools()
+    tools._fit_answers["offer_types"] = ["rooftop"]  # noqa: SLF001
+
+    snapshot = tools.get_fit_answers()
+    snapshot["offer_types"].append("mutated")
+
+    assert tools.get_fit_answers() == {"offer_types": ["rooftop"]}
 
 
 @pytest.mark.asyncio
