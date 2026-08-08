@@ -38,9 +38,14 @@ HELLO_LINE = "Hello?"
 
 # Behaviours that must survive any future edit of the prompt file. Each one is a
 # real incident or a ratified decision, not a style preference.
+# Each entry is a BEHAVIOUR that must survive any rewrite, pinned to the words
+# that carry it. When a rewrite changes the wording, move the row to the new
+# words — never delete it, because the row IS the behaviour. The 2026-08-08
+# rewrite cut the prompt by two thirds and this gate is what proved nothing
+# load-bearing went with it.
 REQUIRED = (
     "{{availability_block}}",  # the pre-loaded calendar must actually be rendered
-    "Serve what they just said",  # the turn framework
+    "answer that first",  # their words come before the agent's running order
     "Leave settled things settled",  # the anti-re-asking principle
     "Caught you at an okay time?",  # the opener runs to the end
     "select_slot",  # selection gate before booking
@@ -48,13 +53,27 @@ REQUIRED = (
     "It's free",  # consistent answer on the magnet
     "manufacture urgency",  # no fake scarcity — a halal standard, not a preference
     "Never deny being an AI",
+    # Added 2026-08-08. Each is a fault Sami heard on a real call:
+    "Never end a call in silence",  # it booked him in, then dropped the line
+    "Never apologise",  # it apologised for OUR transcription lag
+    "NOT all you have",  # it treated its two opening times as the whole calendar
+    "THEIR words",  # "San Jose" must not come back as "Santa Clara County"
 )
 # Phrases that must NOT come back: each one caused a bad call.
 FORBIDDEN = (
     "the first time or the second",  # nobody talks like that
     "check_availability",  # superseded by the pre-loaded calendar
     "read it back",  # reading an email address aloud on a phone call
+    # Added 2026-08-08: this instruction is what turned the caller's "San Jose"
+    # into the agent's "Santa Clara County" — a normalisation the prompt asked
+    # for, not a fabrication, and the reason the rule is now "THEIR words".
+    "in your own words",
 )
+# NOT forbidden, deliberately: "let me capture that" and "then we'll continue".
+# The prompt names those phrases in order to BAN them, and a substring check
+# cannot tell an instruction from a prohibition. The eval rig's
+# check_no_narrated_tool_calls catches the behaviour itself, which is the thing
+# that matters.
 
 
 def file_prompt() -> str:

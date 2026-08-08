@@ -31,11 +31,16 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import structlog
 from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.services import calcom_client
-from app.services.gpt_realtime import build_instructions_with_language, render_template
+from app.services.gpt_realtime import (
+    GPTRealtimeSession,
+    build_instructions_with_language,
+    render_template,
+)
 from app.services.tools import crm_tools as crm_module
 from app.services.tools.call_control_tools import CallControlTools
 from app.services.tools.crm_tools import CRMTools
@@ -291,6 +296,11 @@ class Conversation:
     def __init__(self, connection: Any, crm: CRMTools) -> None:
         self.connection = connection
         self.crm = crm
+        # Borrowed by _execute_tool so the rig runs the live dead-air rule.
+        # structlog, not stdlib: the borrowed method logs with keyword fields.
+        self._consecutive_waits = 0
+        self.session_id = "eval"
+        self.logger = structlog.get_logger("convo_eval")
         self.events: list[tuple[str, ...]] = []  # ("assistant"|"caller"|"tool", ...)
         self.ended = False
         self._rate_limit_retries = 0
@@ -325,9 +335,16 @@ class Conversation:
         return "\n".join(lines)
 
     async def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if name in CALL_CONTROL_NAMES:
-            return await CallControlTools.execute_tool(name, arguments)
-        return await self.crm.execute_tool(name, arguments)
+        result = (
+            await CallControlTools.execute_tool(name, arguments)
+            if name in CALL_CONTROL_NAMES
+            else await self.crm.execute_tool(name, arguments)
+        )
+        # The dead-air limit lives on the live SESSION, and this rig talks to the
+        # model directly, so without this line the rig runs a system we do not
+        # ship — the exact gap that let `enabled_tools = []` pass 10/10 on
+        # 2026-08-08. Borrow the real method rather than reimplement it.
+        return GPTRealtimeSession._apply_dead_air_limit(self, name, result)  # noqa: SLF001
 
     async def caller_says(self, text: str) -> None:
         """Send one caller turn and drain the agent's reaction (incl. tool hops)."""
@@ -564,10 +581,18 @@ def check_day_probe(convo: Conversation, violations: list[str]) -> None:
     # invent one or go quiet about it.
     if "wednesday at" in joined:
         violations.append("invented a Wednesday time that is not on the calendar")
+    # A phrase whitelist, and it is brittle by nature: "we don't hold Wednesday"
+    # is a perfectly plain denial and failed this check on 2026-08-08 purely for
+    # wording. The substantive guard is the "wednesday at" check above — that one
+    # catches invention, which is the behaviour that actually costs us. Widen the
+    # list when a real transcript denies availability in words a person would use;
+    # do NOT bend the prompt to satisfy the phrasing.
     if "wednesday" in joined and not any(
         marker in joined
-        for marker in ("nothing", "not got", "haven't got", "don't have", "no wednesday",
-                       "afraid", "nothing on wednesday", "isn't", "not free", "no openings")
+        for marker in ("nothing", "not got", "haven't got", "don't have", "don't hold",
+                       "do not hold", "no wednesday", "afraid", "nothing on wednesday",
+                       "isn't", "not free", "no openings", "can't do", "cannot do",
+                       "nothing free", "not available", "unavailable")
     ):
         violations.append("did not say plainly that Wednesday is unavailable")
 

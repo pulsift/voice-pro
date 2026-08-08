@@ -104,6 +104,11 @@ _OPENER_RESPONSE_INDEX = 2
 _HELD_AUDIO_MAX_BYTES = 8000 * 15
 _HELD_FLUSH_TAIL_BYTES = 8000 * 3
 
+# How many `wait_for_user` calls in a row mean the LINE is broken rather than the
+# caller being briefly quiet. One stray noise deserves silence; two running does
+# not — see _apply_dead_air_limit.
+DEAD_AIR_WAIT_LIMIT = 2
+
 
 def render_template(template: str, variables: dict[str, Any] | None) -> str:
     """Fill {{placeholders}} in the agent prompt from per-call variables.
@@ -240,6 +245,12 @@ class GPTRealtimeSession:
         self.connection: Any = None
         self.tool_registry: ToolRegistry | None = None
         self.client: AsyncOpenAI | None = None
+        # Consecutive `wait_for_user` calls — the caller has given us nothing
+        # usable this many turns running. Counted HERE rather than asked of the
+        # model, because "twice in a row" is arithmetic: the prompt has carried
+        # that rule in prose for weeks and on 2026-08-08 the agent still went
+        # quiet three times running on an unusable line and never hung up.
+        self._consecutive_waits: int = 0
         # Transcript accumulation
         self._transcript_entries: list[TranscriptEntry] = []
         self._current_assistant_text: str = ""
@@ -507,6 +518,48 @@ class GPTRealtimeSession:
 
         return result
 
+    def _apply_dead_air_limit(self, name: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Close a call the line has made unusable, instead of waiting forever.
+
+        `wait_for_user` is how the agent stays quiet through a stray noise, and
+        that is right once. Twice running with nothing usable in between means
+        the LINE is the problem, not the person — at which point silence is the
+        worst possible answer: the caller hears dead air and we hold a billed leg
+        open until the bridge times out.
+
+        The prompt has carried this rule in prose for weeks. It does not hold,
+        because it asks the model to count, and on 2026-08-08 the agent called
+        `wait_for_user` three times in a row on a garbled line and never hung up.
+        Counting is arithmetic, so it moves here; the model keeps only the words.
+
+        Any other tool firing means the caller gave us something real, so the
+        count resets.
+        """
+        if name != "wait_for_user":
+            self._consecutive_waits = 0
+            return result
+
+        self._consecutive_waits += 1
+        if self._consecutive_waits < DEAD_AIR_WAIT_LIMIT:
+            return result
+
+        self.logger.info(
+            "dead_air_limit_reached",
+            consecutive_waits=self._consecutive_waits,
+            session_id=self.session_id,
+        )
+        self._consecutive_waits = 0
+        return {
+            **result,
+            "dead_air_limit_reached": True,
+            "message": (
+                "The line has given you nothing usable twice running, so it is "
+                "the connection at fault, not them. Do not ask again. Say it "
+                "seems to be breaking up and that we will email them today to "
+                "get them set, then one goodbye, then end_call."
+            ),
+        }
+
     async def handle_function_call_event(self, event: Any) -> dict[str, Any]:
         """Handle function call from GPT Realtime.
 
@@ -545,6 +598,7 @@ class GPTRealtimeSession:
 
         # Execute tool via internal tool registry
         result = await self.handle_tool_call({"name": name, "arguments": arguments})
+        result = self._apply_dead_air_limit(name, result)
 
         # Send result back using SDK
         if self.connection:
@@ -557,8 +611,10 @@ class GPTRealtimeSession:
             )
             # Trigger GPT to generate a response after the function call.
             # wait_for_user is the official noise/silence no-op: forcing a
-            # response here would defeat it, so stay silent instead.
-            if name != "wait_for_user":
+            # response here would defeat it, so stay silent instead — UNLESS the
+            # line has now been unusable too many turns running, in which case
+            # staying silent IS the failure and the agent has to close the call.
+            if name != "wait_for_user" or result.get("dead_air_limit_reached"):
                 await self.connection.response.create()
 
         self.logger.info(
