@@ -802,6 +802,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
             opening.arm_fallback_start()
             event_count = 0
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
+            farewell_pending = False  # the closing line comes in the response AFTER end_call
 
             async def _classify_answerer(first_utterance: str) -> None:
                 # C2: the callee's first words say whether a person picked up. On a
@@ -906,6 +907,12 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     if result.get("action") == "end_call":
                         log.info("end_call_action_received", reason=result.get("reason"))
                         pending_end_call = True
+                        # Handling the call already asked for one more response,
+                        # and that is where the goodbye lives now that tools are
+                        # called before the agent speaks. Hanging up on the
+                        # response that merely CARRIED end_call would end the
+                        # call on silence.
+                        farewell_pending = True
 
                 # Capture transcript events
                 elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -958,6 +965,10 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     else:
                         log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
+                        if farewell_pending:
+                            farewell_pending = False
+                            log.info("waiting_for_farewell_before_hangup")
+                            continue
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break
@@ -1251,6 +1262,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                 return
 
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
+            farewell_pending = False  # the closing line comes in the response AFTER end_call
             opening.arm_fallback_start()
 
             async for event in realtime_session.connection:
@@ -1299,6 +1311,12 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     if result.get("action") == "end_call":
                         log.info("end_call_action_received", reason=result.get("reason"))
                         pending_end_call = True
+                        # Handling the call already asked for one more response,
+                        # and that is where the goodbye lives now that tools are
+                        # called before the agent speaks. Hanging up on the
+                        # response that merely CARRIED end_call would end the
+                        # call on silence.
+                        farewell_pending = True
 
                 # Capture transcript events
                 elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -1331,6 +1349,10 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     await opening.response_finished(_response_id(event))
                     log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
+                        if farewell_pending:
+                            farewell_pending = False
+                            log.info("waiting_for_farewell_before_hangup")
+                            continue
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break

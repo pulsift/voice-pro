@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -185,6 +186,17 @@ def install_fakes() -> None:
         if hasattr(module, "schedule_fulfilment_webhook"):
             module.schedule_fulfilment_webhook = lambda _payload: None
 
+    # The promised-list outbox is a REAL database write that happens before any
+    # Cal.com call. Unfaked, every booking died as `fulfilment_unavailable` on a
+    # refused connection to a database this rig has no business touching — so
+    # `check_booked` failed on every scenario for reasons that had nothing to do
+    # with the conversation, and the one invariant that matters most (never claim
+    # booked before the tool succeeds) was never actually exercised.
+    crm_module.stage_fulfilment_intent = AsyncMock(return_value="eval-intent-key")
+    crm_module.claim_fulfilment_booking = AsyncMock(return_value=uuid.uuid4())
+    crm_module.authorize_fulfilment_booking = AsyncMock(return_value=True)
+    crm_module.finalize_fulfilment_intent = AsyncMock(return_value=True)
+
 
 def load_instructions(prompt_file: Path, menu: dict[str, Any]) -> str:
     """Render the prompt exactly as the live session does, menu included."""
@@ -214,6 +226,13 @@ class Conversation:
         self.events: list[tuple[str, ...]] = []  # ("assistant"|"caller"|"tool", ...)
         self.ended = False
         self._rate_limit_retries = 0
+        # Item order inside each model response. A response holding BOTH a
+        # spoken message and a function call is where "I'll check that time and
+        # then..." comes from: the model speaks, calls the tool, and we then ask
+        # for a SECOND response that says the real thing. Two utterances, one of
+        # them pure narration. The order tells us whether it can be cut before
+        # the caller ever hears it.
+        self.response_shapes: list[list[str]] = []
 
     @property
     def assistant_texts(self) -> list[str]:
@@ -223,7 +242,14 @@ class Conversation:
         lines = []
         for e in self.events:
             if e[0] == "tool":
-                lines.append(f"  [tool] {e[1]} -> success={e[2]}")
+                line = f"  [tool] {e[1]} -> success={e[2]}"
+                if not e[2]:
+                    # A refused tool is the most important line in the whole
+                    # transcript and it used to print as a bare "False".
+                    result = e[3] if len(e) > 3 else {}
+                    detail = result.get("error") or result.get("message") or result
+                    line += f"  ({str(detail)[:200]})"
+                lines.append(line)
             elif e[0] == "debug":
                 lines.append(f"  [debug] {e[1]}")
             else:
@@ -278,6 +304,16 @@ class Conversation:
             elif event_type == "response.done":
                 open_responses -= 1
                 response = getattr(event, "response", None)
+                shape = [
+                    (str(getattr(i, "type", "?")), str(getattr(i, "name", "") or ""))
+                    for i in (getattr(response, "output", None) or [])
+                ]
+                if shape:
+                    self.response_shapes.append(shape)
+                    if len(shape) > 1:
+                        readable = [f"{kind}:{name}" if name else kind
+                                    for kind, name in shape]
+                        self.events.append(("debug", f"response items in order: {readable}"))
                 extracted = False
                 for item in getattr(response, "output", None) or []:
                     if getattr(item, "type", "") != "message":
@@ -351,6 +387,39 @@ def strip_intent(text: str) -> str:
     return " ".join(kept)
 
 
+# Tools whose result the caller is waiting on. Speaking before one of these
+# produces the turn Sami heard on his own call: a promise ("I'll check that time
+# and then we'll do two quick fit details"), the tool, and then the real sentence.
+# end_call and wait_for_user are exempt: "take care" followed by a hang-up is one
+# turn, not two, and it is exactly what we want.
+SILENT_TOOLS = {
+    "select_slot",
+    "record_fit_answers",
+    "book_appointment",
+    "refresh_availability",
+}
+
+
+def check_no_narrated_tool_calls(convo: Conversation, violations: list[str]) -> None:
+    """No speaking before a tool the caller is waiting on.
+
+    Read off the model's own response items rather than off the words, because
+    the tell is structural: one response holding a message AND a function call
+    always becomes two spoken turns once we feed the result back.
+    """
+    for shape in convo.response_shapes:
+        spoke_first = False
+        for kind, name in shape:
+            if kind == "message":
+                spoke_first = True
+            elif kind == "function_call" and spoke_first and name in SILENT_TOOLS:
+                violations.append(
+                    f"narrated {name} before calling it (response items: "
+                    f"{[f'{k}:{n}' if n else k for k, n in shape]})"
+                )
+                break
+
+
 def check_common(convo: Conversation, violations: list[str]) -> None:
     texts = [normalize_spoken(t) for t in convo.assistant_texts]
     if not texts:
@@ -372,6 +441,7 @@ def check_common(convo: Conversation, violations: list[str]) -> None:
         for phrase in FORBIDDEN_SPOKEN:
             if phrase in low:
                 violations.append(f"tech leakage {phrase!r} in: {text[:100]!r}")
+    check_no_narrated_tool_calls(convo, violations)
     # "booked"-style claims must come only after a successful create tool event.
     create_seen = False
     for e in convo.events:

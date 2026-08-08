@@ -886,7 +886,12 @@ class CRMTools:
             {
                 "type": "function",
                 "name": "select_slot",
-                "description": "Lock in one of your listed times, after the lead clearly names it. Pass the id shown next to that time.",
+                "description": (
+                    "Lock in one of your listed times, after the lead clearly names it. Pass "
+                    "the id shown next to that time. Call it as the FIRST thing you do on that "
+                    "turn, with nothing spoken before it: it answers instantly and you speak "
+                    "the moment it does, so the lead hears no gap and needs no warning."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -908,7 +913,9 @@ class CRMTools:
                     "even if the call ends before booking. Call it again for anything they add or "
                     "correct later; it adds to what is already saved, never wipes it out. Only pass "
                     "a field they actually answered - never guess or fill in one they did not "
-                    "address."
+                    "address. Call it as the FIRST thing you do on that turn, with nothing spoken "
+                    "before it: it answers instantly and you speak the moment it does, so the "
+                    "lead hears no gap and needs no warning."
                 ),
                 "parameters": {
                     "type": "object",
@@ -937,7 +944,10 @@ class CRMTools:
                 "description": (
                     "Book the selected appointment after select_slot succeeds and the ICP fit check "
                     "is captured. The attendee name and email on file are filled automatically; pass "
-                    "email only if the lead volunteers a correction. Pass the exact selected start."
+                    "email only if the lead volunteers a correction. Pass the exact selected start. "
+                    "Call it as the FIRST thing you do on that turn, with nothing spoken before it: "
+                    "it answers instantly and you speak the moment it does, so the lead hears no "
+                    "gap and needs no warning. Nothing about the booking is true until it returns."
                 ),
                 "parameters": {
                     "type": "object",

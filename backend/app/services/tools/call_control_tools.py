@@ -51,9 +51,11 @@ class CallControlTools:
                 "type": "function",
                 "name": "end_call",
                 "description": (
-                    "End the current phone call. Use this when the conversation is complete, "
-                    "the caller wants to hang up, or you've said goodbye. Always say a brief "
-                    "farewell before calling this function."
+                    "End the current phone call. Use this when the conversation is complete "
+                    "or the caller wants to hang up. Your closing line is still spoken after "
+                    "this - the line does not drop until you have finished speaking - so "
+                    "either say the farewell first or call this and then say it. One line "
+                    "either way, and never two goodbyes."
                 ),
                 "parameters": {
                     "type": "object",
