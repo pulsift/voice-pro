@@ -233,15 +233,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
         logger.exception("Error closing database connections")
 
 
+# The interactive docs and the schema behind them are open to anyone, which is
+# the fork's default. On our deployment that publishes every endpoint, parameter
+# and webhook path of a service that dials real people — probed live on
+# 2026-08-08 and it answered. Nobody outside this laptop has a reason to read it,
+# so it is off in production and on everywhere else, where it is genuinely useful.
+_public_docs = settings.APP_ENVIRONMENT != "production"
+
 # Create FastAPI app
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     debug=settings.DEBUG,
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    docs_url="/docs" if _public_docs else None,
+    redoc_url="/redoc" if _public_docs else None,
+    openapi_url="/openapi.json" if _public_docs else None,
 )
 
 # Add rate limiting
