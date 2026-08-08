@@ -29,6 +29,7 @@ from app.models.campaign import (
     CampaignStatus,
 )
 from app.models.contact import Contact
+from app.services.operator_alerts import stage_operator_alert
 from app.services.telephony.telnyx_service import TelnyxService, is_unknown_telnyx_dial_outcome
 from app.services.telephony.twilio_service import (
     TwilioDialOutcomeUnknownError,
@@ -351,6 +352,31 @@ class CampaignWorker:
             return _twilio()
         return None
 
+    @staticmethod
+    async def _caller_id_is_owned(campaign: Campaign, db: AsyncSession) -> bool:
+        """Is this campaign's caller ID still a number we have registered?
+
+        Ownership is the security property; workspace is an extra constraint and
+        only applied when the campaign actually has one. Demanding a workspace
+        unconditionally is what made the manual-call gate refuse every call on
+        2026-08-03 in this single-tenant deployment.
+        """
+        from app.models.phone_number import PhoneNumber
+
+        from_number = (campaign.from_phone_number or "").strip()
+        if not from_number:
+            return False
+        # Both columns are already UUIDs here — no int-to-UUID hashing, which is
+        # only for the models that store user_id as an integer.
+        conditions = [
+            PhoneNumber.phone_number == from_number,
+            PhoneNumber.user_id == campaign.user_id,
+        ]
+        if campaign.workspace_id is not None:
+            conditions.append(PhoneNumber.workspace_id == campaign.workspace_id)
+        result = await db.execute(select(PhoneNumber.id).where(*conditions).limit(1))
+        return result.scalar_one_or_none() is not None
+
     async def _initiate_call(
         self,
         campaign: Campaign,
@@ -373,6 +399,31 @@ class CampaignWorker:
             contact_id=contact.id,
             phone=contact.phone_number,
         )
+
+        # A campaign stores its caller ID as a bare string, so it can outlive the
+        # number itself: released, reassigned, mistyped, or moved to another
+        # workspace. Manual calls have been gated on ownership since 2026-08-03;
+        # this path was not, and handed the raw value to the carrier AFTER the
+        # contact had already been marked as calling. Fail closed instead, and
+        # say so in words rather than only in the logs.
+        if not await self._caller_id_is_owned(campaign, db):
+            log.error(
+                "campaign_caller_id_not_owned", from_number=campaign.from_phone_number
+            )
+            campaign_contact.status = CampaignContactStatus.FAILED.value
+            campaign_contact.last_call_outcome = CallStatus.FAILED.value
+            campaign_contact.last_attempt_at = datetime.now(UTC)
+            await stage_operator_alert(
+                db,
+                dedup_key=f"campaign-caller-id:{campaign.id}:{campaign.from_phone_number}",
+                message=(
+                    f"Campaign '{campaign.name}' is set to call from a number that is "
+                    "no longer one of ours, so its calls are stopped. Pick a "
+                    "registered number for it."
+                ),
+            )
+            await db.commit()
+            return
 
         # Build webhook URL for when call is answered
         provider = "telnyx" if isinstance(telephony_service, TelnyxService) else "twilio"
