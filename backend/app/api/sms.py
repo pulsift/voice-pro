@@ -10,15 +10,16 @@ into the same `sms_messages` table so the thread view stays provider-agnostic.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.base.exceptions import TwilioException, TwilioRestException
+from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 
 from app.api.settings import get_user_api_keys
@@ -39,6 +40,52 @@ logger = structlog.get_logger()
 # row is a config error and is rejected with a 400 (never a 500 at send time).
 SMS_SEND_PROVIDERS = ("telnyx", "twilio")
 DEFAULT_SMS_PROVIDER = "telnyx"
+
+
+def _twilio_webhook_url(path: str) -> str:
+    """The URL Twilio SIGNED, which is not the URL this process sees.
+
+    Railway terminates TLS, so `request.url` inside the app reports `http://` and
+    can carry an internal host. Rebuilding the signed string from it fails EVERY
+    signature — which looks exactly like the security working while every inbound
+    message is silently refused. X-Forwarded-* is not the fix either: it is
+    caller-controlled, so trusting it to validate a signature is circular.
+
+    The canonical public origin is configuration, and it is already set in
+    production for the transcript share links.
+    """
+    base = (settings.PUBLIC_BASE_URL or settings.PUBLIC_URL or "").rstrip("/")
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="PUBLIC_BASE_URL is not configured; cannot verify Twilio signatures",
+        )
+    return f"{base}{path}"
+
+
+def _verify_twilio_signature(request: Request, params: dict[str, str]) -> None:
+    """Refuse anything Twilio did not sign.
+
+    The HMAC key is the account's classic Auth Token specifically — an API-key
+    secret does not validate. Validation covers EVERY received parameter, never a
+    hand-picked list: Twilio adds parameters without notice, and an allowlist
+    starts rejecting real messages the day they do.
+    """
+    token = settings.TWILIO_AUTH_TOKEN
+    if not token:
+        raise HTTPException(
+            status_code=503, detail="Twilio auth token is not configured"
+        )
+    signature = request.headers.get("X-Twilio-Signature", "")
+    url = _twilio_webhook_url(request.url.path)
+    if not RequestValidator(token).validate(url, params, signature):
+        logger.warning(
+            "twilio_webhook_signature_rejected",
+            path=request.url.path,
+            has_signature=bool(signature),
+            param_count=len(params),
+        )
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -205,6 +252,64 @@ class SendSmsRequest(BaseModel):
 # =============================================================================
 # Inbound webhook
 # =============================================================================
+
+
+@webhook_router.post("/twilio/sms")
+async def twilio_inbound_sms(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Receive inbound SMS on the Twilio number.
+
+    This closes a hole that has been open, silently, for as long as the number
+    has existed: `+16693694746` is the caller ID the voice agent dials prospects
+    from, and its `sms_url` at Twilio was never set. A prospect who sees a missed
+    call and texts back reaches nothing — Twilio accepts the message and drops
+    it. Nobody sees it and nobody is told.
+
+    Receiving needs no A2P 10DLC registration; only US-bound SENDING does. So
+    this is safe to ship on its own, ahead of any decision about which number
+    Sami texts from.
+
+    Twilio expects TwiML or an empty 204. A JSON body makes it log warning 12300
+    on every single message, which pollutes the very debugger you read when a
+    webhook misbehaves.
+    """
+    form = await request.form()
+    params = {key: str(value) for key, value in form.items()}
+    _verify_twilio_signature(request, params)
+
+    provider_message_id = params.get("MessageSid") or params.get("SmsSid")
+    if provider_message_id:
+        # Twilio retries on any non-2xx or timeout, so a repeat is ordinary
+        # traffic rather than an error.
+        existing = await db.scalar(
+            select(SmsMessage).where(SmsMessage.provider_message_id == provider_message_id)
+        )
+        if existing:
+            return Response(status_code=204)
+
+    msg = SmsMessage(
+        provider="twilio",
+        provider_message_id=provider_message_id,
+        direction="inbound",
+        from_number=params.get("From"),
+        to_number=params.get("To"),
+        text=params.get("Body"),
+        messaging_profile_id=params.get("MessagingServiceSid"),
+        num_media=int(params.get("NumMedia") or 0),
+        raw=params,
+        received_at=datetime.now(UTC),
+    )
+    db.add(msg)
+    await db.commit()
+    logger.info(
+        "sms_inbound_stored",
+        provider="twilio",
+        from_number=params.get("From"),
+        to_number=params.get("To"),
+    )
+    return Response(status_code=204)
 
 
 @webhook_router.post("/telnyx/sms")

@@ -159,6 +159,35 @@ def fake_slots() -> list[dict[str, str]]:
     ]
 
 
+def four_day_slots() -> list[dict[str, str]]:
+    """Monday to Thursday, four openings a day — the shape of a REAL calendar.
+
+    The shared `fake_slots` holds Tuesday and Friday only, so every day it has is
+    also a day it offers, and the 2026-08-08 live failure cannot happen in it.
+    On that call the agent held sixteen slots including four on Wednesday, was
+    asked for Wednesday, and said "I don't have Wednesday at midday in the pair I
+    offered" — treating its two opening times as its whole calendar. Reproducing
+    that needs a day the calendar HOLDS but did not open with.
+    """
+    now = datetime.now(UTC)
+
+    def fmt(moment: datetime) -> str:
+        return moment.isoformat().replace("+00:00", "Z")
+
+    def next_weekday(target: int) -> datetime:
+        ahead = (target - now.weekday()) % 7 or 7
+        return now + timedelta(days=ahead)
+
+    slots: list[dict[str, str]] = []
+    for weekday in (0, 1, 2, 3):  # Monday .. Thursday
+        day = next_weekday(weekday)
+        for hour in (6, 9, 12, 16):  # 09:00 / 12:00 / 15:00 / 19:00 Damascus
+            slots.append(
+                {"start": fmt(day.replace(hour=hour, minute=0, second=0, microsecond=0))}
+            )
+    return slots
+
+
 def eval_menu() -> dict[str, Any]:
     """The pre-loaded menu the production bridge builds before the call starts."""
     from app.services.availability import build_menu
@@ -566,6 +595,36 @@ def check_booked_no_wednesday(convo: Conversation, violations: list[str]) -> Non
             violations.append(f"invented a Wednesday time: {text[:100]!r}")
 
 
+def check_offers_a_held_day(convo: Conversation, violations: list[str]) -> None:
+    """A day the calendar HOLDS must be offered, even if it was not opened with.
+
+    The failure being pinned: the agent treats its two opening times as its whole
+    calendar and denies a day it can plainly see. Denying a day we hold is worse
+    than useless — it costs the booking and reads as arguing.
+    """
+    texts = [normalize_spoken(t) for t in convo.assistant_texts]
+    joined = " ".join(texts)
+    wednesday_reply = next((t for t in texts if "wednesday" in t), "")
+
+    if not wednesday_reply:
+        violations.append("never answered the Wednesday question at all")
+        return
+    for denial in ("don't have", "do not have", "don't hold", "nothing on wednesday",
+                   "no wednesday", "not available", "nothing wednesday"):
+        if denial in joined:
+            violations.append(
+                f"denied a day the calendar HOLDS: {wednesday_reply[:140]!r}"
+            )
+            break
+    if not any(word in wednesday_reply for word in
+               ("nine", "midday", "three", "seven", "morning", "afternoon", "evening")):
+        violations.append(
+            f"named Wednesday but offered no actual Wednesday time: "
+            f"{wednesday_reply[:140]!r}"
+        )
+    check_booked(convo, violations)
+
+
 def check_day_probe(convo: Conversation, violations: list[str]) -> None:
     """A named day must be ANSWERED from the calendar, both ways round."""
     check_booked(convo, violations)
@@ -718,6 +777,29 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r".", ["Okay."]),
         ],
         "final": check_vague_then_pick,
+    },
+    "day_we_hold_but_did_not_offer": {
+        # SAMI'S LIVE FAILURE, 2026-08-08. The agent held four Wednesday slots,
+        # was asked for Wednesday, and answered "I don't have Wednesday at midday
+        # in the pair I offered" — its two opening times had become, in its head,
+        # the whole calendar. He then had to be talked back to a time he had not
+        # asked for. This is the scenario that would have caught it.
+        "slots": four_day_slots,
+        "rules": [
+            (r"okay time|caught you|good time", ["Yeah, go ahead."]),
+            (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
+                "Mostly rooftop."
+            ]),
+            (r"states|areas|cover", ["Northern California."]),
+            (OFFER_PATTERN, [
+                "What about Wednesday?",
+                "Wednesday at three then.",
+                "Yeah, Wednesday at three in the afternoon.",
+            ]),
+            (r"you're set|invite|anything else|booked", ["Great, thanks, bye."]),
+            (r".", ["Okay."]),
+        ],
+        "final": check_offers_a_held_day,
     },
     "wednesday_probe": {
         # Rules-mode: the caller answers whatever the agent actually asked, so
@@ -901,12 +983,23 @@ async def drive_rules_caller(convo: Conversation, spec: dict[str, Any]) -> None:
 
 async def run_scenario(
     client: AsyncOpenAI,
-    instructions: str,
+    prompt_file: Path,
     name: str,
     spec: dict[str, Any],
     menu: dict[str, Any],
     tools: list[dict[str, Any]],
 ) -> tuple[bool, str]:
+    # A scenario may bring its OWN calendar. The shared one holds Tuesday and
+    # Friday, so every day it has is also a day it offers — which makes the real
+    # 2026-08-08 failure impossible to reproduce here: the agent held sixteen
+    # slots including four on Wednesday, was asked for Wednesday, and answered
+    # "I don't have Wednesday in the pair I offered". Reproducing that needs a
+    # third day, so the menu and the rendered prompt are built per scenario.
+    if spec.get("slots"):
+        from app.services.availability import build_menu
+
+        menu = build_menu(spec["slots"](), VARS["tzName"])
+    instructions = load_instructions(prompt_file, menu)
     crm = CRMTools(db=MagicMock(), user_id=1, variables=dict(VARS))
     # The production bridge pre-loads the calendar before the caller speaks; the
     # eval must start from the same state or it tests a system we do not ship.
@@ -979,14 +1072,13 @@ async def main() -> int:
 
     install_fakes()
     menu = eval_menu()
-    instructions = load_instructions(args.prompt_file, menu)
     client = AsyncOpenAI(api_key=get_api_key())
 
     names = args.only or list(SCENARIOS)
     results: dict[str, bool] = {}
     for name in names:
         passed, report = await run_scenario(
-            client, instructions, name, SCENARIOS[name], menu, tools
+            client, args.prompt_file, name, SCENARIOS[name], menu, tools
         )
         results[name] = passed
         print(report, flush=True)
