@@ -53,7 +53,7 @@ def test_direct_mode_posts_only_compiled_seed_payload(
         "method": "POST",
         "body": {
             "to_number": "+963998183191",
-            "from_number": "+14086649020",
+            "from_number": seeded_call.DIRECT_FROM_NUMBER,
             "agent_id": "06a42ae8-6169-4055-a752-8ef561d8d2aa",
             "variables": dict(seeded_call.DIRECT_TEST_VARIABLES),
         },

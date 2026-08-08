@@ -60,69 +60,71 @@ def test_masked_phone_shows_only_last_four() -> None:
     assert ops_common.masked_phone("+963998183191") == "***3191"
 
 
-def test_temp_workflows_disable_all_execution_data() -> None:
-    assert ops_common.no_execution_data_settings() == {
-        "saveDataErrorExecution": "none",
-        "saveDataSuccessExecution": "none",
-        "saveExecutionProgress": False,
-        "saveManualExecutions": False,
-    }
-
-
-def test_temp_workflow_delete_failure_is_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_n8n(
-        path: str, *, method: str = "GET", body: object | None = None
-    ) -> object:
-        del body
-        if path == "/api/v1/workflows" and method == "POST":
-            return {"id": "temp-id"}
-        if path == "/api/v1/workflows/temp-id" and method == "DELETE":
-            raise ops_common.OpsError("delete failed")
-        return {}
-
-    monkeypatch.setattr(ops_common, "n8n_api", fake_n8n)
-    monkeypatch.setattr(ops_common, "request_json", lambda *args, **kwargs: (200, {}))
-    monkeypatch.setattr(ops_common.time, "sleep", lambda _: None)
-    with pytest.raises(ops_common.OpsError, match="FATAL.*cleanup failed"):
-        ops_common.run_temporary_workflow(
-            name="test",
-            hook_path="test-hook",
-            nodes=[],
-            connections={},
-        )
-
-
-def test_kill_read_is_narrow_and_never_queries_whole_config(
+def test_kill_read_asks_the_router_and_never_puts_the_token_in_the_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(**kwargs: object) -> object:
+    def fake_request(url: str, **kwargs: object) -> tuple[int, object]:
+        captured["url"] = url
         captured.update(kwargs)
-        return [{"paused": True}]
+        return 200, {"ok": True, "kill_switch": True, "changed_at": "2026-08-08T04:00:00Z"}
 
-    monkeypatch.setattr(ops_common, "run_temporary_workflow", fake_run)
-    assert ops_common.read_kill_state() is True
-    serialized = repr(captured)
-    assert "jsonb_object_agg" not in serialized
-    assert "kill_switch" in serialized
-    assert "kill_token" not in serialized
+    monkeypatch.setattr(ops_common, "request_json", fake_request)
+    monkeypatch.setattr(ops_common, "user_env", lambda _name: "tok")
+
+    assert ops_common.kill_state() == (True, "2026-08-08T04:00:00Z")
+    assert captured["url"].endswith("/api/v1/killswitch")
+    assert "tok" not in str(captured["url"]), "the token must never travel in a URL"
+    assert captured["headers"] == {"X-Kill-Token": "tok"}
 
 
-def test_seeded_forge_keeps_hmac_inside_n8n(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_refused_router_call_is_an_error_not_a_silent_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`{"ok": false}` comes back with HTTP 200. Reading only the status would
+    turn a refused kill-switch read into "calls are running"."""
+    monkeypatch.setattr(
+        ops_common, "request_json",
+        lambda *a, **k: (200, {"ok": False, "error": "token_mismatch"}),
+    )
+    monkeypatch.setattr(ops_common, "user_env", lambda _name: "tok")
+    with pytest.raises(ops_common.OpsError, match="token_mismatch"):
+        ops_common.kill_paused()
+
+
+def test_setting_the_kill_switch_verifies_the_state_it_got_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ops_common, "request_json",
+        lambda *a, **k: (200, {"ok": True, "kill_switch": False}),
+    )
+    monkeypatch.setattr(ops_common, "user_env", lambda _name: "tok")
+    with pytest.raises(ops_common.OpsError, match="wrong state"):
+        ops_common.set_kill_switch(paused=True)
+
+
+def test_the_seed_never_signs_anything_on_this_laptop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(**kwargs: object) -> object:
+    def fake_request(url: str, **kwargs: object) -> tuple[int, object]:
+        captured["url"] = url
         captured.update(kwargs)
-        return [{"accepted": True, "conversation_id": "cid"}]
+        return 200, {"conversation_id": "seed-abc123", "outcome": {"action": "placed"}}
 
-    monkeypatch.setattr(ops_common, "run_temporary_workflow", fake_run)
-    assert ops_common.forge_seeded_reply() == "cid"
-    serialized = repr(captured)
-    assert "jsonb_object_agg" not in serialized
-    assert "sendkit_hmac_positive" in serialized
-    assert "Sign Internally" in serialized
-    assert "secret" not in repr(captured.get("connections"))
+    monkeypatch.setattr(ops_common, "request_json", fake_request)
+    monkeypatch.setattr(ops_common, "user_env", lambda _name: "tok")
+
+    assert ops_common.forge_seeded_reply() == "seed-abc123"
+    assert captured["url"].endswith("/api/v1/ops/seed-positive")
+    body = captured["body"]
+    assert isinstance(body, dict)
+    # Only WHO to seed leaves this machine. No secret, no signature, and no
+    # conversation id we could get wrong — the router prefixes that itself.
+    assert set(body) == {"lead_id", "lead_email", "reply_text"}
 
 
 def test_prompt_failed_verification_auto_rolls_back(

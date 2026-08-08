@@ -15,7 +15,7 @@ from ops_common import (
     SENDKIT,
     TEST_CAMPAIGN_ID,
     OpsError,
-    kill_paused,
+    kill_state,
     request_json,
     user_env,
 )
@@ -106,8 +106,9 @@ def main() -> int:
     if test:
         print(f"test_campaign id={test[0]} status={test[2]} name={test[1]}")
 
-    paused = kill_paused()
+    paused, kill_changed_at = kill_state()
     print(f"kill_switch_on={str(paused).lower()}")
+    print(f"kill_switch_changed_at={kill_changed_at or 'not-since-stamping-began'}")
     try:
         lead_phone = seeded_lead_phone()
     except OpsError:

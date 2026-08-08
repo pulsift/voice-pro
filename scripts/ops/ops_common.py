@@ -5,11 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +18,7 @@ except ImportError:  # pragma: no cover - Windows is the production operator hos
 
 BACKEND = "https://backend-production-7d1e.up.railway.app"
 FULFILMENT = "https://pulsift-fulfilment-production.up.railway.app"
-N8N = "https://n8n-production-2e51.up.railway.app"
+ROUTER = "https://reply-router-production.up.railway.app"
 RAILWAY_GRAPHQL = "https://backboard.railway.com/graphql/v2"
 CALCOM = "https://api.cal.com/v2"
 SENDKIT = "https://api.sendkit.ai"
@@ -233,126 +231,47 @@ def current_variables() -> dict[str, str]:
     return {str(key): str(value) for key, value in values.items()}
 
 
-def n8n_api(path: str, *, method: str = "GET", body: object | None = None) -> Any:
+def router_request(
+    path: str, *, method: str = "GET", body: object | None = None
+) -> Any:
+    """Call the reply router's operator API with the shared kill token.
+
+    Reading the kill switch, moving it, and forging a seeded reply all used to
+    run inside a throwaway n8n workflow, so the HMAC and the database
+    credentials never reached this laptop. n8n was retired on 2026-08-03 and
+    took the mechanism with it, which left `safety_status` and `seeded_call`
+    broken without either of them saying so.
+
+    The router keeps the same property with an endpoint instead of a workflow:
+    the signing secret stays server-side, and the seed's conversation id is
+    test-prefixed by the server rather than by whoever remembers to.
+    """
     status, payload = request_json(
-        N8N + path,
+        ROUTER + path,
         method=method,
         body=body,
-        headers={"X-N8N-API-KEY": user_env("N8N_API_KEY")},
+        headers={"X-Kill-Token": user_env("ROUTER_KILL_TOKEN")},
+        timeout=90,
     )
-    require_status(status, {200, 201, 204}, f"n8n {method} {path}")
+    require_status(status, {200}, f"router {method} {path}")
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        raise OpsError(f"router {method} {path} refused: {payload.get('error')}")
     return payload
 
 
-def no_execution_data_settings() -> dict[str, object]:
-    """n8n settings that prevent temporary workflow payload persistence."""
-    return {
-        "saveDataErrorExecution": "none",
-        "saveDataSuccessExecution": "none",
-        "saveExecutionProgress": False,
-        "saveManualExecutions": False,
-    }
-
-
-def run_temporary_workflow(
-    *,
-    name: str,
-    hook_path: str,
-    nodes: list[dict[str, object]],
-    connections: dict[str, object],
-) -> Any:
-    """Run a no-history workflow and fail fatally if it cannot be deleted."""
-    workflow = {
-        "name": name,
-        "nodes": nodes,
-        "connections": connections,
-        "settings": no_execution_data_settings(),
-    }
-    created = n8n_api("/api/v1/workflows", method="POST", body=workflow)
-    workflow_id = str(created.get("id") or "") if isinstance(created, dict) else ""
-    if not workflow_id:
-        raise OpsError("n8n did not return a temporary workflow ID")
-    result: Any = None
-    primary_error: Exception | None = None
-    try:
-        n8n_api(f"/api/v1/workflows/{workflow_id}/activate", method="POST")
-        time.sleep(2)
-        status, result = request_json(f"{N8N}/webhook/{hook_path}", timeout=60)
-        require_status(status, {200}, "temporary n8n operation")
-    except Exception as exc:  # cleanup must run for every failure mode
-        primary_error = exc
-    try:
-        try:
-            n8n_api(f"/api/v1/workflows/{workflow_id}/deactivate", method="POST")
-        except OpsError:
-            pass
-        n8n_api(f"/api/v1/workflows/{workflow_id}", method="DELETE")
-    except Exception as exc:
-        raise OpsError(
-            f"FATAL: temporary n8n workflow cleanup failed for id={workflow_id}"
-        ) from exc
-    if primary_error is not None:
-        if isinstance(primary_error, OpsError):
-            raise primary_error
-        raise OpsError(
-            f"temporary n8n operation failed ({type(primary_error).__name__})"
-        ) from primary_error
-    return result
-
-
-def _postgres_node(*, name: str, query: str, position: list[int]) -> dict[str, object]:
-    return {
-        "parameters": {"operation": "executeQuery", "query": query, "options": {}},
-        "name": name,
-        "type": "n8n-nodes-base.postgres",
-        "typeVersion": 2.4,
-        "credentials": {
-            "postgres": {
-                "id": POSTGRES_CREDENTIAL_ID,
-                "name": POSTGRES_CREDENTIAL_NAME,
-            }
-        },
-        "position": position,
-    }
-
-
-def _webhook_node(hook_path: str) -> dict[str, object]:
-    return {
-        "parameters": {
-            "httpMethod": "GET",
-            "path": hook_path,
-            "responseMode": "lastNode",
-        },
-        "name": "Webhook",
-        "type": "n8n-nodes-base.webhook",
-        "typeVersion": 2,
-        "position": [0, 0],
-    }
+def kill_state() -> tuple[bool, str]:
+    """(calls paused?, when that last changed). The stamp is the audit trail on
+    the one control that stops us spending money."""
+    payload = router_request("/api/v1/killswitch")
+    paused = payload.get("kill_switch") if isinstance(payload, dict) else None
+    if not isinstance(paused, bool):
+        raise OpsError("kill-switch state is missing or invalid")
+    changed_at = str(payload.get("changed_at") or "") if isinstance(payload, dict) else ""
+    return paused, changed_at
 
 
 def read_kill_state() -> bool:
-    """Read only the non-secret kill boolean through a no-history workflow."""
-    suffix = uuid.uuid4().hex
-    hook_path = f"ops-kill-read-{suffix}"
-    query = (
-        "SELECT (value->>'paused')::boolean AS paused "
-        "FROM voiceagent.config WHERE key='kill_switch';"
-    )
-    payload = run_temporary_workflow(
-        name=f"ZZTMP Voice Pro kill read {suffix[:8]}",
-        hook_path=hook_path,
-        nodes=[
-            _webhook_node(hook_path),
-            _postgres_node(name="Kill State", query=query, position=[220, 0]),
-        ],
-        connections={
-            "Webhook": {"main": [[{"node": "Kill State", "type": "main", "index": 0}]]}
-        },
-    )
-    row = payload[0] if isinstance(payload, list) and payload else payload
-    if not isinstance(row, dict) or not isinstance(row.get("paused"), bool):
-        raise OpsError("kill-switch state is missing or invalid")
-    return bool(row["paused"])
+    return kill_state()[0]
 
 
 def kill_paused() -> bool:
@@ -360,114 +279,30 @@ def kill_paused() -> bool:
 
 
 def set_kill_switch(*, paused: bool) -> bool:
-    suffix = uuid.uuid4().hex
-    hook_path = f"ops-kill-set-{suffix}"
-    sql_bool = "true" if paused else "false"
-    query = (
-        "UPDATE voiceagent.config SET value=jsonb_build_object('paused', "
-        f"{sql_bool}), updated_at=now() WHERE key='kill_switch' "
-        "RETURNING (value->>'paused')::boolean AS paused;"
+    payload = router_request(
+        f"/api/v1/killswitch?set={'on' if paused else 'off'}", method="POST"
     )
-    payload = run_temporary_workflow(
-        name=f"ZZTMP Voice Pro kill set {suffix[:8]}",
-        hook_path=hook_path,
-        nodes=[
-            _webhook_node(hook_path),
-            _postgres_node(name="Set Kill", query=query, position=[220, 0]),
-        ],
-        connections={
-            "Webhook": {"main": [[{"node": "Set Kill", "type": "main", "index": 0}]]}
-        },
-    )
-    row = payload[0] if isinstance(payload, list) and payload else payload
-    observed = bool(row.get("paused")) if isinstance(row, dict) else not paused
+    observed = payload.get("kill_switch") if isinstance(payload, dict) else None
     if observed is not paused:
         raise OpsError("kill-switch update returned the wrong state")
     return observed
 
 
 def forge_seeded_reply() -> str:
-    """Sign and send the seeded event inside n8n; the HMAC never leaves n8n."""
-    suffix = uuid.uuid4().hex
-    hook_path = f"ops-seeded-forge-{suffix}"
-    sign_code = f"""
-const crypto = require('crypto');
-const secret = String($('Load HMAC').first().json.secret || '');
-if (!secret || secret === 'PENDING') throw new Error('HMAC unavailable');
-const conversationId = crypto.randomUUID();
-const body = {{data: {{conversationId, leadId: '{SEEDED_LEAD_ID}', leadEmail: '{SEEDED_EMAIL}', messageId: crypto.randomUUID(), replyText: 'Yes, this is interesting - happy to hop on a quick call to hear more.'}}}};
-const raw = JSON.stringify(body);
-const signature = crypto.createHmac('sha256', secret).update(raw).digest('hex');
-return [{{json: {{conversation_id: conversationId, body, signature}}}}];
-""".strip()
-    nodes: list[dict[str, object]] = [
-        _webhook_node(hook_path),
-        _postgres_node(
-            name="Load HMAC",
-            query="SELECT value #>> '{}' AS secret FROM voiceagent.config WHERE key='sendkit_hmac_positive';",
-            position=[220, 0],
-        ),
-        {
-            "parameters": {"jsCode": sign_code},
-            "name": "Sign Internally",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [440, 0],
-        },
-        {
-            "parameters": {
-                "method": "POST",
-                "url": f"{N8N}/webhook/sendkit-positive",
-                "sendHeaders": True,
-                "headerParameters": {
-                    "parameters": [
-                        {"name": "Content-Type", "value": "application/json"},
-                        {
-                            "name": "x-sendkit-signature",
-                            "value": "={{ 'sha256=' + $json.signature }}",
-                        },
-                    ]
-                },
-                "sendBody": True,
-                "specifyBody": "json",
-                "jsonBody": "={{ JSON.stringify($json.body) }}",
-                "options": {},
-            },
-            "name": "Send Positive",
-            "type": "n8n-nodes-base.httpRequest",
-            "typeVersion": 4.2,
-            "position": [660, 0],
-        },
-        {
-            "parameters": {
-                "jsCode": "return [{json:{accepted:true,conversation_id:$('Sign Internally').first().json.conversation_id}}];"
-            },
-            "name": "Sanitize",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [880, 0],
-        },
-    ]
-    payload = run_temporary_workflow(
-        name=f"ZZTMP Voice Pro seeded forge {suffix[:8]}",
-        hook_path=hook_path,
-        nodes=nodes,
-        connections={
-            "Webhook": {"main": [[{"node": "Load HMAC", "type": "main", "index": 0}]]},
-            "Load HMAC": {
-                "main": [[{"node": "Sign Internally", "type": "main", "index": 0}]]
-            },
-            "Sign Internally": {
-                "main": [[{"node": "Send Positive", "type": "main", "index": 0}]]
-            },
-            "Send Positive": {
-                "main": [[{"node": "Sanitize", "type": "main", "index": 0}]]
-            },
+    """One seeded positive reply, signed and run by the router itself."""
+    payload = router_request(
+        "/api/v1/ops/seed-positive",
+        method="POST",
+        body={
+            "lead_id": SEEDED_LEAD_ID,
+            "lead_email": SEEDED_EMAIL,
+            "reply_text": (
+                "Yes, this is interesting - happy to hop on a quick call to hear more."
+            ),
         },
     )
-    row = payload[0] if isinstance(payload, list) and payload else payload
     conversation_id = (
-        str(row.get("conversation_id") or "") if isinstance(row, dict) else ""
+        str(payload.get("conversation_id") or "") if isinstance(payload, dict) else ""
     )
     if not conversation_id:
         raise OpsError("seeded positive reply returned no conversation ID")
