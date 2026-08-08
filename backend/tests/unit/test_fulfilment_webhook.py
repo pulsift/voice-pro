@@ -814,3 +814,33 @@ async def test_worker_start_is_idempotent_and_stop_cancels_task(
     await fulfilment_webhook.stop_fulfilment_worker()
     assert first.cancelled()
     assert fulfilment_webhook._worker_task is None
+
+
+# --- survivor of the 2026-08-08 mutation sweep ---------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("booking_id", [None, "", "   "])
+async def test_a_booking_with_no_proven_uid_is_refused_not_recorded(
+    booking_id: object,
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The Cal.com UID is the only proof a meeting actually exists. Finalizing
+    without one records a booking nobody made, tells the prospect they are booked,
+    and starts a paid build off it. Nothing was watching this until a mutation
+    removed the check and all 533 tests stayed green."""
+    key = await stage()
+
+    with pytest.raises(ValueError, match="missing its UID"):
+        await fulfilment_webhook.finalize_fulfilment_intent(key, booking_id)
+
+    row = await load_row(outbox_session_factory, key)
+    assert row.state == "awaiting_booking", "the promise was finalized without proof"
+    assert row.booking_id is None
+
+
+@pytest.mark.asyncio
+async def test_finalizing_an_unknown_intent_is_a_quiet_no(
+    outbox_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await fulfilment_webhook.finalize_fulfilment_intent(None, "booking-1") is False

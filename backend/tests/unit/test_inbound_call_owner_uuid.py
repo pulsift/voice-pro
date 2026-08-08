@@ -74,3 +74,74 @@ async def test_inbound_webhook_converts_integer_agent_owner_to_uuid(provider: st
     assert record.provider == provider
     assert isinstance(record.user_id, uuid.UUID)
     assert record.user_id == user_id_to_uuid(agent.user_id)
+
+
+# --- the outage this gate caused, and the test that was missing ---------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registered_workspace", "call_workspace"),
+    [
+        (None, None),      # single-tenant: no workspace rows exist at all
+        (None, "some"),    # a number registered before workspaces existed
+        ("same", "same"),  # both present and matching
+    ],
+    ids=["no-workspace-anywhere", "number-predates-workspaces", "matching-workspace"],
+)
+async def test_an_owned_caller_id_is_accepted_with_or_without_a_workspace(
+    registered_workspace: str | None, call_workspace: str | None
+) -> None:
+    """Ownership is the security property. Workspace is an EXTRA constraint.
+
+    Requiring a workspace unconditionally made this gate unsatisfiable in a
+    deployment that has no workspace rows, and it refused 100% of outbound calls
+    for hours on 2026-08-03 — including every call the machine placed. It was
+    fixed the same day and nothing has been watching it since: a mutation that
+    put the requirement straight back left all 533 tests green.
+    """
+    from app.api.telephony import require_owned_caller_id
+
+    shared = uuid.uuid4()
+    registered = shared if registered_workspace == "same" else None
+    on_the_call = shared if call_workspace == "same" else (
+        uuid.uuid4() if call_workspace else None
+    )
+
+    found = MagicMock()
+    found.scalar_one_or_none.return_value = uuid.uuid4()
+    db = MagicMock(execute=AsyncMock(return_value=found))
+
+    await require_owned_caller_id(
+        from_number="+14155550100",
+        workspace_id=on_the_call,
+        owner_user_id=731,
+        db=db,
+    )
+
+    conditions = str(db.execute.await_args.args[0])
+    assert "phone_numbers.phone_number" in conditions
+    assert "phone_numbers.user_id" in conditions
+    if on_the_call is None:
+        assert "workspace_id" not in conditions, (
+            "a workspace was demanded when the call had none — this is the exact "
+            "shape that refused every outbound call on 2026-08-03"
+        )
+    del registered  # the row is the mock's answer; the query shape is the contract
+
+
+@pytest.mark.asyncio
+async def test_a_caller_id_nobody_registered_is_still_refused() -> None:
+    from fastapi import HTTPException
+
+    from app.api.telephony import require_owned_caller_id
+
+    missing = MagicMock()
+    missing.scalar_one_or_none.return_value = None
+    db = MagicMock(execute=AsyncMock(return_value=missing))
+
+    with pytest.raises(HTTPException) as raised:
+        await require_owned_caller_id(
+            from_number="+14155550100", workspace_id=None, owner_user_id=731, db=db
+        )
+    assert raised.value.status_code == 403

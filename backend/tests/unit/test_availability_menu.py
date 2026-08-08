@@ -585,3 +585,64 @@ def test_a_repeated_start_never_becomes_two_menu_entries():
     offered = menu.get("offer_slots") or []
     if len(offered) == 2:
         assert offered[0]["start"] != offered[1]["start"]
+
+
+# --- the two times the agent leads with -----------------------------------------
+#
+# Sami, after a live call: "Actually when I asked if it could do Thursday it
+# already offered me 2 times" — two slots on the same day is not a choice, it is
+# the same answer twice. The pair is chosen in code so the agent reads a finished
+# decision instead of working one out aloud.
+#
+# Survivor of the 2026-08-08 mutation sweep: replacing the whole chooser with
+# "the first two slots" left all 533 tests green.
+
+
+def offered(raw: list[dict[str, str]], timezone: str = "UTC") -> list[str]:
+    """The OFFER FIRST line the agent actually reads, as spoken labels."""
+    menu = availability.build_menu(raw, timezone)
+    line = menu["block"]
+    offer = next(
+        (row for row in line.splitlines() if row.strip().startswith("OFFER FIRST")), ""
+    )
+    return [part.strip(" .") for part in offer.split(":", 1)[-1].split(", or ")]
+
+
+def test_the_two_offered_times_land_on_different_days():
+    raw = [
+        {"start": iso(13, 9)},
+        {"start": iso(13, 12)},   # same day, and the tempting "first two"
+        {"start": iso(14, 9)},
+        {"start": iso(14, 12)},
+    ]
+    first, second = offered(raw)
+    assert "monday" in first.lower()
+    assert "monday" not in second.lower(), (
+        f"both offered times are on the same day: {first!r} and {second!r}"
+    )
+
+
+def test_the_two_offered_times_are_one_morning_and_one_later():
+    raw = [
+        {"start": iso(13, 9)},
+        {"start": iso(13, 10)},
+        {"start": iso(14, 9)},
+        {"start": iso(14, 13)},
+    ]
+    first, second = offered(raw)
+    assert "morning" in first.lower()
+    assert "morning" not in second.lower(), (
+        f"both offered times are mornings: {first!r} and {second!r}"
+    )
+
+
+def test_one_day_of_openings_still_offers_two_bands_rather_than_two_neighbours():
+    raw = [{"start": iso(13, 9)}, {"start": iso(13, 10)}, {"start": iso(13, 13)}]
+    first, second = offered(raw)
+    assert first != second
+    assert "morning" in first.lower()
+    assert "morning" not in second.lower()
+
+
+def test_a_single_opening_is_offered_alone_rather_than_padded():
+    assert len(offered([{"start": iso(13, 9)}])) == 1

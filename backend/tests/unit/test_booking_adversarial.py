@@ -801,3 +801,39 @@ async def test_reconnect_cleanup_replaces_only_with_longer_transcript() -> None:
 
     assert record.transcript == longer
     db.commit.assert_awaited_once_with()
+
+
+# --- survivors of the 2026-08-08 mutation sweep --------------------------------
+#
+# Each of these was a behaviour the code already had and NOTHING was watching.
+# Found by breaking it on purpose and seeing the whole suite stay green.
+
+
+@pytest.mark.asyncio
+async def test_a_list_is_never_promised_with_no_fit_answers_to_build_it_from():
+    """The two fit questions ARE the product: they are what the hundred leads get
+    built from. Booking without them promises a list nobody can build, and the
+    prospect finds out days later."""
+    tools = make_tools()
+    await offer_and_select(tools)
+
+    post = AsyncMock()
+    with patch("app.services.calcom_client.create_booking", post):
+        result = await tools.book_appointment(SLOT["start"], icp=None)
+
+    assert result["success"] is False
+    assert result["error"] == "missing_icp"
+    post.assert_not_awaited(), "a booking was attempted with no fit answers"
+    # ...and the agent is told what to do about it, in words it can act on.
+    assert "fit questions" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_fit_answer_object_counts_as_no_fit_answers():
+    tools = make_tools()
+    await offer_and_select(tools)
+    post = AsyncMock()
+    with patch("app.services.calcom_client.create_booking", post):
+        result = await tools.book_appointment(SLOT["start"], icp={})
+    assert result["error"] == "missing_icp"
+    post.assert_not_awaited()
