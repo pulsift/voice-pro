@@ -39,6 +39,7 @@ from app.services.gpt_realtime import build_instructions_with_language, render_t
 from app.services.tools import crm_tools as crm_module
 from app.services.tools.call_control_tools import CallControlTools
 from app.services.tools.crm_tools import CRMTools
+from app.services.tools.registry import ToolRegistry
 
 MODEL = os.environ.get("EVAL_REALTIME_MODEL", "gpt-realtime-2.1")
 MAX_RESPONSES_PER_SCENARIO = 30
@@ -210,8 +211,75 @@ def load_instructions(prompt_file: Path, menu: dict[str, Any]) -> str:
     return build_instructions_with_language(rendered, "en-US", timezone="UTC")
 
 
-def tool_definitions() -> list[dict[str, Any]]:
-    return CRMTools.get_tool_definitions() + CallControlTools.get_tool_definitions()
+# The five without which a booking call is theatre. If the live agent row stops
+# producing any of them, this rig must go RED — not green with a quieter agent.
+LOAD_BEARING_TOOLS = (
+    "select_slot",
+    "record_fit_answers",
+    "book_appointment",
+    "refresh_availability",
+    "end_call",
+)
+
+
+HTTP_OK = 200
+
+
+class ToolConfigError(RuntimeError):
+    """The live agent is configured with a tool list that cannot book."""
+
+
+def tool_names(tools: list[dict[str, Any]]) -> list[str]:
+    return [t.get("name") or t.get("function", {}).get("name") or "?" for t in tools]
+
+
+def tool_definitions(
+    enabled_tools: list[str],
+    enabled_tool_ids: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the tool list the way the PRODUCTION session builds it.
+
+    This used to be `CRMTools.get_tool_definitions() + CallControlTools...`
+    handed straight to the model, which bypassed both the registry and the agent
+    row — so the rig always held a full toolbox no matter what production held.
+    On 2026-08-08 production held `enabled_tools = []`, meaning ZERO tools on
+    every real call, and all ten scenarios here still passed green. The agent
+    claimed a booking it had no `book_appointment` to make and argued about a
+    calendar it had no `refresh_availability` to check; the rig saw none of it.
+
+    So this now makes the identical call `gpt_realtime._configure_session` makes,
+    and refuses to run at all when the result cannot book. A rig that passes
+    while production cannot book is worse than no rig.
+    """
+    registry = ToolRegistry(db=MagicMock(), user_id=1, integrations={}, workspace_id=None)
+    tools = registry.get_all_tool_definitions(enabled_tools, enabled_tool_ids)
+    have = set(tool_names(tools))
+    missing = [name for name in LOAD_BEARING_TOOLS if name not in have]
+    if missing:
+        raise ToolConfigError(
+            f"the agent's enabled_tools ({enabled_tools!r}) produce {len(tools)} "
+            f"tools and are MISSING {missing}. Production cannot book with this "
+            f"configuration, so there is nothing here worth evaluating."
+        )
+    return tools
+
+
+def live_enabled_tools() -> tuple[list[str], dict[str, list[str]] | None]:
+    """Read `enabled_tools` off the LIVE agent row, through the deployed API.
+
+    Reading the real row is the whole point: a rig that hardcodes its own list is
+    testing a system we do not ship.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ops"))
+    from ops_common import AGENT_ID, BACKEND, admin_token, request_json
+
+    status, payload = request_json(
+        f"{BACKEND}/api/v1/agents/{AGENT_ID}",
+        headers={"Authorization": f"Bearer {admin_token()}"},
+    )
+    if status != HTTP_OK or not isinstance(payload, dict):
+        raise ToolConfigError(f"could not read the live agent row (HTTP {status})")
+    return list(payload.get("enabled_tools") or []), payload.get("enabled_tool_ids")
 
 
 CALL_CONTROL_NAMES = {"wait_for_user", "end_call", "transfer_call", "send_dtmf"}
@@ -812,6 +880,7 @@ async def run_scenario(
     name: str,
     spec: dict[str, Any],
     menu: dict[str, Any],
+    tools: list[dict[str, Any]],
 ) -> tuple[bool, str]:
     crm = CRMTools(db=MagicMock(), user_id=1, variables=dict(VARS))
     # The production bridge pre-loads the calendar before the caller speaks; the
@@ -824,7 +893,7 @@ async def run_scenario(
                 "type": "realtime",
                 "output_modalities": ["text"],
                 "instructions": instructions,
-                "tools": tool_definitions(),
+                "tools": tools,
                 "tool_choice": "auto",
                 "reasoning": {"effort": "low"},
             }
@@ -858,7 +927,30 @@ async def main() -> int:
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--only", action="append", help="run only these scenarios")
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument(
+        "--enabled-tools",
+        help="comma-separated override, for running with no network. Without it "
+             "the LIVE agent row decides, which is the point.",
+    )
     args = parser.parse_args()
+
+    # Before anything else: what does production actually give the model? A run
+    # against a toolbox production does not have is a run against a system we do
+    # not ship, and that is precisely how ten green scenarios coexisted with an
+    # agent that could not book.
+    if args.enabled_tools:
+        enabled, enabled_ids = [t.strip() for t in args.enabled_tools.split(",")], None
+        source = "--enabled-tools override"
+    else:
+        enabled, enabled_ids = live_enabled_tools()
+        source = "the LIVE agent row"
+    try:
+        tools = tool_definitions(enabled, enabled_ids)
+    except ToolConfigError as error:
+        print(f"REFUSING TO RUN: {error}")
+        print(f"(read from {source})")
+        return 2
+    print(f"tools: {len(tools)} from {source} {enabled} -> {', '.join(tool_names(tools))}")
 
     install_fakes()
     menu = eval_menu()
@@ -869,7 +961,7 @@ async def main() -> int:
     results: dict[str, bool] = {}
     for name in names:
         passed, report = await run_scenario(
-            client, instructions, name, SCENARIOS[name], menu
+            client, instructions, name, SCENARIOS[name], menu, tools
         )
         results[name] = passed
         print(report, flush=True)
