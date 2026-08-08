@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,14 +26,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # =============================================================================
 # Pydantic Models
 # =============================================================================
-
-
-class RegisterRequest(BaseModel):
-    """User registration request."""
-
-    email: EmailStr
-    username: str  # Will be used as full_name
-    password: str
 
 
 class TokenResponse(BaseModel):
@@ -98,51 +90,18 @@ def create_access_token(subject: str | int, expires_delta: timedelta | None = No
 # =============================================================================
 
 
-@router.post("/register", response_model=UserResponse)
-@limiter.limit("5/minute")  # Strict rate limit to prevent account spam
-async def register(
-    request: RegisterRequest,
-    http_request: Request,  # Required for rate limiter
-    db: AsyncSession = Depends(get_db),
-) -> UserResponse:
-    """Register a new user.
-
-    Args:
-        request: Registration request with email, username, password
-        db: Database session
-
-    Returns:
-        Created user
-    """
-    if settings.APP_ENVIRONMENT == "production":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Public registration is disabled",
-        )
-
-    log = logger.bind(email=request.email, username=request.username)
-    log.info("registering_user")
-
-    # Check if email already exists
-    result = await db.execute(select(User).where(User.email == request.email))
-    if result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered",
-        )
-
-    # Create user (username is stored as full_name)
-    user = User(
-        email=request.email,
-        full_name=request.username,
-        hashed_password=get_password_hash(request.password),
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-
-    log.info("user_registered", user_id=user.id)
-    return UserResponse.from_user(user)
+# There is no registration endpoint, and that is deliberate.
+#
+# The fork shipped one, gated on APP_ENVIRONMENT. Two things were true at once on
+# 2026-08-08: the setting was never set on the live service, so the gate would not
+# have fired — and the endpoint had never worked anyway, because its rate limiter
+# looks for a parameter named `request` and the handler called it `http_request`,
+# so every call 500'd before reaching the gate. The test that "proved" the gate
+# stripped the decorator off first, which is how both survived side by side.
+#
+# This deployment has one user and needs no second one. An endpoint that creates
+# accounts, does not run, and would silently open the day someone repaired the
+# decorator is worth less than nothing, so it is gone rather than fixed.
 
 
 @router.post("/login", response_model=TokenResponse)

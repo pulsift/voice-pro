@@ -1,73 +1,63 @@
-"""Production registration gate without changing existing login behavior."""
+"""There is no way to create an account on this machine, and login still works.
 
-import inspect
+The fork shipped a registration endpoint behind an APP_ENVIRONMENT gate. On
+2026-08-08 two things turned out to be true at once: the setting was never set on
+the live service, so the gate would not have fired — and the endpoint had never
+worked anyway, because its rate limiter looks for a parameter named `request` and
+the handler called it `http_request`, so every call 500'd before reaching the
+gate.
+
+The test that "proved" the gate called `inspect.unwrap(register)` to strip the
+decorator first. That is how a broken endpoint and a passing test lived side by
+side for weeks: the test measured the handler, and nobody could reach the
+handler. It is exactly the shape of failure this whole sweep exists to find.
+
+The endpoint is gone. These tests pin its absence, because deleting something is
+only safe if something notices it coming back.
+"""
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 
-from app.api.auth import RegisterRequest, login, register
+from app.api import auth as auth_module
+from app.api.auth import login
 from app.core.config import settings
 
 
-@pytest.mark.asyncio
-async def test_production_refuses_public_registration_before_database_access(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "APP_ENVIRONMENT", "production")
-    db = MagicMock(execute=AsyncMock())
+def test_no_route_on_this_machine_creates_an_account():
+    paths = {route.path for route in auth_module.router.routes}
+    assert "/api/v1/auth/register" not in paths
+    assert not any("register" in path or "signup" in path for path in paths), paths
 
-    with pytest.raises(HTTPException) as exc_info:
-        await inspect.unwrap(register)(
-            RegisterRequest(
-                email="outsider@example.com",
-                username="Outsider",
-                password="not-used",  # noqa: S106
-            ),
-            MagicMock(),
-            db,
+
+def test_the_registration_request_model_is_gone_too():
+    assert not hasattr(auth_module, "RegisterRequest")
+    assert not hasattr(auth_module, "register")
+
+
+def test_every_rate_limited_endpoint_names_its_request_parameter_correctly():
+    """The bug that hid the whole thing: slowapi looks for a parameter literally
+    named `request`, and silently 500s the endpoint when it is called something
+    else. Nothing was checking, so a rate-limited endpoint could be dead on
+    arrival and look configured."""
+    import inspect
+
+    for route in auth_module.router.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None or not hasattr(endpoint, "__wrapped__"):
+            continue
+        parameters = inspect.signature(inspect.unwrap(endpoint)).parameters
+        assert "request" in parameters, (
+            f"{route.path} is rate limited but has no `request` parameter, so it "
+            "500s on every call"
         )
 
-    assert exc_info.value.status_code == 403
-    assert exc_info.value.detail == "Public registration is disabled"
-    db.execute.assert_not_awaited()
-
 
 @pytest.mark.asyncio
-async def test_development_registration_remains_available(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "APP_ENVIRONMENT", "development")
-    query_result = MagicMock()
-    query_result.scalar_one_or_none.return_value = None
-    db = MagicMock(
-        execute=AsyncMock(return_value=query_result),
-        add=MagicMock(),
-        commit=AsyncMock(),
-    )
-
-    async def assign_user_id(user: object) -> None:
-        user.id = 7
-
-    db.refresh = AsyncMock(side_effect=assign_user_id)
-
-    with patch("app.api.auth.get_password_hash", return_value="hashed-password"):
-        response = await inspect.unwrap(register)(
-            RegisterRequest(
-                email="local@example.com",
-                username="Local User",
-                password="local-password",  # noqa: S106
-            ),
-            MagicMock(),
-            db,
-        )
-
-    assert response.id == 7
-    assert response.email == "local@example.com"
-    db.add.assert_called_once()
-    db.commit.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_existing_login_remains_usable_in_production(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "APP_ENVIRONMENT", "production")
+async def test_login_still_works_in_production():
+    settings.APP_ENVIRONMENT = "production"
     user = SimpleNamespace(id=7, hashed_password="stored-hash")  # noqa: S106
     query_result = MagicMock()
     query_result.scalar_one_or_none.return_value = user
@@ -76,6 +66,8 @@ async def test_existing_login_remains_usable_in_production(monkeypatch) -> None:
         username="sami@example.com",
         password="correct-password",  # noqa: S106
     )
+
+    import inspect
 
     with (
         patch("app.api.auth.verify_password", return_value=True),
