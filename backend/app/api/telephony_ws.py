@@ -61,6 +61,37 @@ def _response_id(event: Any) -> str | None:
     return str(identifier) if identifier else None
 
 
+# How many silent responses we will sit through after `end_call` before hanging up
+# anyway. The line is billed and the caller is waiting, so this is small — it
+# exists to survive one empty response, not to wait out a model that has decided
+# to say nothing.
+MAX_SILENT_RESPONSES_BEFORE_HANGUP = 2
+
+
+def _response_spoke(event: Any) -> bool:
+    """Did the response that just finished actually put words on the line?
+
+    A response carrying only function calls is silent. So is an empty one — and
+    an empty one is exactly what arrived 180ms after `end_call` on 2026-08-08.
+    It satisfied a guard that was counting RESPONSES, so the line dropped on a
+    caller who had just been booked in and never told. Counting responses is not
+    the same as knowing they heard something, so this counts speech instead.
+    """
+    response = getattr(event, "response", None)
+    output = getattr(response, "output", None) if response is not None else None
+    for item in output or []:
+        if str(getattr(item, "type", "") or "") != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            if str(getattr(part, "transcript", "") or "").strip():
+                return True
+            if str(getattr(part, "text", "") or "").strip():
+                return True
+            if str(getattr(part, "type", "") or "") in ("audio", "output_audio"):
+                return True
+    return False
+
+
 class OpeningSequence:
     """Hello-first opening, and the watchdog that keeps a silent line from hanging.
 
@@ -803,6 +834,7 @@ async def _handle_twilio_stream(  # noqa: PLR0915
             event_count = 0
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
             farewell_pending = False  # the closing line comes in the response AFTER end_call
+            silent_responses = 0  # responses since end_call that said nothing aloud
 
             async def _classify_answerer(first_utterance: str) -> None:
                 # C2: the callee's first words say whether a person picked up. On a
@@ -965,10 +997,18 @@ async def _handle_twilio_stream(  # noqa: PLR0915
                     else:
                         log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
-                        if farewell_pending:
-                            farewell_pending = False
-                            log.info("waiting_for_farewell_before_hangup")
-                            continue
+                        if farewell_pending and not _response_spoke(event):
+                            silent_responses += 1
+                            if silent_responses <= MAX_SILENT_RESPONSES_BEFORE_HANGUP:
+                                log.info(
+                                    "waiting_for_farewell_before_hangup",
+                                    silent_responses=silent_responses,
+                                )
+                                continue
+                            log.warning(
+                                "hanging_up_without_a_spoken_goodbye",
+                                silent_responses=silent_responses,
+                            )
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break
@@ -1263,6 +1303,7 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
 
             pending_end_call = False  # True when end_call requested but waiting for AI to finish
             farewell_pending = False  # the closing line comes in the response AFTER end_call
+            silent_responses = 0  # responses since end_call that said nothing aloud
             opening.arm_fallback_start()
 
             async for event in realtime_session.connection:
@@ -1349,10 +1390,18 @@ async def _handle_telnyx_stream(  # noqa: PLR0915
                     await opening.response_finished(_response_id(event))
                     log.debug("realtime_event", event_type=event_type)
                     if pending_end_call:
-                        if farewell_pending:
-                            farewell_pending = False
-                            log.info("waiting_for_farewell_before_hangup")
-                            continue
+                        if farewell_pending and not _response_spoke(event):
+                            silent_responses += 1
+                            if silent_responses <= MAX_SILENT_RESPONSES_BEFORE_HANGUP:
+                                log.info(
+                                    "waiting_for_farewell_before_hangup",
+                                    silent_responses=silent_responses,
+                                )
+                                continue
+                            log.warning(
+                                "hanging_up_without_a_spoken_goodbye",
+                                silent_responses=silent_responses,
+                            )
                         log.info("ending_call_after_response_complete")
                         should_end_call = True
                         break

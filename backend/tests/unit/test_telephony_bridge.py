@@ -11,6 +11,28 @@ from fastapi import WebSocketDisconnect
 from app.api.telephony_ws import _handle_telnyx_stream, _handle_twilio_stream
 
 
+def spoken_response(words: str) -> SimpleNamespace:
+    """A `response.done` that actually put words on the line.
+
+    The bridge hangs up only once the caller has HEARD something, so a test that
+    yields a bare `response.done` as "the goodbye" is describing silence. That
+    was the 2026-08-08 bug: an empty response 180ms after end_call satisfied a
+    guard that counted responses, and a caller who had just been booked in got
+    a dead line instead of being told.
+    """
+    return SimpleNamespace(
+        type="response.done",
+        response=SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(transcript=words, text=None, type="audio")],
+                )
+            ]
+        ),
+    )
+
+
 class BlockingConnection:
     """Async event source that records prompt cancellation."""
 
@@ -137,10 +159,10 @@ async def test_telnyx_end_call_cancels_provider_sibling_and_closes_socket() -> N
             call_id="tool-1",
             name="end_call",
         )
-        # The response that CARRIED end_call...
+        # The response that CARRIED end_call: silent, so it is not the goodbye.
         yield SimpleNamespace(type="response.done")
-        # ...and the one that speaks the goodbye. The hangup waits for this one.
-        yield SimpleNamespace(type="response.done")
+        # ...and the one that SPEAKS the goodbye. The hangup waits for this one.
+        yield spoken_response("Take care.")
 
     session = make_session(realtime_events())
     session.handle_function_call_event = AsyncMock(
@@ -181,9 +203,10 @@ async def test_telnyx_end_call_cancels_provider_sibling_and_closes_socket() -> N
 async def test_the_goodbye_after_end_call_is_spoken_before_the_hangup(
     handler: object, start_message: dict, expected_id: str
 ) -> None:
-    """Tools are called before the agent speaks, so the closing line now lives in
-    the response AFTER end_call. Hanging up on the response that merely carried
-    the tool call would end every call on silence."""
+    """Tools are called before the agent speaks, so the closing line lives in a
+    response AFTER end_call. The bridge waits for one that actually SPEAKS —
+    hanging up on the silent response that merely carried the tool call ends the
+    call on silence, which is what happened to a real caller on 2026-08-08."""
     websocket = ScriptedWebSocket([json.dumps(start_message)])
     closes_seen: list[int] = []
 
@@ -196,7 +219,7 @@ async def test_the_goodbye_after_end_call_is_spoken_before_the_hangup(
         )
         yield SimpleNamespace(type="response.done")
         closes_seen.append(websocket.close.await_count)
-        yield SimpleNamespace(type="response.done")
+        yield spoken_response("You're all set. Take care.")
 
     session = make_session(realtime_events())
     session.handle_function_call_event = AsyncMock(
@@ -207,6 +230,56 @@ async def test_the_goodbye_after_end_call_is_spoken_before_the_hangup(
 
     assert result == expected_id
     assert closes_seen == [0], "hung up before the goodbye could be generated"
+    websocket.close.assert_awaited_once_with(code=1000, reason="Call ended by agent")
+
+
+@pytest.mark.parametrize(
+    ("handler", "start_message", "expected_id"),
+    [
+        (
+            _handle_twilio_stream,
+            {"event": "start", "start": {"streamSid": "stream-1", "callSid": "call-1"}},
+            "call-1",
+        ),
+        (
+            _handle_telnyx_stream,
+            {
+                "event": "start",
+                "stream_id": "stream-1",
+                "start": {"call_control_id": "call-control-1"},
+            },
+            "call-control-1",
+        ),
+    ],
+    ids=["twilio", "telnyx"],
+)
+@pytest.mark.asyncio
+async def test_a_model_that_never_speaks_still_gets_hung_up_on(
+    handler: object, start_message: dict, expected_id: str
+) -> None:
+    """The other half of the same contract. Waiting for speech must not become
+    waiting forever — the leg is billed by the second and the caller is sitting
+    in silence. After a couple of silent responses we hang up regardless."""
+    websocket = ScriptedWebSocket([json.dumps(start_message)])
+
+    async def realtime_events() -> object:
+        await websocket.blocked.wait()
+        yield SimpleNamespace(
+            type="response.function_call_arguments.done",
+            call_id="tool-1",
+            name="end_call",
+        )
+        for _ in range(6):  # comfortably past the ceiling; it must not need all six
+            yield SimpleNamespace(type="response.done")
+
+    session = make_session(realtime_events())
+    session.handle_function_call_event = AsyncMock(
+        return_value={"success": True, "action": "end_call", "reason": "complete"}
+    )
+
+    result = await asyncio.wait_for(handler(websocket, session, MagicMock()), timeout=0.5)
+
+    assert result == expected_id
     websocket.close.assert_awaited_once_with(code=1000, reason="Call ended by agent")
 
 

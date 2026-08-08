@@ -28,13 +28,16 @@ Two safety properties, both deliberate:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
+import cal_booking
 from ops_common import (
     AGENT_ID,
     BACKEND,
     OpsError,
+    admin_request,
     admin_token,
     masked_phone,
     request_json,
@@ -100,10 +103,102 @@ def place(to_number: str) -> dict[str, object]:
     return payload
 
 
+CALL_POLL_SECONDS = 15
+CALL_WAIT_CEILING_SECONDS = 900
+FINISHED = {"completed", "ended", "failed", "no_answer", "busy", "canceled"}
+HTTP_OK = 200
+CANCELLED_STATES = {"cancelled", "canceled"}
+
+
+def find_call(call_id: str) -> dict[str, object] | None:
+    """The call record for the leg we just placed, by its provider call id."""
+    payload = admin_request("/api/v1/calls?page=1&page_size=10")
+    items = payload if isinstance(payload, list) else (
+        payload.get("calls") or payload.get("items") or []
+    )
+    for record in items:
+        if isinstance(record, dict) and call_id in json.dumps(record):
+            return record
+    return None
+
+
+def booked_uids(record: dict[str, object]) -> list[str]:
+    """Cal.com uids this call actually created."""
+    uids: list[str] = []
+    for attempt in record.get("booking_attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        if attempt.get("operation") == "create" and attempt.get("category") == "success":
+            uid = str(attempt.get("uid") or "")
+            if uid:
+                uids.append(uid)
+    return uids
+
+
+def cleanup_bookings(call_id: str) -> int:
+    """Cancel anything a test call put on the real calendar.
+
+    A ring test dials a real number through a real agent into a real Cal.com
+    account, so a successful test leaves a genuine appointment behind — one that
+    nobody is going to attend. Sami's standing instruction is that a test call
+    cleans up after itself, so the cleanup lives HERE, in the thing that made the
+    mess, rather than in an operator's memory.
+    """
+    deadline = time.time() + CALL_WAIT_CEILING_SECONDS
+    record: dict[str, object] | None = None
+    while time.time() < deadline:
+        record = find_call(call_id)
+        status = str((record or {}).get("status") or "").lower()
+        if status in FINISHED:
+            break
+        time.sleep(CALL_POLL_SECONDS)
+    if record is None:
+        print("cleanup: the call record never appeared — check the calendar by hand")
+        return 1
+
+    uids = booked_uids(record)
+    if not uids:
+        print("cleanup: nothing was booked, nothing to cancel")
+        return 0
+
+    failures = 0
+    for uid in uids:
+        status, _, state = cal_booking.get(uid)
+        if status != HTTP_OK:
+            print(f"cleanup: uid={uid} could not be read (HTTP {status}) — CANCEL BY HAND")
+            failures += 1
+            continue
+        if state in CANCELLED_STATES:
+            print(f"cleanup: uid={uid} was already cancelled")
+            continue
+        cancel_status, _ = request_json(
+            f"{cal_booking.CALCOM}/bookings/{uid}/cancel",
+            method="POST",
+            headers=cal_booking.headers(),
+            body={"cancellationReason": "Pulsift ring test — automatic cleanup"},
+        )
+        # Cal.com answering 200 is not evidence the meeting is gone; only the
+        # re-read is. A cleanup that reports success while a real appointment
+        # survives is worse than one that fails loudly.
+        _, _, verified = cal_booking.get(uid)
+        if cancel_status != HTTP_OK or verified not in CANCELLED_STATES:
+            print(f"cleanup: uid={uid} cancel NOT verified (HTTP {cancel_status}, "
+                  f"status={verified}) — CANCEL BY HAND")
+            failures += 1
+            continue
+        print(f"cleanup: uid={uid} cancelled and verified")
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--to", default=DEFAULT_TO, help="one of our own numbers")
     parser.add_argument("--confirm", action="store_true", help="required: it rings")
+    parser.add_argument(
+        "--keep-booking",
+        action="store_true",
+        help="leave the test booking on the calendar (default is to cancel it)",
+    )
     args = parser.parse_args()
 
     if args.to not in OWN_NUMBERS:
@@ -116,13 +211,19 @@ def main() -> int:
         )
 
     payload = place(args.to)
+    call_id = str(payload.get("call_id") or "")
     print(
         f"ringing={masked_phone(args.to)} who={OWN_NUMBERS[args.to]} "
-        f"call_id={payload.get('call_id')} provider={payload.get('provider')}"
+        f"call_id={call_id} provider={payload.get('provider')}"
     )
     print("dashboard: https://frontend-production-3c62.up.railway.app/dashboard/calls")
     print("listen for: bare 'Hello?' -> silence -> the opener runs to 'okay time?'")
-    return 0
+
+    if args.keep_booking:
+        print("cleanup: skipped (--keep-booking) — cancel it yourself")
+        return 0
+    print("waiting for the call to end so any test booking can be cancelled...")
+    return cleanup_bookings(call_id)
 
 
 if __name__ == "__main__":

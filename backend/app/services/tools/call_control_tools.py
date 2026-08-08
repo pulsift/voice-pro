@@ -138,16 +138,39 @@ class CallControlTools:
         logger.info("wait_for_user_requested")
         return {"success": True, "message": "Waiting for the caller."}
 
+    # Reasons where leaving without speaking is the right thing: nobody is
+    # listening, and a machine does not want a message.
+    SILENT_END_REASONS = frozenset(
+        {"voicemail", "machine", "answering_machine", "no_answer"}
+    )
+
     @staticmethod
     def _execute_end_call(arguments: dict[str, Any]) -> dict[str, Any]:
-        """Execute end_call tool."""
-        reason = arguments.get("reason", "conversation_complete")
+        """Execute end_call tool.
+
+        The result TEXT matters more than it looks. It used to read "Call will be
+        ended after this response", which tells the model its work is done — so
+        on 2026-08-08 it booked a real appointment, called end_call, said
+        NOTHING, and the line dropped on a caller who was never told he was
+        booked in. The tool was quietly asking for that silence.
+
+        The telephony bridge separately refuses to hang up on an unspoken
+        goodbye. That guard is the floor; this is the cause.
+        """
+        reason = str(arguments.get("reason", "conversation_complete") or "")
         logger.info("end_call_requested", reason=reason)
+        if reason.lower() in CallControlTools.SILENT_END_REASONS:
+            message = "Hanging up. Say nothing further."
+        else:
+            message = (
+                "Say your one closing line NOW - it is the last thing they hear, "
+                "and the call ends when you finish speaking. Never end on silence."
+            )
         return {
             "success": True,
             "action": "end_call",
             "reason": reason,
-            "message": "Call will be ended after this response.",
+            "message": message,
         }
 
     @staticmethod
