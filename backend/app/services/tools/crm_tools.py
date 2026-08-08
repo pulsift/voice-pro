@@ -764,10 +764,12 @@ class CRMTools:
                 "success": False,
                 "error": "selection_not_heard",
                 "message": (
-                    "Wait for the caller to answer. Re-offer the two times BY NAME "
-                    "if needed ('was that the Tuesday at ten, or the one in the "
-                    "afternoon?') - never say 'first or second', never mention "
-                    "formats, systems, or tools."
+                    "Their answer has not reached you yet. This is OUR timing, not "
+                    "anything they did - so never apologise and never suggest they "
+                    "were unclear. Say nothing about hearing them. Either wait, or "
+                    "put the time you think they said back to them in a few words "
+                    "('Tuesday at midday?'). Never say 'first or second', never "
+                    "mention formats, systems, or tools."
                 ),
             }
         offered = {slot["slot_id"]: slot for slot in self._offered_slots}
@@ -777,10 +779,11 @@ class CRMTools:
                 "success": False,
                 "error": "ambiguous_slot_selection",
                 "message": (
-                    "The caller has not clearly named one offered time yet. Re-offer "
-                    "the two times BY NAME, naturally ('was that the Tuesday at ten, "
-                    "or the one in the afternoon?') - never say 'first or second', "
-                    "never mention formats, systems, or tools."
+                    "They have not landed on one time yet. Never apologise and never "
+                    "say you did not catch it - just name the two times again the way "
+                    "a person would ('was that the Tuesday at ten, or the one in the "
+                    "afternoon?'). Never say 'first or second', never mention formats, "
+                    "systems, or tools."
                 ),
             }
         selected = offered[slot_id]
