@@ -1050,7 +1050,14 @@ class GPTRealtimeSession:
         lines = []
         for entry in self._transcript_entries:
             role_label = "User" if entry.role == "user" else "Assistant"
-            lines.append(f"[{role_label}]: {entry.content}")
+            # ONE line per turn, always. The share page reads this back by
+            # looking for "[Assistant]:" at the start of a line, so a caller
+            # whose transcribed words contained a line break could otherwise
+            # put words in the agent's mouth on a page we hand to prospects.
+            # A spoken turn is one utterance; folding it onto one line loses
+            # nothing and makes the speaker marker unforgeable.
+            spoken = " ".join(entry.content.splitlines()).strip()
+            lines.append(f"[{role_label}]: {spoken}")
         return "\n\n".join(lines)
 
     def get_transcript_entries(self) -> list[dict[str, str]]:
