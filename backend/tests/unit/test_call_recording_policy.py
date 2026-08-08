@@ -423,3 +423,85 @@ def test_unset_allowlist_leaves_the_policy_exactly_as_it_was(
     assert recording_allowed("+14155550123") is False  # CA, all-party
     assert recording_allowed("+46700171894") is False  # non-NANP
     assert recording_allowed("+12125550123") is True  # NY, one-party
+
+
+# ---------------------------------------------------------------------------
+# The agent must not know calls are ever recorded
+# ---------------------------------------------------------------------------
+#
+# Sami's ruling, 2026-08-07, in his words: exclude it "(1) to prevent issues
+# from VA having unnecessary context and (2) having it hallucinate and give a
+# dangerous response". Recording stays a carrier-side decision made from the
+# consent map above; the agent is never told, never asked to disclose, and has
+# no fallback line about it. This is the guard that keeps a future edit from
+# leaking it back in — a one-line addition to the prompt would otherwise be
+# invisible until a prospect heard it.
+
+# Phrases, not the bare stem: `record_fit_answers` writes down what the lead
+# said about their business and has nothing to do with audio.
+_RECORDING_PATTERNS = (
+    r"record\w*\s+(?:this|the|your|our|every|each|all)?\s*calls?\b",
+    r"calls?\s+(?:is|are|may|might|will|can)\s+(?:be\s+)?(?:being\s+)?record",
+    r"\bbeing\s+record",
+    r"\btranscrib\w*",
+    r"\btranscripts?\b",
+    r"\bmonitored\b",
+    r"this call may be",
+    r"quality and training",
+)
+
+
+def _recording_leaks(text: str) -> list[str]:
+    import re
+
+    lowered = text.lower()
+    return [p for p in _RECORDING_PATTERNS if re.search(p, lowered)]
+
+
+def _every_word_the_agent_could_read() -> list[tuple[str, str]]:
+    """(where it came from, the text) for everything that reaches the model."""
+    from pathlib import Path
+
+    from app.services.gpt_realtime import build_instructions_with_language
+    from app.services.tools.call_control_tools import CallControlTools
+    from app.services.tools.crm_tools import CRMTools
+
+    prompt_path = Path(__file__).resolve().parents[2] / "app/prompts/pulsift_booker.md"
+    sources = [("pulsift_booker.md", prompt_path.read_text(encoding="utf-8"))]
+    sources.append((
+        "the instruction wrapper",
+        build_instructions_with_language("", "en-US", timezone="UTC"),
+    ))
+    sources.append((
+        "the timezone-unresolved override",
+        build_instructions_with_language(
+            "", "en-US", timezone="unresolved",
+            runtime_rules=["TIMEZONE CORRECTION OVERRIDE: placeholder"],
+        ),
+    ))
+    for definition in CRMTools.get_tool_definitions() + CallControlTools.get_tool_definitions():
+        sources.append((f"tool {definition.get('name')}", str(definition)))
+    return sources
+
+
+def test_the_agent_is_never_told_that_calls_are_recorded():
+    offences = [
+        (where, leak)
+        for where, text in _every_word_the_agent_could_read()
+        for leak in _recording_leaks(text)
+    ]
+    assert not offences, (
+        "the voice agent must have zero knowledge of call recording; found "
+        f"{offences}"
+    )
+
+
+def test_the_guard_would_notice():
+    """A guard nobody has watched go red is decoration."""
+    assert _recording_leaks("This call may be recorded for quality and training.")
+    assert _recording_leaks("Heads up, I'm recording this call.")
+    assert _recording_leaks("I'll send you the transcript afterwards.")
+    # ...and the business tool it must not trip over.
+    assert not _recording_leaks(
+        "record_fit_answers: save what the lead told you about their business"
+    )

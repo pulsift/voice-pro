@@ -27,10 +27,10 @@ dependencies = [
     "python-multipart>=0.0.18",
     # HTTP Client
     "httpx>=0.28.0",
-    # Voice & AI
+    # Voice & AI. The realtime model does speech-to-text and text-to-speech
+    # itself, so the fork's Deepgram and ElevenLabs SDKs went with the
+    # settings that configured them (2026-08-08).
     "pipecat-ai>=0.0.67",
-    "deepgram-sdk>=3.8.3",
-    "elevenlabs>=1.11.0",
     "openai>=1.55.3",
     # Telephony
     "telnyx>=2.1.3",
@@ -39,10 +39,6 @@ dependencies = [
     "slowapi>=0.1.9",
     # Monitoring & Logging
     "sentry-sdk[fastapi]>=2.18.0",
-    "opentelemetry-api>=1.28.2",
-    "opentelemetry-sdk>=1.28.2",
-    "opentelemetry-instrumentation-fastapi>=0.49b2",
-    "opentelemetry-instrumentation-sqlalchemy>=0.49b2",
     "structlog>=24.4.0",
     # WebSockets
     "websockets>=14.1",
@@ -189,8 +185,6 @@ module = [
     "asyncpg.*",
     "redis.*",
     "pipecat.*",
-    "deepgram.*",
-    "elevenlabs.*",
     "telnyx.*",
     "twilio.*",
 ]

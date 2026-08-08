@@ -133,8 +133,9 @@ class Settings(BaseSettings):
     REALTIME_POST_HELLO_GIVEUP_SECONDS: float = 12.0
     REALTIME_OPENER_HOLD_MAX_SECONDS: float = 12.0
     REALTIME_SESSION_READY_TIMEOUT_SECONDS: float = 3.0
-    DEEPGRAM_API_KEY: str | None = None
-    ELEVENLABS_API_KEY: str | None = None
+    # No separate speech-to-text or text-to-speech settings: the realtime
+    # model does both itself. The fork's Deepgram and ElevenLabs keys and
+    # timeouts were read by nothing and were removed on 2026-08-08.
 
     # Telephony
     TELNYX_API_KEY: str | None = None
@@ -144,7 +145,6 @@ class Settings(BaseSettings):
     # Outbound caller ID (E.164) for Twilio calls, and the selected outbound provider.
     # Twilio is the default. Telnyx stays dormant unless this is explicitly set to
     # "telnyx"; missing credentials fail closed instead of switching providers.
-    TWILIO_FROM_NUMBER: str | None = None
     TELEPHONY_OUTBOUND_PROVIDER: str = "twilio"
 
     # Call recording. Three gates must ALL be true before a call is recorded:
@@ -222,8 +222,6 @@ class Settings(BaseSettings):
     # External Service Timeouts (seconds)
     # These are critical for preventing hung connections during voice calls
     OPENAI_TIMEOUT: float = 30.0  # LLM inference can be slow
-    DEEPGRAM_TIMEOUT: float = 15.0  # Real-time STT should be fast
-    ELEVENLABS_TIMEOUT: float = 20.0  # TTS synthesis timeout
     TELNYX_TIMEOUT: float = 10.0  # Telephony API calls
     TWILIO_TIMEOUT: float = 10.0  # Telephony API calls
     GOOGLE_API_TIMEOUT: float = 15.0  # Calendar, Drive, etc.
@@ -238,10 +236,6 @@ class Settings(BaseSettings):
     SENTRY_ENVIRONMENT: str = "development"
     SENTRY_TRACES_SAMPLE_RATE: float = 1.0
 
-    # OpenTelemetry
-    OTEL_ENABLED: bool = False
-    OTEL_SERVICE_NAME: str = "voicenoob-api"
-    OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
 
 
 settings = Settings()
