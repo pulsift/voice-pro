@@ -74,8 +74,18 @@ class EmbedSessionResponse(BaseModel):
 def validate_origin(origin: str | None, allowed_domains: list[str]) -> bool:
     """Validate that the Origin header matches allowed domains.
 
-    Supports wildcards: "*.example.com" matches "app.example.com"
-    Empty allowed_domains means all origins are allowed.
+    Supports wildcards: "*.example.com" matches "app.example.com".
+
+    An EMPTY allowlist denies everything. It used to allow everything — the
+    fork's convenience for local development — and on 2026-08-09 that was found
+    live on the production agent: `embed_enabled` was true and `allowed_domains`
+    was `[]`, so any origin on the internet could fetch the agent's config, open
+    a session, and post to `/tool-call`. Proven by probing it from an unrelated
+    origin with no credential, not inferred from the code.
+
+    An allowlist that means "allow everyone" when nobody has filled it in is
+    backwards: the safe state has to be the one you get by doing nothing. Set an
+    explicit domain (`["localhost"]` for development) to allow anything at all.
 
     Args:
         origin: The Origin header value
@@ -85,8 +95,7 @@ def validate_origin(origin: str | None, allowed_domains: list[str]) -> bool:
         True if origin is allowed, False otherwise
     """
     if not allowed_domains:
-        # Empty list means all origins allowed (for development/testing)
-        return True
+        return False
 
     if not origin:
         return False
