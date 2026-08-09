@@ -29,6 +29,7 @@ from app.services.amd import MACHINE_VERDICTS, classify_greeting
 from app.services.call_events import stage_media_finalized_call_event
 from app.services.gpt_realtime import GPTRealtimeSession
 from app.services.telephony.media_grant import consume_twilio_media_grant
+from app.services.tools.crm_tools import wait_for_calendar_writes
 
 router = APIRouter(prefix="/ws/telephony", tags=["telephony-ws"])
 logger = structlog.get_logger()
@@ -710,6 +711,13 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
                 amd_allowed=amd_allowed,
             )
 
+            # The calendar write now runs behind the agent's confirmation, so give
+            # it the few seconds it needs before the call record is written. It is
+            # already durable and already alerts on failure — this is only the
+            # difference between the booking id landing ON the record and landing
+            # just after it.
+            await wait_for_calendar_writes()
+
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_sid:
                 transcript = realtime_session.get_transcript() if agent.enable_transcript else ""
@@ -1195,6 +1203,13 @@ async def telnyx_media_stream(  # noqa: PLR0915
                 enable_transcript=agent.enable_transcript,
                 on_stream_started=on_stream_started,
             )
+
+            # The calendar write now runs behind the agent's confirmation, so give
+            # it the few seconds it needs before the call record is written. It is
+            # already durable and already alerts on failure — this is only the
+            # difference between the booking id landing ON the record and landing
+            # just after it.
+            await wait_for_calendar_writes()
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_control_id:

@@ -26,7 +26,27 @@ from app.core.config import settings
 from app.models.fulfilment_outbox import FulfilmentOutbox
 from app.models.operator_alert import OperatorAlert
 from app.services import fulfilment_webhook
+from app.services.tools import crm_tools
 from app.services.tools.crm_tools import CRMTools
+
+
+@pytest.fixture(autouse=True)
+def raised_alerts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Every operator alert a detached calendar write raised.
+
+    This is where a booking failure now surfaces. The agent has already said the
+    time is theirs, so there is no conversational recovery left to assert on —
+    the alert IS the outcome, and a failure that raises none is a silent one.
+    """
+    raised: list[dict[str, str]] = []
+
+    async def capture(*, dedup_key: str, message: str) -> bool:
+        raised.append({"dedup_key": dedup_key, "message": message})
+        return True
+
+    monkeypatch.setattr("app.services.tools.crm_tools.raise_operator_alert", capture)
+    return raised
+
 
 START = "2026-08-03T14:00:00Z"
 PAYLOAD = {
@@ -657,8 +677,16 @@ async def test_concurrent_same_intent_issues_exactly_one_cal_create(
             first.book_appointment(START, icp=PAYLOAD["icp"]),
             second.book_appointment(START, icp=PAYLOAD["icp"]),
         )
+        # The Cal.com write now runs behind the agent's confirmation, so the race
+        # this test exists for happens HERE, between two detached writes. That is
+        # exactly where a duplicate booking would appear if the lease stopped
+        # holding, and the assertion below is unchanged: one create, ever.
+        await crm_tools.wait_for_calendar_writes()
 
-    assert sum(bool(result.get("success")) for result in results) == 1
+    # Both callers are told the time is theirs — the lease decides who actually
+    # writes it, and the loser's intent stays recoverable rather than becoming a
+    # second booking.
+    assert all(bool(result.get("success")) for result in results)
     assert create.await_count == 1
     row = await load_row(outbox_session_factory, intent_key)
     assert row.state == "pending"
@@ -725,8 +753,11 @@ async def test_negative_concurrent_loser_cannot_cancel_winner_crash_recovery(
         ),
     ):
         result = await tools.book_appointment(START, icp=PAYLOAD["icp"])
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["success"] is False
+    # The caller was told the time is theirs; the loser's intent stays recoverable
+    # rather than being erased, which is the property under test.
+    assert result["success"] is True
     retained = await load_row(outbox_session_factory, intent_key)
     assert retained.state == "booking_dispatched"
     assert retained.booking_dispatched_at is not None

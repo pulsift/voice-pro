@@ -10,10 +10,29 @@ from app.api.calls import get_call
 from app.api.telephony_ws import save_transcript_to_call_record
 from app.core.config import settings
 from app.services.calcom_client import create_booking, sanitize_provider_text
+from app.services.tools import crm_tools
 from app.services.tools.crm_tools import CRMTools
 
 SLOT = {"start": "2026-07-13T09:00:00Z", "label": "Monday 11:00 AM"}
 ICP = {"offer_types": ["commercial solar"], "min_kw": 50, "states": ["Texas"]}
+
+
+@pytest.fixture(autouse=True)
+def raised_alerts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Every operator alert a detached calendar write raised.
+
+    This is where a booking failure now surfaces. The agent has already said the
+    time is theirs, so there is no conversational recovery left to assert on —
+    the alert IS the outcome, and a failure that raises none is a silent one.
+    """
+    raised: list[dict[str, str]] = []
+
+    async def capture(*, dedup_key: str, message: str) -> bool:
+        raised.append({"dedup_key": dedup_key, "message": message})
+        return True
+
+    monkeypatch.setattr("app.services.tools.crm_tools.raise_operator_alert", capture)
+    return raised
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +76,19 @@ async def offer_and_select(tools: CRMTools) -> None:
     assert (await tools.select_slot("slot_1"))["success"] is True
 
 
+def landed_uid(tools: CRMTools) -> str | None:
+    """The booking id the detached calendar write recorded, once it has run.
+
+    book_appointment returns before Cal.com is called, so the uid cannot be in
+    its result. It is on the create/reconcile attempt instead — the same record
+    the call is persisted with, so this is also what the dashboard reads.
+    """
+    for attempt in reversed(tools.get_booking_attempts()):
+        if attempt.get("uid"):
+            return str(attempt["uid"])
+    return None
+
+
 @pytest.mark.asyncio
 async def test_timeout_after_provider_commit_reconciles_without_duplicate_post() -> None:
     """An unknown POST outcome must be checked before a second POST is allowed."""
@@ -96,9 +128,10 @@ async def test_timeout_after_provider_commit_reconciles_without_duplicate_post()
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
     assert result["success"] is True
-    assert result["uid"] == "committed-booking"
+    assert landed_uid(tools) == "committed-booking"
     assert post.await_count == 1
     assert reconcile.await_count == 2
     reconcile.assert_awaited_with(start_iso=SLOT["start"], email="lead@example.com")
@@ -140,16 +173,22 @@ async def test_repeated_booking_invocation_never_reposts_a_dispatched_intent() -
         ),
     ):
         first = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
         second = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert first["success"] is False
-    assert second["success"] is False
+    # Both calls answer the agent identically — it no longer waits to find out.
+    # The lease is what stops the second one posting, and that is the guarantee
+    # this test exists for.
+    assert first == second
     assert post.await_count == 1
     assert {call.kwargs["start_iso"] for call in post.await_args_list} == {SLOT["start"]}
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_unavailable_blocks_retry_post() -> None:
+async def test_reconciliation_unavailable_blocks_retry_post(
+    raised_alerts: list[dict[str, str]],
+) -> None:
     """A broken read-after-write check must fail closed rather than duplicate a booking."""
     tools = make_tools()
     await offer_and_select(tools)
@@ -183,13 +222,16 @@ async def test_reconciliation_unavailable_blocks_retry_post() -> None:
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.asyncio.sleep", AsyncMock()),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["success"] is False
-    assert result["error"] == "booking_outcome_unknown"
+    # Fails closed exactly as before — one post, never a duplicate. The uncertain
+    # outcome now reaches a human instead of the agent.
     assert post.await_count == 1
     assert reconcile.await_count == 2
     assert tools.get_booking_attempts()[-1]["category"] == "reconcile_unavailable"
+    assert len(raised_alerts) == 1
+    assert "the calendar response was uncertain" in raised_alerts[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -215,9 +257,10 @@ async def test_new_session_preflight_finds_existing_booking_before_any_post() ->
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "earlier-session-booking"
+    assert landed_uid(tools) == "earlier-session-booking"
     post.assert_not_awaited()
     reconcile.assert_awaited_once_with(start_iso=SLOT["start"], email="lead@example.com")
     webhook.assert_awaited_once()
@@ -251,9 +294,10 @@ async def test_booking_transition_evidence_orders_offer_select_reconcile_create(
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent"),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "new-booking"
+    assert landed_uid(tools) == "new-booking"
     assert [attempt["operation"] for attempt in tools.get_booking_attempts()] == [
         "availability",
         "select",
@@ -317,9 +361,10 @@ async def test_fulfilment_intent_commits_before_cal_post_and_finalizes_after_suc
             AsyncMock(side_effect=finalize_intent),
         ),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "booking-ordered"
+    assert landed_uid(tools) == "booking-ordered"
     assert order == ["stage", "reconcile", "create", "finalize"]
     assert staged.await_args.kwargs["start_iso"] == SLOT["start"]
     assert staged.await_args.kwargs["email"] == "lead@example.com"
@@ -350,6 +395,7 @@ async def test_receiver_incompatible_icp_cannot_create_booking(
         patch("app.services.calcom_client.create_booking", create),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=invalid_icp)
+        await crm_tools.wait_for_calendar_writes()
 
     assert result["success"] is False
     assert result["error"] == "invalid_icp"
@@ -374,6 +420,7 @@ async def test_intent_stage_failure_prevents_any_cal_read_or_write() -> None:
         patch("app.services.calcom_client.create_booking", create),
     ):
         result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
     assert result["success"] is False
     assert result["error"] == "fulfilment_unavailable"
@@ -419,9 +466,10 @@ async def test_malformed_success_response_fails_closed_then_reconciles(
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent"),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "verified-by-read"
+    assert landed_uid(tools) == "verified-by-read"
     client.post.assert_awaited_once()
     assert reconcile.await_args_list == [
         call(start_iso=SLOT["start"], email="lead@example.com"),
@@ -468,9 +516,10 @@ async def test_unreadable_success_response_reconciles_without_duplicate_post() -
         patch("app.services.calcom_client.find_existing_booking", reconcile),
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent", webhook),
     ):
-        result = await tools.book_appointment(SLOT["start"], icp=ICP)
+        await tools.book_appointment(SLOT["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "committed-despite-broken-json"
+    assert landed_uid(tools) == "committed-despite-broken-json"
     client.post.assert_awaited_once()
     assert reconcile.await_args_list == [
         call(start_iso=SLOT["start"], email="lead@example.com"),
@@ -820,6 +869,7 @@ async def test_a_list_is_never_promised_with_no_fit_answers_to_build_it_from():
     post = AsyncMock()
     with patch("app.services.calcom_client.create_booking", post):
         result = await tools.book_appointment(SLOT["start"], icp=None)
+        await crm_tools.wait_for_calendar_writes()
 
     assert result["success"] is False
     assert result["error"] == "missing_icp"
@@ -835,5 +885,6 @@ async def test_an_empty_fit_answer_object_counts_as_no_fit_answers():
     post = AsyncMock()
     with patch("app.services.calcom_client.create_booking", post):
         result = await tools.book_appointment(SLOT["start"], icp={})
+        await crm_tools.wait_for_calendar_writes()
     assert result["error"] == "missing_icp"
     post.assert_not_awaited()

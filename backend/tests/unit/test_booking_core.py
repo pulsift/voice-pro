@@ -12,6 +12,25 @@ from app.services.calcom_client import create_booking, normalize_timezone
 from app.services.tools import crm_tools
 from app.services.tools.crm_tools import CRMTools
 
+
+@pytest.fixture(autouse=True)
+def raised_alerts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Every operator alert a detached calendar write raised.
+
+    This is where a booking failure now surfaces. The agent has already said the
+    time is theirs, so there is no conversational recovery left to assert on —
+    the alert IS the outcome, and a failure that raises none is a silent one.
+    """
+    raised: list[dict[str, str]] = []
+
+    async def capture(*, dedup_key: str, message: str) -> bool:
+        raised.append({"dedup_key": dedup_key, "message": message})
+        return True
+
+    monkeypatch.setattr("app.services.tools.crm_tools.raise_operator_alert", capture)
+    return raised
+
+
 SLOT_1 = {"start": "2026-07-13T09:00:00Z", "label": "Monday 11:00 AM"}
 SLOT_2 = {"start": "2026-07-13T13:00:00Z", "label": "Monday 3:00 PM"}
 ICP = {"offer_types": ["commercial solar"], "min_kw": 50, "states": ["Texas"]}
@@ -70,6 +89,19 @@ def test_normalize_timezone_contract() -> None:
     assert normalize_timezone(None, "America/New_York", "UTC") == "America/New_York"
     assert normalize_timezone(None, "also unknown", "UTC") == "UTC"
     assert normalize_timezone("unknown", "also unknown", "bad/default") is None
+
+
+def landed_uid(tools: CRMTools) -> str | None:
+    """The booking id the detached calendar write recorded, once it has run.
+
+    book_appointment returns before Cal.com is called, so the uid cannot be in
+    its result. It is on the create/reconcile attempt instead — the same record
+    the call is persisted with, so this is also what the dashboard reads.
+    """
+    for attempt in reversed(tools.get_booking_attempts()):
+        if attempt.get("uid"):
+            return str(attempt["uid"])
+    return None
 
 
 @pytest.mark.asyncio
@@ -372,20 +404,25 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
         assert (await tools.book_appointment(SLOT_1["start"], icp=ICP))["error"] == (
             "slots_not_offered"
         )
+        await crm_tools.wait_for_calendar_writes()
         await tools.check_availability(time_zone="Europe/Stockholm")
         assert (await tools.book_appointment(SLOT_1["start"], icp=ICP))["error"] == (
             "slot_not_selected"
         )
+        await crm_tools.wait_for_calendar_writes()
         tools.observe_user_utterance("the second one")
         await tools.select_slot("slot_2")
         assert (await tools.book_appointment(SLOT_1["start"], icp=ICP))["error"] == (
             "slot_mismatch"
         )
+        await crm_tools.wait_for_calendar_writes()
         booked = await tools.book_appointment("2026-07-13T13:00:00+00:00", icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
         duplicate = await tools.book_appointment(SLOT_2["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
     assert booked == duplicate
-    assert booked["uid"] == "booking-1"
+    assert landed_uid(tools) == "booking-1"
     create_booking.assert_awaited_once_with(
         start_iso=SLOT_2["start"],
         name="Sami",
@@ -427,9 +464,10 @@ async def _book_and_capture_fulfilment_payload(tools: CRMTools) -> dict:
         await tools.check_availability(time_zone="UTC")
         tools.observe_user_utterance("the first one")
         await tools.select_slot("slot_1")
-        result = await tools.book_appointment(SLOT_1["start"], icp=ICP)
+        await tools.book_appointment(SLOT_1["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["uid"] == "booking-1"
+    assert landed_uid(tools) == "booking-1"
     return crm_tools.stage_fulfilment_intent.call_args.kwargs["payload"]
 
 
@@ -500,6 +538,7 @@ async def test_live_email_overrides_seed_and_missing_placeholder_is_rejected() -
     await tools.select_slot("slot_1")
 
     assert (await tools.book_appointment(SLOT_1["start"], icp=ICP))["error"] == "missing_email"
+    await crm_tools.wait_for_calendar_writes()
     create_booking = AsyncMock(
         return_value={"success": True, "category": "success", "status_code": 201, "uid": "b2"}
     )
@@ -512,35 +551,39 @@ async def test_live_email_overrides_seed_and_missing_placeholder_is_rejected() -
         patch("app.services.tools.crm_tools.finalize_fulfilment_intent"),
     ):
         await tools.book_appointment(SLOT_1["start"], email="live@example.com", icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
     assert create_booking.await_args.kwargs["email"] == "live@example.com"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("outcomes", "expected_error", "expected_calls"),
+    ("outcomes", "expected_reason", "expected_calls"),
     [
         (
             [
                 {"success": False, "category": "transient", "status_code": 429},
                 {"success": False, "category": "transient", "status_code": 500},
             ],
-            "booking_outcome_unknown",
+            "the calendar response was uncertain",
             1,
         ),
         (
             [{"success": False, "category": "rejected", "status_code": 400}],
-            "booking_rejected",
+            "the calendar refused it",
             1,
         ),
         (
             [{"success": False, "category": "rejected", "status_code": 422}],
-            "booking_rejected",
+            "the calendar refused it",
             1,
         ),
     ],
 )
 async def test_retry_once_and_non_retryable_matrix(
-    outcomes: list[dict[str, object]], expected_error: str, expected_calls: int
+    outcomes: list[dict[str, object]],
+    expected_reason: str,
+    expected_calls: int,
+    raised_alerts: list[dict[str, str]],
 ) -> None:
     tools = make_tools()
     create_booking = AsyncMock(side_effect=outcomes)
@@ -565,8 +608,13 @@ async def test_retry_once_and_non_retryable_matrix(
         tools.observe_user_utterance("first")
         await tools.select_slot("slot_1")
         result = await tools.book_appointment(SLOT_1["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["error"] == expected_error
+    # The write failed after the agent had already confirmed the time, so the
+    # outcome is an alert naming the prospect, not a line for the agent to say.
+    assert result["success"] is True
+    assert len(raised_alerts) == 1
+    assert expected_reason in raised_alerts[0]["message"]
     assert create_booking.await_count == expected_calls
     attempts = tools.get_booking_attempts()
     assert sum(attempt["operation"] == "create" for attempt in attempts) == expected_calls
@@ -575,7 +623,9 @@ async def test_retry_once_and_non_retryable_matrix(
 
 
 @pytest.mark.asyncio
-async def test_transient_create_never_dispatches_a_second_post() -> None:
+async def test_transient_create_never_dispatches_a_second_post(
+    raised_alerts: list[dict[str, str]],
+) -> None:
     tools = make_tools()
     create_booking = AsyncMock(
         side_effect=[
@@ -606,16 +656,32 @@ async def test_transient_create_never_dispatches_a_second_post() -> None:
         tools.observe_user_utterance("first")
         await tools.select_slot("slot_1")
         result = await tools.book_appointment(SLOT_1["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["error"] == "booking_outcome_unknown"
+    # One post, ever — the property this test exists for, unchanged. What moved is
+    # where the uncertainty surfaces: the caller has been told the time is theirs,
+    # so it reaches Sami as an alert instead of the agent as a recovery line.
+    assert result["success"] is True
     assert create_booking.await_count == 1
     assert find_existing_booking.await_count == 2
     find_existing_booking.assert_awaited_with(start_iso=SLOT_1["start"], email="seeded@example.com")
     webhook.assert_not_awaited()
+    assert len(raised_alerts) == 1
+    assert "the calendar response was uncertain" in raised_alerts[0]["message"]
 
 
 @pytest.mark.asyncio
-async def test_conflict_refreshes_without_substitute_booking() -> None:
+async def test_a_conflict_alerts_instead_of_re_offering(
+    raised_alerts: list[dict[str, str]],
+) -> None:
+    """A slot taken between the menu and the write is now a human's problem.
+
+    It used to come back as fresh times for the agent to offer. It cannot: the
+    caller has already been told that time is theirs and the call has usually
+    ended. So the guarantee changes shape but not strength — still exactly one
+    create, still never a substitute booking chosen on the caller's behalf, and
+    now an alert that names them and the exact time they were promised.
+    """
     tools = make_tools()
     fresh = [{"start": "2026-07-14T09:00:00Z", "label": "Tuesday 9:00 AM"}]
     get_slots = AsyncMock(side_effect=[[SLOT_1, SLOT_2], fresh])
@@ -634,20 +700,16 @@ async def test_conflict_refreshes_without_substitute_booking() -> None:
         tools.observe_user_utterance("second")
         await tools.select_slot("slot_2")
         result = await tools.book_appointment(SLOT_2["start"], icp=ICP)
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["error"] == "slot_conflict"
-    assert result["slots"] == [
-        {
-            "slot_id": "slot_1",
-            "when": "Tuesday at nine in the morning",
-            "start": fresh[0]["start"],
-        }
-    ]
+    assert result["success"] is True
+    assert len(raised_alerts) == 1
+    assert "taken between the menu being built and the write" in (
+        raised_alerts[0]["message"]
+    )
     assert create_booking.await_count == 1
-    assert get_slots.await_args_list == [
-        call(lead_tz="UTC", days=LOOKAHEAD_DAYS),
-        call(lead_tz="UTC", days=LOOKAHEAD_DAYS),
-    ]
+    # No second calendar read: there is nothing left to re-offer to.
+    assert get_slots.await_args_list == [call(lead_tz="UTC", days=LOOKAHEAD_DAYS)]
     assert (await tools.select_slot("slot_1"))["error"] == "selection_not_heard"
 
 
@@ -666,6 +728,7 @@ async def test_new_availability_invalidates_selection_and_instances_are_isolated
     assert (await first.book_appointment(SLOT_1["start"], icp=ICP))["error"] == (
         "slot_not_selected"
     )
+    await crm_tools.wait_for_calendar_writes()
     assert (await second.select_slot("slot_1"))["error"] == "slots_not_offered"
 
 

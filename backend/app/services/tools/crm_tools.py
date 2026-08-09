@@ -31,6 +31,7 @@ from app.services.fulfilment_webhook import (
     finalize_fulfilment_intent,
     stage_fulfilment_intent,
 )
+from app.services.operator_alerts import raise_operator_alert
 
 logger = structlog.get_logger()
 MAX_BOOKING_ATTEMPTS = 2
@@ -44,6 +45,25 @@ _FULFILMENT_ICP_FIELDS = {*_FULFILMENT_ICP_LIST_FIELDS, "min_kw"}
 
 AvailabilityLoader = Callable[[str, str], Awaitable[AvailabilityResult | None]]
 AvailabilityInvalidator = Callable[[str], Awaitable[None]]
+
+# Calendar writes that outlive the sentence that promised them. asyncio keeps only
+# a weak reference to a running task, so a set at module scope is what stops the
+# garbage collector cancelling a booking mid-flight.
+_CALENDAR_WRITES: set[asyncio.Task[None]] = set()
+
+
+async def wait_for_calendar_writes(timeout: float = 10.0) -> int:  # noqa: ASYNC109
+    """Let in-flight calendar writes finish. Returns how many were still running.
+
+    Called at call teardown. The writes are already durable and already alert on
+    failure, so this is not correctness - it is the difference between the booking
+    landing before the call record is written and landing just after it.
+    """
+    pending = {task for task in _CALENDAR_WRITES if not task.done()}
+    if pending:
+        logger.info("waiting_for_calendar_writes", count=len(pending))
+        await asyncio.wait(pending, timeout=timeout)
+    return len(pending)
 
 
 def _normalize_fulfilment_icp(value: dict[str, Any] | str) -> dict[str, Any]:
@@ -156,6 +176,11 @@ class CRMTools:
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
+        # What the caller was actually told, kept for the operator alert that fires
+        # if the calendar write behind it fails. "A booking failed" is not
+        # actionable; "Peter was told Wednesday at midday" is.
+        self._pending_booking_label: str | None = None
+        self._pending_booking_email: str | None = None
         # Fit answers (what they install, areas they cover), captured the moment
         # they're given - independent of booking, so a call that ends before
         # book_appointment ever runs still hands the team something real. See
@@ -1345,6 +1370,235 @@ class CRMTools:
             self.logger.exception("check_availability_failed", error=str(e))
             return {"success": False, "error": str(e)}
 
+    async def _alert_operator_about_booking(
+        self, *, intent_key: str, reason: str, detail: str = ""
+    ) -> None:
+        """Tell a human, because the agent already promised this time out loud.
+
+        The old code answered every calendar failure by handing the model a line
+        to say. That option is gone by design - the caller has heard "you're
+        booked" and the call has usually ended - so the recovery moves from the
+        conversation to Sami. The alert names the prospect and the exact time,
+        because "a booking failed" is not actionable and this is the only signal
+        anyone gets.
+        """
+        when = self._describe_selected(self._pending_booking_label)
+        message = (
+            f"{self._pending_booking_email or 'a prospect'} was told on the phone that "
+            f"{when} was booked, and the calendar write did not go through "
+            f"({reason}). They are expecting an invite that does not exist - this "
+            f"needs booking by hand and an email to them."
+        )
+        if detail:
+            message = f"{message} {detail}"
+        self.logger.error(
+            "booking_promised_but_not_written", intent_key=intent_key, reason=reason
+        )
+        await raise_operator_alert(
+            dedup_key=f"voice-booking-unconfirmed:{intent_key}", message=message
+        )
+
+    @staticmethod
+    def _describe_selected(label: str | None) -> str:
+        return label or "the time they chose"
+
+    async def _write_booking_to_calendar(  # noqa: PLR0911, PLR0912, PLR0915
+        self,
+        *,
+        intent_key: str,
+        booking_claim_token: uuid.UUID | None,
+        selected_start: str,
+        name: str,
+        attendee_email: str,
+        lead_tz: str,
+        full_notes: str,
+    ) -> None:
+        """Write the booking to Cal.com after the agent has already confirmed it.
+
+        Detached from the conversation, so nothing here can return a message to the
+        model: by the time it runs the caller has been told the time is theirs and
+        the agent has moved on. Every path that used to hand the agent a recovery
+        line therefore ends in an operator alert instead.
+
+        The idempotency machinery is unchanged and still carries its full weight -
+        reconcile before the first POST, at most one create, reconcile again after
+        a transient. A repeat call after a reconnect or a redeploy must never
+        produce a second booking for the same attendee and start.
+        """
+        booking_dispatched = False
+        log = self.logger.bind(intent_key=intent_key, selected_start=selected_start)
+        try:
+            from app.services.calcom_client import create_booking, find_existing_booking
+
+            booking_result: dict[str, Any] = {}
+            selected_attempts = [
+                attempt
+                for attempt in self._booking_attempts
+                if attempt.get("operation") == "create"
+                and attempt.get("selected_start") == selected_start
+            ]
+            prior_count = len(selected_attempts)
+            if selected_attempts:
+                last_category = selected_attempts[-1].get("category")
+                if last_category == "rejected":
+                    await self._alert_operator_about_booking(
+                        intent_key=intent_key, reason="the calendar rejected it earlier"
+                    )
+                    return
+                if last_category == "transient":
+                    booking_result = await find_existing_booking(
+                        start_iso=selected_start, email=attendee_email
+                    )
+                    self._record_booking_attempt(
+                        "reconcile", selected_start, lead_tz, booking_result
+                    )
+                    if booking_result.get("success"):
+                        prior_count = MAX_BOOKING_ATTEMPTS
+                    elif booking_result.get("category") == "reconcile_unavailable":
+                        await self._alert_operator_about_booking(
+                            intent_key=intent_key,
+                            reason="the calendar could not be checked safely",
+                        )
+                        return
+                    elif prior_count >= MAX_BOOKING_ATTEMPTS:
+                        await self._alert_operator_about_booking(
+                            intent_key=intent_key, reason="the calendar kept failing"
+                        )
+                        return
+
+            # Reconcile before the first POST as well as after an unknown one. This
+            # closes the process/session boundary: a repeated call after reconnect
+            # or redeploy cannot create a second booking for the same attendee and
+            # exact start.
+            if prior_count == 0 and not booking_result:
+                booking_result = await find_existing_booking(
+                    start_iso=selected_start, email=attendee_email
+                )
+                self._record_booking_attempt(
+                    "reconcile", selected_start, lead_tz, booking_result
+                )
+                if booking_result.get("success"):
+                    prior_count = MAX_BOOKING_ATTEMPTS
+                elif booking_result.get("category") == "reconcile_unavailable":
+                    await self._alert_operator_about_booking(
+                        intent_key=intent_key,
+                        reason="the calendar could not be checked safely",
+                    )
+                    return
+
+            if not booking_result.get("success"):
+                if booking_claim_token is None:
+                    await self._alert_operator_about_booking(
+                        intent_key=intent_key,
+                        reason="another attempt already held the booking lease",
+                    )
+                    return
+                booking_dispatched = await authorize_fulfilment_booking(
+                    intent_key, booking_claim_token
+                )
+                if not booking_dispatched:
+                    await self._alert_operator_about_booking(
+                        intent_key=intent_key,
+                        reason="the booking lease changed mid-write",
+                    )
+                    return
+
+            # A Cal.com create is non-idempotent. Once its durable dispatch marker
+            # is set, every later attempt is reconciliation-only.
+            remaining_attempts = min(1, MAX_BOOKING_ATTEMPTS - prior_count)
+            for local_attempt in range(remaining_attempts):
+                booking_result = await create_booking(
+                    start_iso=selected_start,
+                    name=name,
+                    email=attendee_email,
+                    lead_tz=lead_tz,
+                    notes=full_notes or None,
+                )
+                self._record_booking_attempt(
+                    "create", selected_start, lead_tz, booking_result, default="rejected"
+                )
+                if booking_result.get("category") != "transient":
+                    break
+                reconciliation = await find_existing_booking(
+                    start_iso=selected_start, email=attendee_email
+                )
+                self._record_booking_attempt(
+                    "reconcile", selected_start, lead_tz, reconciliation
+                )
+                if reconciliation.get("success") or (
+                    reconciliation.get("category") == "reconcile_unavailable"
+                ):
+                    booking_result = reconciliation
+                    break
+                if local_attempt < remaining_attempts - 1:
+                    await asyncio.sleep(0.1)
+        except Exception as exc:
+            log.exception("calcom_book_failed", error_type=type(exc).__name__)
+            await self._alert_operator_about_booking(
+                intent_key=intent_key, reason="the calendar call raised an error"
+            )
+            return
+
+        if booking_result.get("success"):
+            booking_id = booking_result.get("uid")
+            try:
+                if not await finalize_fulfilment_intent(intent_key, booking_id):
+                    log.error("fulfilment_intent_missing_after_booking")
+            except ExtraBookingConflictError as exc:
+                log.exception(
+                    "calcom_extra_booking_requires_manual_reconciliation",
+                    booking_id=booking_id,
+                    error=str(exc),
+                )
+            except Exception:
+                # The pre-booking intent is already durable. Its worker can
+                # reconcile this exact attendee/slot after a commit-unknown
+                # finalization, so never treat this as a lost booking.
+                log.exception("fulfilment_intent_finalize_failed")
+            log.info("calendar_write_landed_after_the_agent_said_so", uid=booking_id)
+            return
+
+        # Everything below here means the caller was told a time that is not on the
+        # calendar. Conflict included: the old code re-offered fresh times, which is
+        # no longer possible or wanted - the agent has already committed.
+        reasons = {
+            "conflict": "that time was taken between the menu being built and the write",
+            "rejected": "the calendar refused it",
+            "reconcile_unavailable": "the calendar response was uncertain",
+            "transient": "the calendar response was uncertain",
+        }
+        category = str(booking_result.get("category") or "")
+        await self._alert_operator_about_booking(
+            intent_key=intent_key,
+            reason=reasons.get(category, "the calendar write did not complete"),
+        )
+
+    def _record_booking_attempt(
+        self,
+        operation: str,
+        selected_start: str,
+        lead_tz: str,
+        result: dict[str, Any],
+        *,
+        default: str | None = None,
+    ) -> None:
+        """Append one calendar attempt to the record the call is persisted with."""
+        self._booking_attempts.append(
+            {
+                "operation": operation,
+                "attempt": len(self._booking_attempts) + 1,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "selected_start": selected_start,
+                "timezone": lead_tz,
+                "category": result.get("category", default)
+                if default
+                else result.get("category"),
+                "status_code": result.get("status_code"),
+                "uid": result.get("uid") if result.get("success") else None,
+                "raw_body": str(result.get("raw_body") or "")[:1000],
+            }
+        )
+
     async def book_appointment(  # noqa: PLR0911, PLR0912, PLR0915
         self,
         scheduled_at: str,
@@ -1433,6 +1687,20 @@ class CRMTools:
                     ),
                 }
 
+            # Captured before the handover nulls the live selection: the background
+            # write must book the time the caller actually chose, not whatever the
+            # session state has become by the time it runs.
+            selected_start_iso = self._selected_start
+            self._pending_booking_label = next(
+                (
+                    slot.get("label")
+                    for slot in self._offered_slots
+                    if slot.get("slot_id") == self._selected_slot_id
+                ),
+                None,
+            )
+            self._pending_booking_email = attendee_email
+
             icp_str = json.dumps(fulfilment_icp, ensure_ascii=False)
             full_notes = notes or ""
             if service_type:
@@ -1461,7 +1729,7 @@ class CRMTools:
                 fulfilment_payload["promise_key"] = promise_key
             try:
                 intent_key = await stage_fulfilment_intent(
-                    start_iso=self._selected_start,
+                    start_iso=selected_start_iso,
                     email=attendee_email,
                     payload=fulfilment_payload,
                     workspace_id=self.workspace_id,
@@ -1482,268 +1750,47 @@ class CRMTools:
                     ),
                 }
 
-            booking_dispatched = False
-            try:
-                from app.services.calcom_client import create_booking, find_existing_booking
-
-                booking_result: dict[str, Any] = {}
-                selected_attempts = [
-                    attempt
-                    for attempt in self._booking_attempts
-                    if attempt.get("operation") == "create"
-                    and attempt.get("selected_start") == self._selected_start
-                ]
-                prior_count = len(selected_attempts)
-                if selected_attempts:
-                    last_category = selected_attempts[-1].get("category")
-                    if last_category == "rejected":
-                        return {
-                            "success": False,
-                            "error": "booking_rejected",
-                            "status_code": selected_attempts[-1].get("status_code"),
-                        }
-                    if last_category == "transient":
-                        booking_result = await find_existing_booking(
-                            start_iso=self._selected_start,
-                            email=attendee_email,
-                        )
-                        self._booking_attempts.append(
-                            {
-                                "operation": "reconcile",
-                                "attempt": len(self._booking_attempts) + 1,
-                                "timestamp": datetime.now(UTC).isoformat(),
-                                "selected_start": self._selected_start,
-                                "timezone": lead_tz,
-                                "category": booking_result.get("category"),
-                                "status_code": booking_result.get("status_code"),
-                                "uid": booking_result.get("uid")
-                                if booking_result.get("success")
-                                else None,
-                                "raw_body": str(booking_result.get("raw_body") or "")[:1000],
-                            }
-                        )
-                        if booking_result.get("success"):
-                            prior_count = MAX_BOOKING_ATTEMPTS
-                        elif booking_result.get("category") == "reconcile_unavailable":
-                            return {
-                                "success": False,
-                                "error": "booking_outcome_unknown",
-                                "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
-                            }
-                        elif prior_count >= MAX_BOOKING_ATTEMPTS:
-                            return {
-                                "success": False,
-                                "error": "booking_failed",
-                                "message": "The calendar hiccuped - tell them you'll email to lock it in, then call end_call.",
-                            }
-
-                # Reconcile before the first POST as well as after an unknown POST.
-                # This closes the process/session boundary: a repeated tool call after
-                # reconnect or redeploy cannot create a second booking for the same
-                # attendee and exact start.
-                if prior_count == 0 and not booking_result:
-                    booking_result = await find_existing_booking(
-                        start_iso=self._selected_start,
-                        email=attendee_email,
-                    )
-                    self._booking_attempts.append(
-                        {
-                            "operation": "reconcile",
-                            "attempt": len(self._booking_attempts) + 1,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "selected_start": self._selected_start,
-                            "timezone": lead_tz,
-                            "category": booking_result.get("category"),
-                            "status_code": booking_result.get("status_code"),
-                            "uid": booking_result.get("uid")
-                            if booking_result.get("success")
-                            else None,
-                            "raw_body": str(booking_result.get("raw_body") or "")[:1000],
-                        }
-                    )
-                    if booking_result.get("success"):
-                        prior_count = MAX_BOOKING_ATTEMPTS
-                    elif booking_result.get("category") == "reconcile_unavailable":
-                        return {
-                            "success": False,
-                            "error": "booking_outcome_unknown",
-                            "message": "The calendar cannot safely verify this time. Do not retry it; tell them the team will confirm by email.",
-                        }
-
-                if not booking_result.get("success"):
-                    if booking_claim_token is None:
-                        return {
-                            "success": False,
-                            "error": "booking_outcome_unknown",
-                            "message": "Another booking attempt is being verified. Do not try that time again; tell them the team will confirm by email.",
-                        }
-                    booking_dispatched = await authorize_fulfilment_booking(
-                        intent_key,
-                        booking_claim_token,
-                    )
-                    if not booking_dispatched:
-                        return {
-                            "success": False,
-                            "error": "booking_outcome_unknown",
-                            "message": "The booking lease changed while the calendar was checked. Do not try that time again; tell them the team will confirm by email.",
-                        }
-
-                # A Cal.com create is non-idempotent. Once its durable dispatch
-                # marker is set, every later attempt is reconciliation-only.
-                remaining_attempts = min(1, MAX_BOOKING_ATTEMPTS - prior_count)
-                for local_attempt in range(remaining_attempts):
-                    booking_result = await create_booking(
-                        start_iso=self._selected_start,
-                        name=name,
-                        email=attendee_email,
-                        lead_tz=lead_tz,
-                        notes=full_notes or None,
-                    )
-                    self._booking_attempts.append(
-                        {
-                            "operation": "create",
-                            "attempt": len(self._booking_attempts) + 1,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "selected_start": self._selected_start,
-                            "timezone": lead_tz,
-                            "category": booking_result.get("category", "rejected"),
-                            "status_code": booking_result.get("status_code"),
-                            "uid": booking_result.get("uid")
-                            if booking_result.get("success")
-                            else None,
-                            "raw_body": str(booking_result.get("raw_body") or "")[:1000],
-                        }
-                    )
-                    if booking_result.get("category") != "transient":
-                        break
-                    reconciliation = await find_existing_booking(
-                        start_iso=self._selected_start,
-                        email=attendee_email,
-                    )
-                    self._booking_attempts.append(
-                        {
-                            "operation": "reconcile",
-                            "attempt": len(self._booking_attempts) + 1,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                            "selected_start": self._selected_start,
-                            "timezone": lead_tz,
-                            "category": reconciliation.get("category"),
-                            "status_code": reconciliation.get("status_code"),
-                            "uid": reconciliation.get("uid")
-                            if reconciliation.get("success")
-                            else None,
-                            "raw_body": str(reconciliation.get("raw_body") or "")[:1000],
-                        }
-                    )
-                    if reconciliation.get("success"):
-                        booking_result = reconciliation
-                        break
-                    if reconciliation.get("category") == "reconcile_unavailable":
-                        booking_result = reconciliation
-                        break
-                    if local_attempt < remaining_attempts - 1:
-                        await asyncio.sleep(0.1)
-            except Exception as e:
-                self.logger.exception("calcom_book_failed", error=str(e))
-                if booking_dispatched:
-                    return {
-                        "success": False,
-                        "error": "booking_outcome_unknown",
-                        "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
-                    }
-                return {"success": False, "error": "booking_failed"}
-            if booking_result.get("success"):
-                booking_id = booking_result.get("uid")
-                try:
-                    finalized = await finalize_fulfilment_intent(intent_key, booking_id)
-                    if not finalized:
-                        self.logger.error("fulfilment_intent_missing_after_booking")
-                except ExtraBookingConflictError as exc:
-                    self.logger.exception(
-                        "calcom_extra_booking_requires_manual_reconciliation",
-                        intent_key=intent_key,
-                        booking_id=booking_id,
-                        error=str(exc),
-                    )
-                except Exception as exc:
-                    # The pre-booking intent is already durable. Its worker can
-                    # reconcile this exact attendee/slot after a commit-unknown
-                    # finalization, so never deny a booking Cal.com proved exists.
-                    self.logger.exception(
-                        "fulfilment_intent_finalize_failed",
-                        error_type=type(exc).__name__,
-                    )
-                self._selected_slot_id = None
-                self._selected_start = None
-                self._booking_completed = {
-                    "success": True,
-                    "message": (
-                        "Booked - the invite is on its way to the lead. Now: confirm the time "
-                        "back to them ONCE in a short line, give ONE warm goodbye, then call end_call."
-                    ),
-                    "uid": booking_id,
-                }
-                return deepcopy(self._booking_completed)
-            if booking_result.get("category") == "conflict":
-                try:
-                    fresh_menu = await self._load_availability_menu(
-                        lead_tz, origin="offered"
-                    )
-                except Exception as e:
-                    self._replace_offered_slots([], lead_tz)
-                    self.logger.exception(
-                        "calcom_conflict_refresh_failed", error_type=type(e).__name__
-                    )
-                    return {"success": False, "error": "calendar_unavailable"}
-                if fresh_menu is None:
-                    return {"success": False, "error": "availability_superseded"}
-                if fresh_menu["status"] == "unavailable":
-                    return {"success": False, "error": "calendar_unavailable"}
-                if fresh_menu["status"] == "empty":
-                    return {
-                        "success": False,
-                        "error": "slot_conflict",
-                        "timezone": fresh_menu["timezone"],
-                        "slots": [],
-                        "menu": fresh_menu["block"],
-                        "message": "That time was just taken and the calendar has no current openings. End without booking.",
-                    }
-                if not self._offered_slots:
-                    return {"success": False, "error": "calendar_unavailable"}
-                return {
-                    "success": False,
-                    "error": "slot_conflict",
-                    "timezone": fresh_menu["timezone"],
-                    "slots": [
-                        {"slot_id": s["slot_id"], "when": s["label"], "start": s["start"]}
-                        for s in self._offered_slots
-                    ],
-                    "menu": fresh_menu["block"],
-                    "message": "That time was just taken. Offer these fresh times without choosing one automatically.",
-                }
-            if booking_result.get("category") == "rejected":
-                return {
-                    "success": False,
-                    "error": "booking_rejected",
-                    "status_code": booking_result.get("status_code"),
-                }
-            if booking_result.get("category") == "reconcile_unavailable":
-                return {
-                    "success": False,
-                    "error": "booking_outcome_unknown",
-                    "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
-                }
-            if booking_result.get("category") == "transient":
-                return {
-                    "success": False,
-                    "error": "booking_outcome_unknown",
-                    "message": "The calendar response is uncertain. Do not try that time again; tell them the team will confirm by email.",
-                }
-            return {
-                "success": False,
-                "error": "booking_failed",
-                "message": "The calendar hiccuped - tell them you'll email to lock it in, then call end_call.",
+            # THE HANDOVER. Everything above this line was local: the slot was
+            # already validated against the loaded menu by select_slot, and
+            # stage_fulfilment_intent has just made the promise durable. All that
+            # is left is Cal.com's own write, which measured SEVEN SECONDS on the
+            # 2026-08-08 call - seven seconds in which the prompt claimed "every
+            # tool answers instantly", the model correctly sensed the real silence,
+            # and filled it with "our booking step is still processing in the
+            # background, so give it a moment". Sami: "Who said I want to give it a
+            # moment?"
+            #
+            # His ruling, 2026-08-09: "he should just trigger the tool to book and
+            # then just not wait for it... immediately he says something along the
+            # lines of 'sounds good Sami, Wednesday at midday it is' and then he
+            # immediately moves on." So the tool answers now and the calendar
+            # catches up. A failure after this point cannot lose the lead - the
+            # intent is on disk and the alert below names the prospect and the
+            # exact time promised.
+            self._selected_slot_id = None
+            self._selected_start = None
+            self._booking_completed = {
+                "success": True,
+                "message": (
+                    "Booked. Say the day and time back to them ONCE in a short line, "
+                    "give ONE warm goodbye, then call end_call."
+                ),
             }
+            task = asyncio.create_task(
+                self._write_booking_to_calendar(
+                    intent_key=intent_key,
+                    booking_claim_token=booking_claim_token,
+                    selected_start=selected_start_iso,
+                    name=name,
+                    attendee_email=attendee_email,
+                    lead_tz=lead_tz,
+                    full_notes=full_notes,
+                )
+            )
+            # A task with no strong reference can be garbage-collected mid-flight.
+            _CALENDAR_WRITES.add(task)
+            task.add_done_callback(_CALENDAR_WRITES.discard)
+            return deepcopy(self._booking_completed)
         if self._requires_calcom:
             return {"success": False, "error": "calendar_unavailable"}
 

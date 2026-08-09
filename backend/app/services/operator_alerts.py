@@ -156,6 +156,29 @@ async def stage_operator_alert(
     )
 
 
+async def raise_operator_alert(*, dedup_key: str, message: str) -> bool:
+    """Raise one alert from code that has no transaction of its own.
+
+    `stage_operator_alert` deliberately joins the CALLER's transaction, so a state
+    change and its alert commit together. Detached work — a background task that
+    outlives the request that started it — has no such transaction to join, and
+    having no way to alert is how a failure becomes invisible. This opens a
+    session for the alert alone.
+
+    Never raises: the caller is usually already handling a failure, and an alert
+    that fails must not take the recovery down with it. Returns whether it landed.
+    """
+    from app.db.session import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db, db.begin():
+            await stage_operator_alert(db, dedup_key=dedup_key, message=message)
+    except Exception:
+        logger.exception("operator_alert_could_not_be_raised", dedup_key=dedup_key)
+        return False
+    return True
+
+
 class _Claim:
     __slots__ = ("attempts", "dedup_key", "token")
 

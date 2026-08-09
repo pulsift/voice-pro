@@ -8,7 +8,26 @@ import pytest
 
 from app.core.config import settings
 from app.services.gpt_realtime import GPTRealtimeSession
+from app.services.tools import crm_tools
 from app.services.tools.crm_tools import CRMTools
+
+
+@pytest.fixture(autouse=True)
+def raised_alerts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
+    """Every operator alert a detached calendar write raised.
+
+    This is where a booking failure now surfaces. The agent has already said the
+    time is theirs, so there is no conversational recovery left to assert on —
+    the alert IS the outcome, and a failure that raises none is a silent one.
+    """
+    raised: list[dict[str, str]] = []
+
+    async def capture(*, dedup_key: str, message: str) -> bool:
+        raised.append({"dedup_key": dedup_key, "message": message})
+        return True
+
+    monkeypatch.setattr("app.services.tools.crm_tools.raise_operator_alert", capture)
+    return raised
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +264,21 @@ async def test_interactive_refreshes_are_serialized_and_newest_wins() -> None:
 
 
 @pytest.mark.asyncio
-async def test_booking_conflict_refresh_republishes_same_menu_to_prompt_and_gate() -> None:
+async def test_a_booking_conflict_no_longer_republishes_a_menu_mid_goodbye(
+    raised_alerts: list[dict[str, str]],
+) -> None:
+    """The conflict re-offer is gone, on purpose, and must stay gone.
+
+    It used to refresh the calendar and hand the agent fresh times. That made
+    sense while the agent waited for Cal.com. It does not now: the caller has
+    been told the time is theirs and the agent is saying goodbye, so publishing a
+    new menu into the prompt would have it offering times for an appointment it
+    has already confirmed. The conflict goes to a human instead.
+
+    The menu-republishing contract itself is unchanged and still covered by the
+    refresh and timezone-correction tests above — this only pins that the BOOKING
+    path no longer triggers it.
+    """
     session, crm, update = live_session()
     initial = menu(
         "UTC",
@@ -279,10 +312,16 @@ async def test_booking_conflict_refresh_republishes_same_menu_to_prompt_and_gate
             "2026-08-03T09:00:00Z",
             icp={"offer_types": ["commercial solar"], "min_kw": 50},
         )
+        await crm_tools.wait_for_calendar_writes()
 
-    assert result["error"] == "slot_conflict"
-    assert result["menu"] == fresh["block"]
-    assert session.variables["availability_block"] == fresh["block"]
-    assert crm._offered_slots[0]["start"] == "2026-08-04T14:00:00Z"  # noqa: SLF001
-    assert update.await_count == 2
+    assert result["success"] is True
     create_booking.assert_awaited_once()
+    # The prompt still holds the menu the caller actually chose from, and the
+    # calendar was never re-read.
+    assert session.variables["availability_block"] == initial["block"]
+    assert crm._offered_slots[0]["start"] == "2026-08-03T09:00:00Z"  # noqa: SLF001
+    assert update.await_count == 1
+    assert len(raised_alerts) == 1
+    assert "taken between the menu being built and the write" in (
+        raised_alerts[0]["message"]
+    )
