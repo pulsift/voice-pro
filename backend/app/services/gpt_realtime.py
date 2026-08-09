@@ -110,6 +110,33 @@ _HELD_FLUSH_TAIL_BYTES = 8000 * 3
 DEAD_AIR_WAIT_LIMIT = 2
 
 
+def _turn_detection_config() -> dict[str, Any]:
+    """How the agent decides the caller has finished speaking.
+
+    Two different questions. Server VAD asks "has the line been quiet for N
+    milliseconds"; semantic VAD asks "does that sound like a finished thought". On
+    a phone call the second is the right question — a caller pausing to think mid
+    sentence is silent in exactly the way server VAD reads as their turn ending,
+    which is how an agent ends up talking over someone.
+
+    The two modes take DIFFERENT parameters, and passing server VAD's to semantic
+    is a silent no-op rather than an error, so they are built separately here.
+    """
+    if settings.REALTIME_TURN_DETECTION == "semantic":
+        return {
+            "type": "semantic_vad",
+            "eagerness": settings.REALTIME_SEMANTIC_EAGERNESS,
+        }
+    # Env-tunable: noisy PSTN routes need a higher threshold so line noise cannot
+    # commit phantom caller turns.
+    return {
+        "type": "server_vad",
+        "threshold": settings.REALTIME_VAD_THRESHOLD,
+        "prefix_padding_ms": settings.REALTIME_VAD_PREFIX_PADDING_MS,
+        "silence_duration_ms": settings.REALTIME_VAD_SILENCE_DURATION_MS,
+    }
+
+
 def render_template(template: str, variables: dict[str, Any] | None) -> str:
     """Fill {{placeholders}} in the agent prompt from per-call variables.
 
@@ -429,20 +456,12 @@ class GPTRealtimeSession:
                 "input": {
                     "format": {"type": "audio/pcmu"},
                     "transcription": {"model": "whisper-1"},
-                    # Less eager turn-taking so it stops cutting the caller off.
-                    # Env-tunable: noisy PSTN routes need a higher threshold so
-                    # line noise can't commit phantom caller turns.
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": settings.REALTIME_VAD_THRESHOLD,
-                        "prefix_padding_ms": settings.REALTIME_VAD_PREFIX_PADDING_MS,
-                        "silence_duration_ms": settings.REALTIME_VAD_SILENCE_DURATION_MS,
-                    },
+                    "turn_detection": _turn_detection_config(),
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
                     "voice": voice,
-                    "speed": 0.9,  # slightly slower than default (caller felt it was too fast)
+                    "speed": settings.REALTIME_OUTPUT_SPEED,
                 },
             },
             "tools": tools,

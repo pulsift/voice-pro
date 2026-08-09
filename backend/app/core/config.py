@@ -113,7 +113,23 @@ class Settings(BaseSettings):
     # env without a code change. Defaults preserve prior hardcoded behaviour.
     REALTIME_VAD_THRESHOLD: float = 0.6
     REALTIME_VAD_PREFIX_PADDING_MS: int = 300
-    REALTIME_VAD_SILENCE_DURATION_MS: int = 700
+    # 450ms, down from 700 on 2026-08-09. Three quarters of a second of silence
+    # before the agent will speak is a large part of what makes a call feel like a
+    # machine; a person comes back in about a third of one. Fable's read after the
+    # Retell comparison was that the audio dials, not the words, are the bigger
+    # remaining share of what still sounds wrong.
+    REALTIME_VAD_SILENCE_DURATION_MS: int = 450
+    # "server" listens for SILENCE. "semantic" listens for a FINISHED THOUGHT, and
+    # is what stops the agent talking over someone who is mid-sentence but paused.
+    # Switchable by env because it is a judgement by ear, and a dial that can be
+    # turned without a deploy is worth more than a dial that was right once.
+    REALTIME_TURN_DETECTION: str = "semantic"
+    # How ready semantic turn detection is to take the floor: "low" waits longest,
+    # "high" jumps soonest, "auto" is the model's own balance.
+    REALTIME_SEMANTIC_EAGERNESS: str = "auto"
+    # Output speech rate. 0.9 was set when a caller said it sounded rushed - before
+    # the turn-taking was fixed. Slow speech is its own tell.
+    REALTIME_OUTPUT_SPEED: float = 1.0
     # Optional input noise reduction ("near_field" | "far_field"). Filters audio
     # before VAD and the model — cuts phantom turns from line noise on PSTN.
     REALTIME_INPUT_NOISE_REDUCTION: str | None = None
