@@ -218,6 +218,24 @@ class SmsMessageResponse(BaseModel):
     num_media: int
     received_at: datetime | None
     created_at: datetime
+    # Which carrier carried this one. Two providers are live at once and they do
+    # NOT have the same capabilities — until A2P 10DLC is approved, Twilio can
+    # receive from US numbers but cannot send to them. Without the provider on
+    # the message, a send that will be rejected looks like one that will not.
+    provider: str
+
+
+class OurNumberResponse(BaseModel):
+    """One of our own numbers, as something to pick from."""
+
+    number: str
+    provider: str
+    message_count: int
+    last_at: datetime | None
+    # Plain language, because "A2P 10DLC pending" is not something anyone should
+    # have to hold in their head to know whether a text will actually arrive.
+    can_send_to_us: bool
+    note: str
 
 
 class ConversationResponse(BaseModel):
@@ -228,6 +246,7 @@ class ConversationResponse(BaseModel):
     last_direction: str | None
     last_at: datetime
     message_count: int
+    provider: str
 
 
 class ContactResponse(BaseModel):
@@ -385,12 +404,68 @@ async def list_inbox(
     return [_to_message_response(r) for r in rows]
 
 
+@router.get("/numbers", response_model=list[OurNumberResponse])
+async def list_our_numbers(
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_db),
+) -> list[OurNumberResponse]:
+    """Our own numbers, as a thing to pick from, busiest first.
+
+    Sami's design: pick a number, see that number's history, with the provider
+    shown. Two providers run at once and they are not interchangeable — Twilio
+    receives from US numbers today but cannot SEND to them until A2P 10DLC is
+    approved, and a rejected send (carrier error 30034) is indistinguishable from
+    a delivered one unless you already know which number you used.
+    """
+    rows = (await db.scalars(select(SmsMessage))).all()
+
+    numbers: dict[str, dict[str, Any]] = {}
+    for message in rows:
+        our_number = message.to_number if message.direction == "inbound" else message.from_number
+        if not our_number:
+            continue
+        when = message.received_at or message.created_at
+        entry = numbers.setdefault(
+            our_number,
+            {"number": our_number, "provider": message.provider, "message_count": 0,
+             "last_at": None},
+        )
+        entry["message_count"] += 1
+        if entry["last_at"] is None or when > entry["last_at"]:
+            entry["last_at"] = when
+            entry["provider"] = message.provider
+
+    return [
+        OurNumberResponse(
+            **entry,
+            can_send_to_us=entry["provider"] != "twilio",
+            note=(
+                "Receiving works. Sending to US numbers is rejected by the carriers "
+                "until A2P 10DLC registration is approved."
+                if entry["provider"] == "twilio"
+                else "Sending and receiving both work."
+            ),
+        )
+        for entry in sorted(
+            numbers.values(), key=lambda item: item["message_count"], reverse=True
+        )
+    ]
+
+
 @router.get("/conversations", response_model=list[ConversationResponse])
 async def list_conversations(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
+    our_number: str | None = Query(
+        default=None,
+        description="Show only conversations that ran through one of our numbers.",
+    ),
 ) -> list[ConversationResponse]:
-    """Group all messages into per-contact conversations, newest activity first."""
+    """Group all messages into per-contact conversations, newest activity first.
+
+    `our_number` filters to one of our own numbers — the same thread list, seen
+    through one line instead of all of them.
+    """
     rows = (await db.scalars(select(SmsMessage).order_by(SmsMessage.created_at))).all()
 
     # name lookup
@@ -400,20 +475,23 @@ async def list_conversations(
     convos: dict[str, dict[str, Any]] = {}
     for m in rows:
         contact_number = m.from_number if m.direction == "inbound" else m.to_number
-        our_number = m.to_number if m.direction == "inbound" else m.from_number
+        line = m.to_number if m.direction == "inbound" else m.from_number
         if not contact_number:
+            continue
+        if our_number and line != our_number:
             continue
         when = m.received_at or m.created_at
         c = convos.get(contact_number)
         if not c:
             convos[contact_number] = {
                 "contact_number": contact_number,
-                "our_number": our_number,
+                "our_number": line,
                 "name": names.get(contact_number),
                 "last_text": m.text,
                 "last_direction": m.direction,
                 "last_at": when,
                 "message_count": 1,
+                "provider": m.provider,
             }
         else:
             c["message_count"] += 1
@@ -421,7 +499,8 @@ async def list_conversations(
                 c["last_at"] = when
                 c["last_text"] = m.text
                 c["last_direction"] = m.direction
-                c["our_number"] = our_number
+                c["our_number"] = line
+                c["provider"] = m.provider
 
     ordered = sorted(convos.values(), key=lambda c: c["last_at"], reverse=True)
     return [ConversationResponse(**c) for c in ordered]
@@ -541,4 +620,5 @@ def _to_message_response(r: SmsMessage) -> SmsMessageResponse:
         num_media=r.num_media,
         received_at=r.received_at,
         created_at=r.created_at,
+        provider=r.provider,
     )

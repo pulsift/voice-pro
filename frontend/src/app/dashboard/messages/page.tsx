@@ -35,6 +35,16 @@ interface Conversation {
   last_direction: string | null;
   last_at: string;
   message_count: number;
+  provider: string;
+}
+
+interface OurNumber {
+  number: string;
+  provider: string;
+  message_count: number;
+  last_at: string | null;
+  can_send_to_us: boolean;
+  note: string;
 }
 
 interface SmsMessage {
@@ -46,6 +56,7 @@ interface SmsMessage {
   num_media: number;
   received_at: string | null;
   created_at: string;
+  provider: string;
 }
 
 interface SendablePhoneNumber {
@@ -142,11 +153,27 @@ export default function MessagesPage() {
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   };
 
+  // Which of OUR numbers the inbox is being read through. null = all of them.
+  const [lineFilter, setLineFilter] = useState<string | null>(null);
+
+  const { data: ourNumbers = [] } = useQuery<OurNumber[]>({
+    queryKey: ["sms-our-numbers"],
+    queryFn: async () => (await api.get("/api/v1/sms/numbers")).data,
+    refetchInterval: 30000,
+  });
+
   const { data: conversations = [], isLoading: convLoading } = useQuery<Conversation[]>({
-    queryKey: ["sms-conversations"],
-    queryFn: async () => (await api.get("/api/v1/sms/conversations")).data,
+    queryKey: ["sms-conversations", lineFilter],
+    queryFn: async () =>
+      (
+        await api.get("/api/v1/sms/conversations", {
+          params: lineFilter ? { our_number: lineFilter } : undefined,
+        })
+      ).data,
     refetchInterval: 10000,
   });
+
+  const activeLine = ourNumbers.find((n) => n.number === lineFilter) ?? null;
 
   const activeConvo = conversations.find((c) => c.contact_number === selected) ?? null;
 
@@ -239,6 +266,45 @@ export default function MessagesPage() {
           New message
         </Button>
       </div>
+
+      {/* Which of our lines you are reading through. Two providers run at once
+          and they are not interchangeable, so the line is part of the question
+          "will my reply actually arrive". */}
+      {ourNumbers.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setLineFilter(null)}
+            className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+              lineFilter === null ? "bg-primary text-primary-foreground" : "hover:bg-accent"
+            }`}
+          >
+            All numbers
+          </button>
+          {ourNumbers.map((n) => (
+            <button
+              key={n.number}
+              onClick={() => setLineFilter(n.number)}
+              title={n.note}
+              className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                lineFilter === n.number
+                  ? "bg-primary text-primary-foreground"
+                  : "hover:bg-accent"
+              }`}
+            >
+              {formatPhone(n.number)}
+              <span className="ml-1.5 opacity-60">{n.provider}</span>
+              {!n.can_send_to_us && <span className="ml-1.5">· receive only</span>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {activeLine && !activeLine.can_send_to_us && (
+        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+          <span>{activeLine.note}</span>
+        </div>
+      )}
 
       <Card className="grid h-[calc(100vh-12rem)] grid-cols-[300px_1fr] overflow-hidden p-0">
         {/* Conversation list */}
