@@ -38,7 +38,6 @@ dependencies = [
     # Rate Limiting
     "slowapi>=0.1.9",
     # Monitoring & Logging
-    "sentry-sdk[fastapi]>=2.18.0",
     "structlog>=24.4.0",
     # WebSockets
     "websockets>=14.1",

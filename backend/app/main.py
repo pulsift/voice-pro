@@ -131,20 +131,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
     except Exception:
         logger.exception("Failed to check/create admin user - continuing anyway")
 
-    # Initialize Sentry if configured (non-fatal)
-    if settings.SENTRY_DSN:
-        try:
-            import sentry_sdk
-
-            sentry_sdk.init(
-                dsn=settings.SENTRY_DSN,
-                environment=settings.SENTRY_ENVIRONMENT,
-                traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
-            )
-            logger.info("Sentry initialized")
-        except Exception:
-            logger.exception("Failed to initialize Sentry - continuing without error tracking")
-
     # Start campaign worker (non-fatal)
     try:
         # Use PUBLIC_URL from settings if available, otherwise default to localhost

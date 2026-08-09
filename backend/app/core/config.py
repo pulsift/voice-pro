@@ -248,9 +248,6 @@ class Settings(BaseSettings):
     RETRY_BACKOFF_FACTOR: float = 2.0  # Exponential backoff multiplier
 
     # Monitoring
-    SENTRY_DSN: str | None = None
-    SENTRY_ENVIRONMENT: str = "development"
-    SENTRY_TRACES_SAMPLE_RATE: float = 1.0
 
 
 
