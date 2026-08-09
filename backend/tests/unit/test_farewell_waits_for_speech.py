@@ -132,7 +132,7 @@ def test_end_call_asks_for_the_closing_line_instead_of_excusing_silence() -> Non
     """
     from app.services.tools.call_control_tools import CallControlTools
 
-    result = CallControlTools._execute_end_call({"reason": "conversation_complete"})  # noqa: SLF001
+    result = CallControlTools()._execute_end_call({"reason": "conversation_complete"})  # noqa: SLF001
     message = result["message"].lower()
     assert result["action"] == "end_call"
     assert "closing line" in message
@@ -143,7 +143,7 @@ def test_a_missing_reason_still_asks_for_a_goodbye() -> None:
     """`reason` is optional in the schema, so the default path is the common one."""
     from app.services.tools.call_control_tools import CallControlTools
 
-    assert "closing line" in CallControlTools._execute_end_call({})["message"].lower()  # noqa: SLF001
+    assert "closing line" in CallControlTools()._execute_end_call({})["message"].lower()  # noqa: SLF001
 
 
 @pytest.mark.parametrize("reason", ["voicemail", "Voicemail", "answering_machine"])
@@ -152,6 +152,6 @@ def test_a_machine_is_still_left_without_a_message(reason: str) -> None:
     end_call would have the agent talking to an answering machine."""
     from app.services.tools.call_control_tools import CallControlTools
 
-    message = CallControlTools._execute_end_call({"reason": reason})["message"].lower()  # noqa: SLF001
+    message = CallControlTools()._execute_end_call({"reason": reason})["message"].lower()  # noqa: SLF001
     assert "say nothing further" in message
     assert "closing line" not in message

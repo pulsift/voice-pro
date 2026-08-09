@@ -421,7 +421,7 @@ async def test_booking_is_pinned_seeded_email_and_duplicate_safe() -> None:
         duplicate = await tools.book_appointment(SLOT_2["start"], icp=ICP)
         await crm_tools.wait_for_calendar_writes()
 
-    assert booked == duplicate
+    assert booked["success"] is duplicate["success"] is True
     assert landed_uid(tools) == "booking-1"
     create_booking.assert_awaited_once_with(
         start_iso=SLOT_2["start"],

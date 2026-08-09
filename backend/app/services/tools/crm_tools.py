@@ -1715,7 +1715,18 @@ class CRMTools:
                 time_zone
             )  # Deliberately ignored: booking must reuse the stored normalized timezone.
             if self._booking_completed is not None:
-                return deepcopy(self._booking_completed)
+                # Reaching here AT ALL means the booking already succeeded and the
+                # agent has already been told to say the time once. Replaying that
+                # same message was our own tool instructing the repeat the prompt
+                # spends a line forbidding ("never read a time back twice") — and a
+                # rule the code argues with is not a rule.
+                return {
+                    "success": True,
+                    "message": (
+                        "Already booked, and you have already told them. Do NOT say "
+                        "the time again. One short goodbye, then end_call."
+                    ),
+                }
             if not self._offered_slots:
                 return {"success": False, "error": "slots_not_offered"}
             if not self._selected_start or not self._selected_slot_id:

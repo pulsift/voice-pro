@@ -22,7 +22,14 @@ class CallControlTools:
 
     Tools return a special "action" field that signals the realtime
     session to perform the telephony action.
+
+    Holds a little per-call state now: how many times the model has asked to end
+    the call. That is what makes "never say two goodbyes" a rule the code
+    enforces rather than a line in the prompt the tool then contradicts.
     """
+
+    def __init__(self) -> None:
+        self._end_call_requests = 0
 
     @staticmethod
     def get_tool_definitions() -> list[dict[str, Any]]:
@@ -144,8 +151,7 @@ class CallControlTools:
         {"voicemail", "machine", "answering_machine", "no_answer"}
     )
 
-    @staticmethod
-    def _execute_end_call(arguments: dict[str, Any]) -> dict[str, Any]:
+    def _execute_end_call(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Execute end_call tool.
 
         The result TEXT matters more than it looks. It used to read "Call will be
@@ -156,10 +162,21 @@ class CallControlTools:
 
         The telephony bridge separately refuses to hang up on an unspoken
         goodbye. That guard is the floor; this is the cause.
+
+        Calling it TWICE gets a different answer, for the same reason. Repeating
+        "say your one closing line NOW" is our own tool asking for the second
+        goodbye that the prompt spends a line forbidding. A rule the code
+        contradicts is not a rule — which is why this one moved out of the prompt
+        and into here, the way the dead-air limit did.
         """
         reason = str(arguments.get("reason", "conversation_complete") or "")
-        logger.info("end_call_requested", reason=reason)
-        if reason.lower() in CallControlTools.SILENT_END_REASONS:
+        self._end_call_requests += 1
+        logger.info(
+            "end_call_requested", reason=reason, request_number=self._end_call_requests
+        )
+        if self._end_call_requests > 1:
+            message = "You have already said goodbye. Say nothing more."
+        elif reason.lower() in CallControlTools.SILENT_END_REASONS:
             message = "Hanging up. Say nothing further."
         else:
             message = (
@@ -217,12 +234,14 @@ class CallControlTools:
             "message": f"Sending DTMF tones: {digits}",
         }
 
-    @staticmethod
-    async def execute_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Execute a call control tool.
 
         These tools don't perform the action directly - they return a special
         response that signals the realtime session to perform the telephony action.
+
+        An INSTANCE method rather than a static one, because end_call now counts
+        how many times it has been asked, and that count belongs to one call.
 
         Args:
             tool_name: Name of the tool to execute
@@ -233,7 +252,7 @@ class CallControlTools:
         """
         handlers = {
             "wait_for_user": CallControlTools._execute_wait_for_user,
-            "end_call": CallControlTools._execute_end_call,
+            "end_call": self._execute_end_call,
             "transfer_call": CallControlTools._execute_transfer_call,
             "send_dtmf": CallControlTools._execute_send_dtmf,
         }

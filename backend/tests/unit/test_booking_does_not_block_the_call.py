@@ -233,5 +233,8 @@ async def test_asking_twice_books_once() -> None:
         second = await tools.book_appointment(SLOT["start"], icp=ICP)
         await crm_tools.wait_for_calendar_writes()
 
-    assert first == second
+    # NOT identical on purpose: the second answer must not re-instruct the
+    # agent to say the time aloud, which is how a caller heard it twice.
+    assert first["success"] is second["success"] is True
+    assert "Do NOT" in second["message"]
     assert create.await_count == 1

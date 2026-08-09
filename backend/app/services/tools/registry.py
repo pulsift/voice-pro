@@ -44,6 +44,9 @@ class ToolRegistry:
         self.workspace_id = workspace_id
         self.variables = variables or {}
         self.crm_tools = CRMTools(db, user_id, workspace_id=workspace_id, variables=self.variables)
+        # Per-CALL, like crm_tools: end_call counts how many times it has been
+        # asked, so the second goodbye can be refused rather than invited.
+        self.call_control_tools = CallControlTools()
         self._ghl_tools: GoHighLevelTools | None = None
         self._calendly_tools: CalendlyTools | None = None
         self._shopify_tools: ShopifyTools | None = None
@@ -249,7 +252,7 @@ class ToolRegistry:
         }
 
         if tool_name in call_control_tool_names:
-            return await CallControlTools.execute_tool(tool_name, arguments)
+            return await self.call_control_tools.execute_tool(tool_name, arguments)
 
         # CRM tools
         crm_tool_names = {
