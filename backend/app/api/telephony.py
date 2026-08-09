@@ -33,7 +33,6 @@ from app.core.webhook_security import verify_telnyx_webhook, verify_twilio_webho
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.call_record import CallDirection, CallRecord, CallStatus
-from app.models.campaign import Campaign, CampaignContact, CampaignContactStatus
 from app.models.phone_number import PhoneNumber as StoredPhoneNumber
 from app.models.workspace import AgentWorkspace, Workspace
 from app.services.availability import (
@@ -1054,99 +1053,6 @@ async def _lock_twilio_outbound_answer_record(
     return record
 
 
-async def update_campaign_contact_from_call(
-    call_record: CallRecord,
-    call_status: str,
-    duration_seconds: int,
-    db: AsyncSession,
-) -> None:
-    """Update campaign contact status based on call outcome.
-
-    Args:
-        call_record: Call record that just completed
-        call_status: Final call status (completed, busy, failed, no-answer, etc.)
-        duration_seconds: Call duration in seconds
-        db: Database session
-    """
-    # A manual call has no authoritative campaign identity. Never infer one from a
-    # shared phone number or agent because that can mutate an unrelated campaign.
-    if call_record.direction != CallDirection.OUTBOUND.value or call_record.contact_id is None:
-        return
-
-    result = await db.execute(
-        select(CampaignContact)
-        .join(Campaign)
-        .where(
-            CampaignContact.status == CampaignContactStatus.CALLING.value,
-            CampaignContact.contact_id == call_record.contact_id,
-            Campaign.agent_id == call_record.agent_id,
-        )
-        .limit(2)
-        .with_for_update()
-    )
-    campaign_contacts = result.scalars().all()
-
-    if len(campaign_contacts) != 1:
-        logger.warning(
-            "campaign_contact_not_found_or_ambiguous",
-            call_record_id=str(call_record.id),
-            contact_id=call_record.contact_id,
-            candidate_count=len(campaign_contacts),
-        )
-        return
-
-    cc = campaign_contacts[0]
-    log = logger.bind(
-        campaign_contact_id=str(cc.id),
-        contact_id=call_record.contact_id,
-        call_status=call_status,
-    )
-    status_map = {
-        CallStatus.COMPLETED.value: CampaignContactStatus.COMPLETED.value,
-        CallStatus.BUSY.value: CampaignContactStatus.BUSY.value,
-        CallStatus.FAILED.value: CampaignContactStatus.FAILED.value,
-        CallStatus.NO_ANSWER.value: CampaignContactStatus.NO_ANSWER.value,
-        CallStatus.CANCELED.value: CampaignContactStatus.FAILED.value,
-    }
-    new_status = status_map.get(call_status, CampaignContactStatus.COMPLETED.value)
-    cc.status = new_status
-    cc.last_call_id = call_record.id
-    cc.last_call_duration_seconds = duration_seconds
-    cc.last_call_outcome = call_status
-
-    campaign_result = await db.execute(
-        select(Campaign).where(Campaign.id == cc.campaign_id).with_for_update()
-    )
-    campaign = campaign_result.scalar_one_or_none()
-    if campaign:
-        campaign.total_call_duration_seconds += duration_seconds
-        if new_status == CampaignContactStatus.COMPLETED.value:
-            campaign.contacts_completed += 1
-        elif new_status in (
-            CampaignContactStatus.FAILED.value,
-            CampaignContactStatus.BUSY.value,
-            CampaignContactStatus.NO_ANSWER.value,
-        ):
-            if cc.attempts < campaign.max_attempts_per_contact:
-                from datetime import timedelta
-
-                cc.status = CampaignContactStatus.PENDING.value
-                cc.next_attempt_at = datetime.now(UTC) + timedelta(
-                    minutes=campaign.retry_delay_minutes
-                )
-                log.info("Scheduling retry", next_attempt=cc.next_attempt_at.isoformat())
-            else:
-                campaign.contacts_failed += 1
-
-    log.info("Campaign contact updated", new_status=new_status)
-
-
-# =============================================================================
-# Phone Number Management Endpoints
-# =============================================================================
-
-
-@router.get("/phone-numbers", response_model=list[PhoneNumberResponse])
 async def list_phone_numbers(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
@@ -2139,24 +2045,17 @@ async def twilio_status_callback(
         callback_at = datetime.now(UTC)
         normalized_status = call_status.strip().lower().replace("_", "-")
         mapped_status = _TWILIO_STATUS_MAP.get(normalized_status)
-        entered_terminal = False
-
         if mapped_status is None:
             log.warning("twilio_status_unrecognized")
         else:
-            entered_terminal = _apply_twilio_lifecycle_status(
+            # Still applied. Only the "did it just become terminal" ANSWER is gone,
+            # and that existed solely to decide whether to update a campaign
+            # contact. The lifecycle write itself is untouched.
+            _apply_twilio_lifecycle_status(
                 call_record,
                 mapped_status,
                 event_at=callback_at,
                 provider_duration=_parse_twilio_duration(call_duration),
-            )
-
-        if entered_terminal:
-            await update_campaign_contact_from_call(
-                call_record=call_record,
-                call_status=call_record.status,
-                duration_seconds=call_record.duration_seconds or 0,
-                db=db,
             )
 
         if (
@@ -2527,17 +2426,6 @@ async def telnyx_status_callback(
             event_at=lifecycle_at,
             provider_duration=provider_duration,
         )
-
-        # The updater itself only accepts a campaign contact still in CALLING state,
-        # so retry callbacks cannot increment campaign totals twice. Calling it for
-        # every hangup also covers a media-stop fallback that arrived first.
-        if event_type == "call.hangup":
-            await update_campaign_contact_from_call(
-                call_record=call_record,
-                call_status=call_record.status,
-                duration_seconds=call_record.duration_seconds or 0,
-                db=db,
-            )
 
         if event_type == "call.hangup" and call_record.direction == CallDirection.OUTBOUND.value:
             await stage_terminal_call_event(db, call_record, observed_at=lifecycle_at)

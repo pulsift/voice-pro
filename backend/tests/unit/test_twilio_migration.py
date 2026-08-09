@@ -11,9 +11,6 @@ from fastapi import HTTPException
 from app.api import telephony
 from app.api.telephony import InitiateCallRequest, get_twilio_service, select_outbound_provider
 from app.core.config import settings
-from app.services import campaign_worker
-from app.services.campaign_worker import CampaignWorker
-from app.services.telephony.telnyx_service import TelnyxService
 from app.services.telephony.twilio_service import TwilioService
 
 # --- provider gate (pure) ---------------------------------------------------
@@ -83,62 +80,6 @@ def _disable_platform_telephony_credentials(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(settings, "TELNYX_PUBLIC_KEY", None)
     monkeypatch.setattr(settings, "TWILIO_ACCOUNT_SID", None)
     monkeypatch.setattr(settings, "TWILIO_AUTH_TOKEN", None)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("preferred", "expected_type"),
-    [
-        (None, TwilioService),
-        ("twilio", TwilioService),
-        ("telnyx", TelnyxService),
-    ],
-)
-async def test_campaign_worker_uses_only_the_selected_provider(
-    monkeypatch: pytest.MonkeyPatch,
-    preferred: str | None,
-    expected_type: type[TwilioService] | type[TelnyxService],
-) -> None:
-    _disable_platform_telephony_credentials(monkeypatch)
-    monkeypatch.setattr(settings, "TELEPHONY_OUTBOUND_PROVIDER", preferred)
-    monkeypatch.setattr(
-        campaign_worker,
-        "get_user_api_keys",
-        AsyncMock(return_value=_provider_settings()),
-    )
-    campaign = SimpleNamespace(user_id=uuid.uuid4(), workspace_id=uuid.uuid4())
-
-    service = await CampaignWorker()._get_telephony_service(campaign, MagicMock())  # noqa: SLF001
-
-    assert isinstance(service, expected_type)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("preferred", "user_settings"),
-    [
-        ("twilio", _provider_settings(twilio=False)),
-        ("telnyx", _provider_settings(telnyx=False)),
-        ("invalid", _provider_settings()),
-    ],
-)
-async def test_campaign_worker_does_not_fallback_from_unavailable_or_invalid_selection(
-    monkeypatch: pytest.MonkeyPatch,
-    preferred: str,
-    user_settings: SimpleNamespace,
-) -> None:
-    _disable_platform_telephony_credentials(monkeypatch)
-    monkeypatch.setattr(settings, "TELEPHONY_OUTBOUND_PROVIDER", preferred)
-    monkeypatch.setattr(
-        campaign_worker,
-        "get_user_api_keys",
-        AsyncMock(return_value=user_settings),
-    )
-    campaign = SimpleNamespace(user_id=uuid.uuid4(), workspace_id=uuid.uuid4())
-
-    service = await CampaignWorker()._get_telephony_service(campaign, MagicMock())  # noqa: SLF001
-
-    assert service is None
 
 
 @pytest.mark.asyncio

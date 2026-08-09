@@ -11,8 +11,8 @@ page, which is also what an expired link looks like: the retention sweep nulls t
 transcript, the token and the recording URL together, so a leaked link goes dead
 with the data it pointed at.
 
-Retention: a daily background loop (started from main.py's lifespan, mirroring the
-campaign worker) nulls those three columns on every call that ended more than
+Retention: a daily background loop (started from main.py's lifespan) nulls those
+three columns on every call that ended more than
 TRANSCRIPT_RETENTION_DAYS ago. The call record itself — timing, outcome, booking —
 is kept forever; only the content that identifies a person is dropped.
 """

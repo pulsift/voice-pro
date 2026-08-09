@@ -17,7 +17,6 @@ import {
 import {
   Bot,
   Phone,
-  PhoneOutgoing,
   History,
   Settings,
   LayoutDashboard,
@@ -59,12 +58,6 @@ const navigation = [
     href: "/dashboard/crm",
     icon: Users,
     color: "text-emerald-400",
-  },
-  {
-    name: "Campaigns",
-    href: "/dashboard/campaigns",
-    icon: PhoneOutgoing,
-    color: "text-orange-400",
   },
   {
     name: "Appointments",

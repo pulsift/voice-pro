@@ -138,7 +138,6 @@ async def test_only_first_terminal_callback_mutates_lifecycle_while_each_signal_
 
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()) as update,
         patch("app.api.telephony.stage_terminal_call_event", AsyncMock()) as stage,
     ):
         await twilio_status_callback(
@@ -167,7 +166,6 @@ async def test_only_first_terminal_callback_mutates_lifecycle_while_each_signal_
     assert record.status == CallStatus.NO_ANSWER.value
     assert record.duration_seconds == 17
     assert record.ended_at == first_ended_at
-    update.assert_awaited_once()
     assert stage.await_count == 2
     assert all(awaited.args == (db, record) for awaited in stage.await_args_list)
     assert db.commit.await_count == 2
@@ -197,7 +195,6 @@ async def test_completed_before_answered_keeps_call_answered_and_reports_no_retr
 
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
         patch("app.api.telephony.stage_terminal_call_event", AsyncMock()) as stage,
     ):
         await twilio_status_callback(

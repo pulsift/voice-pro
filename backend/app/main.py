@@ -25,7 +25,6 @@ from app.api import (
     agents,
     auth,
     calls,
-    campaigns,
     compliance,
     crm,
     embed,
@@ -57,7 +56,6 @@ from app.services.call_events import (
     start_call_event_worker,
     stop_call_event_worker,
 )
-from app.services.campaign_worker import start_campaign_worker, stop_campaign_worker
 from app.services.fulfilment_webhook import (
     start_fulfilment_worker,
     stop_fulfilment_worker,
@@ -131,15 +129,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
     except Exception:
         logger.exception("Failed to check/create admin user - continuing anyway")
 
-    # Start campaign worker (non-fatal)
-    try:
-        # Use PUBLIC_URL from settings if available, otherwise default to localhost
-        base_url = settings.PUBLIC_URL or f"http://{settings.HOST}:{settings.PORT}"
-        await start_campaign_worker(base_url=base_url)
-        logger.info("Campaign worker started", base_url=base_url)
-    except Exception:
-        logger.exception("Failed to start campaign worker - campaigns will not process")
-
     # Start durable call-ended delivery (non-fatal; pending rows remain in Postgres).
     try:
         await start_call_event_worker()
@@ -172,13 +161,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
 
     # Shutdown
     logger.info("Shutting down application")
-
-    # Stop campaign worker
-    try:
-        await stop_campaign_worker()
-        logger.info("Campaign worker stopped")
-    except Exception:
-        logger.exception("Error stopping campaign worker")
 
     # Finish any calendar write the agent has already promised out loud, BEFORE
     # anything it depends on is torn down. Cancelling one here leaves a prospect
@@ -280,7 +262,6 @@ app.include_router(sms.router)  # SMS inbox API (read inbound texts)
 app.include_router(sms.webhook_router)  # Telnyx inbound-SMS webhook
 app.include_router(telephony_ws.router)  # Telephony WebSocket for media streams
 app.include_router(calls.router)  # Call history API
-app.include_router(campaigns.router, prefix=settings.API_V1_PREFIX)  # Campaigns API
 app.include_router(phone_numbers.router)  # Phone numbers API
 app.include_router(auth.router)  # Authentication API
 app.include_router(compliance.router)  # Compliance API (GDPR/CCPA)

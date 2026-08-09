@@ -5,7 +5,6 @@ from app.models.appointment import Appointment
 from app.models.call_event_outbox import CallEventOutbox
 from app.models.call_interaction import CallInteraction
 from app.models.call_record import CallRecord
-from app.models.campaign import Campaign, CampaignContact
 from app.models.contact import Contact
 from app.models.fulfilment_outbox import FulfilmentOutbox
 from app.models.operator_alert import OperatorAlert
@@ -24,8 +23,6 @@ __all__ = [
     "CallEventOutbox",
     "CallInteraction",
     "CallRecord",
-    "Campaign",
-    "CampaignContact",
     "ConsentRecord",
     "Contact",
     "FulfilmentOutbox",

@@ -6,7 +6,6 @@ import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from requests.exceptions import Timeout as RequestsTimeout
@@ -15,8 +14,6 @@ from twilio.base.exceptions import TwilioRestException
 from app.api.telephony import InitiateCallRequest, initiate_call
 from app.core.config import settings
 from app.models.call_record import CallStatus
-from app.models.campaign import CampaignContactStatus
-from app.services.campaign_worker import CampaignDialOutcomeUnknownError, CampaignWorker
 from app.services.telephony import twilio_service as twilio_module
 from app.services.telephony.twilio_service import (
     TwilioDialOutcomeUnknownError,
@@ -329,114 +326,3 @@ async def test_direct_twilio_4xx_marks_precommitted_record_failed(
     assert db.execute.await_count == 4
     assert db.commit.await_count == 2
 
-
-@pytest.mark.asyncio
-async def test_campaign_twilio_unknown_outcome_keeps_calling_state_and_pending_record() -> None:
-    worker = CampaignWorker("https://voice.example")
-    campaign = SimpleNamespace(
-        id=uuid.uuid4(),
-        user_id=uuid.uuid4(),
-        workspace_id=uuid.uuid4(),
-        agent_id=uuid.uuid4(),
-        from_phone_number="+14155550100",
-        contacts_called=0,
-    )
-    campaign_contact = SimpleNamespace(
-        id=uuid.uuid4(),
-        status=CampaignContactStatus.PENDING.value,
-        attempts=0,
-        last_attempt_at=None,
-        last_call_outcome=None,
-    )
-    contact = SimpleNamespace(id=42, phone_number="+14155550101")
-    db = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
-    # The caller ID is looked up against the registered numbers before any dial.
-    owned = MagicMock()
-    owned.scalar_one_or_none.return_value = uuid.uuid4()
-    db.execute.return_value = owned
-    service = TwilioService("AC-test", "token-test")
-    unknown = TwilioDialOutcomeUnknownError("unknown")
-
-    async def raise_after_precommit(**_: object) -> None:
-        db.commit.assert_awaited_once()
-        raise unknown
-
-    initiate_call_mock = AsyncMock(side_effect=raise_after_precommit)
-    with (
-        patch.object(service, "initiate_call", new=initiate_call_mock),
-        pytest.raises(CampaignDialOutcomeUnknownError),
-    ):
-        await worker._initiate_call(  # noqa: SLF001
-            campaign,
-            campaign_contact,
-            contact,
-            service,
-            db,
-        )
-
-    record = db.add.call_args.args[0]
-    callback_url = initiate_call_mock.await_args.kwargs["webhook_url"]
-    callback_query = parse_qs(urlsplit(callback_url).query)
-    assert callback_query["call_record_id"] == [str(record.id)]
-    assert record.provider_call_id.startswith("pending:")
-    assert record.status == CallStatus.INITIATED.value
-    assert record.ended_at is None
-    assert campaign_contact.status == CampaignContactStatus.CALLING.value
-    assert campaign.contacts_called == 1
-    # Exactly one read: the ownership check. The precommit itself still writes
-    # through the session's identity map, not a query.
-    assert db.execute.await_count == 1
-    db.commit.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_campaign_with_a_caller_id_we_no_longer_own_never_dials() -> None:
-    """A campaign stores its caller ID as a bare string, so it outlives the
-    number. Manual calls have been ownership-gated since 2026-08-03; this path
-    handed the raw value to the carrier AFTER marking the contact as calling."""
-    worker = CampaignWorker("https://voice.example")
-    campaign = SimpleNamespace(
-        id=uuid.uuid4(),
-        name="Solar Q3",
-        user_id=uuid.uuid4(),
-        workspace_id=None,
-        agent_id=uuid.uuid4(),
-        from_phone_number="+14155550100",
-        contacts_called=0,
-    )
-    campaign_contact = SimpleNamespace(
-        id=uuid.uuid4(),
-        status=CampaignContactStatus.PENDING.value,
-        attempts=0,
-        last_attempt_at=None,
-        last_call_outcome=None,
-    )
-    contact = SimpleNamespace(id=42, phone_number="+14155550101")
-    db = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
-    unowned = MagicMock()
-    unowned.scalar_one_or_none.return_value = None
-    db.execute.return_value = unowned
-    service = TwilioService("AC-test", "token-test")
-    initiate_call_mock = AsyncMock()
-    alerts: list[str] = []
-
-    async def capture_alert(_db: object, *, dedup_key: str, message: str) -> None:
-        alerts.append(message)
-
-    with (
-        patch.object(service, "initiate_call", new=initiate_call_mock),
-        patch(
-            "app.services.campaign_worker.stage_operator_alert",
-            new=AsyncMock(side_effect=capture_alert),
-        ),
-    ):
-        await worker._initiate_call(  # noqa: SLF001
-            campaign, campaign_contact, contact, service, db
-        )
-
-    initiate_call_mock.assert_not_awaited()
-    db.add.assert_not_called()
-    assert campaign_contact.status == CampaignContactStatus.FAILED.value
-    assert campaign.contacts_called == 0
-    assert alerts and "Solar Q3" in alerts[0]
-    assert "registered number" in alerts[0]

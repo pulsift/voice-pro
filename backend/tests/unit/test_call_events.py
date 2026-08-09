@@ -733,7 +733,6 @@ async def run_twilio_status_callback(
     stage_mock = AsyncMock(side_effect=stage)
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
         patch("app.api.telephony.stage_terminal_call_event", stage_mock),
     ):
         await twilio_status_callback(
@@ -793,7 +792,6 @@ async def test_twilio_stage_failure_prevents_state_commit() -> None:
     )
     with (
         patch("app.api.telephony.verify_twilio_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
         patch(
             "app.api.telephony.stage_terminal_call_event",
             AsyncMock(side_effect=RuntimeError("outbox write failed")),
@@ -844,7 +842,6 @@ async def test_telnyx_hangup_stage_precedes_same_transaction_commit() -> None:
     stage_mock = AsyncMock(side_effect=stage)
     with (
         patch("app.api.telephony.verify_telnyx_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
         patch("app.api.telephony.stage_terminal_call_event", stage_mock),
     ):
         await telnyx_status_callback(request=make_telnyx_request(), db=db)
@@ -865,7 +862,6 @@ async def test_telnyx_stage_failure_prevents_state_commit() -> None:
     db = MagicMock(execute=AsyncMock(return_value=result), commit=AsyncMock())
     with (
         patch("app.api.telephony.verify_telnyx_webhook", AsyncMock()),
-        patch("app.api.telephony.update_campaign_contact_from_call", AsyncMock()),
         patch(
             "app.api.telephony.stage_terminal_call_event",
             AsyncMock(side_effect=RuntimeError("outbox write failed")),
