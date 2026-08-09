@@ -80,10 +80,62 @@ def test_menu_thins_a_dense_day_across_it_rather_than_clustering() -> None:
     assert len(set(times)) == 4  # spread across the day, not clustered
 
 
-def test_menu_respects_the_total_cap_across_days() -> None:
+def test_the_total_cap_thins_every_day_instead_of_deleting_the_last_ones() -> None:
+    """The ceiling is a prompt-size rail, not a reason to lose Friday.
+
+    The original code filled up day by day and stopped at the cap, so a
+    Monday-to-Friday calendar with a tight ceiling reached the agent as
+    Monday-and-a-bit — and the agent then told callers we hold nothing on Friday
+    while Friday sat wide open. That is the live complaint from 2026-08-08.
+    """
     raw = [{"start": iso(day, hour)} for day in (13, 14, 15, 16, 17) for hour in (9, 11, 14, 16)]
     menu = availability.build_menu(raw, "UTC", max_slots=6)
-    assert len(menu["slots"]) == 6
+
+    assert len(menu["slots"]) <= 6
+    days = [slot["day"] for slot in menu["slots"]]
+    assert days == ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+
+def test_two_slots_a_caller_could_not_tell_apart_never_both_reach_the_menu() -> None:
+    """Same weekday, same spoken time, two different weeks.
+
+    select_slot books only when the transcript reduces to exactly ONE slot, so a
+    second "Monday at nine in the morning" does not add a choice — it removes one,
+    and the caller who says it gets refused. Measured against the live calendar on
+    2026-08-09, a twelve-day window produced 51 such pairs.
+    """
+    raw = [{"start": iso(13, 9)}, {"start": iso(20, 9)}]  # two Mondays, both 9am
+
+    menu = availability.build_menu(raw, "UTC", max_days=99)
+
+    assert [slot["label"] for slot in menu["slots"]] == ["Monday at nine in the morning"]
+    assert menu["slots"][0]["start"] == iso(13, 9)  # the NEARER Monday is kept
+
+
+def test_the_shipped_lookahead_window_cannot_contain_a_repeated_weekday() -> None:
+    """Why LOOKAHEAD_DAYS is 7 and not 12.
+
+    Seven days spans at most seven distinct dates, so every weekday name means
+    exactly one date and "Wednesday at midday" is a single opening. The whole
+    day-named-selection path rests on that; if someone widens the window, this is
+    where they find out what it costs.
+    """
+    assert availability.LOOKAHEAD_DAYS <= 7
+
+
+def test_the_menu_holds_the_whole_day_not_a_curated_handful() -> None:
+    """Sami's ruling: "just give it all the times that I've got available".
+
+    A full business day reaches the agent intact at the shipped defaults. The old
+    defaults kept four of it, which is why the agent kept refusing real openings.
+    """
+    raw = [{"start": iso(13, hour, minute)} for hour in range(8, 18) for minute in (0, 30)]
+
+    menu = availability.build_menu(raw, "UTC")
+
+    assert len(menu["slots"]) == 20
+    assert "eight in the morning" in menu["block"]
+    assert "half past five in the evening" in menu["block"]
 
 
 def test_menu_is_rendered_in_the_leads_own_clock() -> None:

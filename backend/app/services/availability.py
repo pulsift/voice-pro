@@ -33,12 +33,24 @@ from app.core.config import settings
 
 logger = structlog.get_logger()
 
-# Menu shape. Small enough to read aloud from, wide enough to answer "got anything
-# Friday?" without another calendar call.
-LOOKAHEAD_DAYS: Final = 12
-MAX_DAYS: Final = 5
-MAX_PER_DAY: Final = 4
-MAX_SLOTS: Final = 16
+# Menu shape. The agent HOLDS everything and SAYS two — the opposite of the
+# original settings, which held sixteen of a real 107 and said two.
+#
+# The window is one week, and that is load-bearing rather than a taste. Inside
+# seven days each weekday name maps to exactly one date, so "Wednesday at midday"
+# names exactly one opening. Widen it and it stops being true: measured against the
+# live calendar on 2026-08-09, a twelve-day window held two of every weekday and
+# produced 51 pairs of slots a caller cannot tell apart — and select_slot refuses
+# anything the transcript cannot reduce to ONE slot, so every one of those pairs
+# was a booking the agent would have declined to make. `_drop_indistinguishable`
+# enforces the invariant directly, so a future widening degrades instead of breaking.
+LOOKAHEAD_DAYS: Final = 7
+# Not curation any more — safety rails on how much calendar can land in a prompt.
+# MAX_PER_DAY does not bind on a normal business day (48 = every half hour, 8am-8pm,
+# twice over); MAX_SLOTS caps the rendered block at roughly 5,000 characters.
+MAX_DAYS: Final = 7
+MAX_PER_DAY: Final = 48
+MAX_SLOTS: Final = 120
 
 # Server-owned call context. The public outbound telephony endpoint stamps this
 # onto its persisted variables so a call that crosses a restart/deploy can never
@@ -251,23 +263,44 @@ def build_menu(
             {"start": str(iso), "local": local}
         )
 
+    day_keys = sorted(by_day)[:max_days]
+    kept: dict[str, list[dict[str, Any]]] = {
+        key: _thin(sorted(by_day[key], key=lambda item: item["local"]), max_per_day)
+        for key in day_keys
+    }
+    # Share the global ceiling out across the days instead of filling up on Monday
+    # and running out before Friday. The old code broke out of the loop at the
+    # ceiling, which deleted whole days off the end of the week — the agent then
+    # said "we don't hold Friday" about a Friday that was wide open.
+    if day_keys and sum(len(day) for day in kept.values()) > max_slots:
+        share = max(1, max_slots // len(day_keys))
+        kept = {key: _thin(day, share) for key, day in kept.items()}
+
     slots: list[dict[str, str]] = []
     slot_locals: list[tuple[dict[str, str], datetime]] = []
     days: list[dict[str, Any]] = []
-    for day_key in sorted(by_day)[:max_days]:
-        day_slots = sorted(by_day[day_key], key=lambda item: item["local"])
+    spoken_seen: set[tuple[str, str]] = set()
+    indistinguishable = 0
+    for key in day_keys:
         entries = []
-        for item in _thin(day_slots, max_per_day):
-            if len(slots) >= max_slots:
-                break
+        for item in kept[key]:
             local: datetime = item["local"]
+            spoken = (local.strftime("%A"), spoken_time(local))
+            # Two slots the caller cannot tell apart are worse than one slot fewer:
+            # select_slot only books when the transcript reduces to exactly ONE
+            # slot, so a second "Wednesday at midday" does not add a choice, it
+            # removes one. Keep the earlier — "Wednesday" means the next Wednesday.
+            if spoken in spoken_seen:
+                indistinguishable += 1
+                continue
+            spoken_seen.add(spoken)
             entry = {
                 "slot_id": f"slot_{len(slots) + 1}",
                 "start": item["start"],
                 # `label` is what the agent says; `time` keeps the digits for logs
                 # and the dashboard.
-                "label": f"{local.strftime('%A')} at {spoken_time(local)}",
-                "day": local.strftime("%A"),
+                "label": f"{spoken[0]} at {spoken[1]}",
+                "day": spoken[0],
                 "time": local.strftime("%I:%M %p").lstrip("0"),
                 "timezone": lead_tz,
             }
@@ -276,8 +309,14 @@ def build_menu(
             entries.append(entry)
         if entries:
             days.append({"day": entries[0]["day"], "slots": entries})
-        if len(slots) >= max_slots:
-            break
+    if indistinguishable:
+        # Only reachable if the lookahead window ever grows past a week. Loud,
+        # because it means the menu is quietly narrower than the calendar.
+        logger.warning(
+            "availability_menu_dropped_indistinguishable_slots",
+            dropped=indistinguishable,
+            kept=len(slots),
+        )
 
     offer_slots = _choose_offer_slots(slot_locals)
     status: AvailabilityStatus = "available" if slots else "empty"
@@ -342,8 +381,11 @@ def render_block(
     if offer_line:
         lines.append(offer_line)
     lines.append(
-        f"These are the open times on our calendar, already in the lead's own clock "
-        f"({spoken_zone_name(lead_tz)}). Say the words, never the id:"
+        f"This is the WHOLE calendar for the coming week - every time we hold, in the "
+        f"lead's own clock ({spoken_zone_name(lead_tz)}). If a day or a time is on this "
+        f"list, we have it; if it is not here, we genuinely do not. Answer any question "
+        f"about our availability from this list and never guess. Say the words, never "
+        f"the id:"
     )
     for day in days:
         times = " / ".join(f"{slot['label'].split(' at ', 1)[-1]} [{slot['slot_id']}]"

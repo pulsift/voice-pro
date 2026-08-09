@@ -188,6 +188,39 @@ def four_day_slots() -> list[dict[str, str]]:
     return slots
 
 
+def full_week_slots() -> list[dict[str, str]]:
+    """The REAL production calendar shape, measured 2026-08-09: Monday to Friday,
+    every half hour across a working morning and early afternoon — 51 slots.
+
+    The other two fixtures predate the caps being lifted, so both are smaller than
+    anything the live agent now holds. A menu of four slots a day cannot exercise
+    the thing that actually goes wrong at fifty-one: the model reading a long list
+    and having to answer a specific question from the middle of it.
+    """
+    now = datetime.now(UTC)
+
+    def fmt(moment: datetime) -> str:
+        return moment.isoformat().replace("+00:00", "Z")
+
+    def next_weekday(target: int) -> datetime:
+        ahead = (target - now.weekday()) % 7 or 7
+        return now + timedelta(days=ahead)
+
+    slots: list[dict[str, str]] = []
+    for weekday in range(5):  # Monday .. Friday
+        day = next_weekday(weekday)
+        for hour in range(6, 12):  # 09:00 .. 14:30 Damascus
+            for minute in (0, 30):
+                slots.append(
+                    {
+                        "start": fmt(
+                            day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                        )
+                    }
+                )
+    return slots
+
+
 def eval_menu() -> dict[str, Any]:
     """The pre-loaded menu the production bridge builds before the call starts."""
     from app.services.availability import build_menu
@@ -625,6 +658,35 @@ def check_offers_a_held_day(convo: Conversation, violations: list[str]) -> None:
     check_booked(convo, violations)
 
 
+def check_takes_a_time_from_deep_in_the_menu(
+    convo: Conversation, violations: list[str]
+) -> None:
+    """A named time in the MIDDLE of a fifty-slot list must be honoured.
+
+    The caps came off on 2026-08-09, so the agent now holds a full week instead of
+    sixteen curated times. That trades one failure for a different one: with four
+    slots the model could hardly miss the right one, and with fifty-one it can skim
+    a long block and answer from the two it opened with. This asks for a Thursday
+    afternoon time that is genuinely on the calendar and nowhere near the opener.
+    """
+    texts = [normalize_spoken(t) for t in convo.assistant_texts]
+    joined = " ".join(texts)
+    thursday_reply = next((t for t in texts if "thursday" in t), "")
+
+    if not thursday_reply:
+        violations.append("never answered the Thursday question at all")
+        return
+    for denial in ("don't have", "do not have", "don't hold", "nothing on thursday",
+                   "no thursday", "not available", "can't do thursday",
+                   "nothing thursday", "afraid not"):
+        if denial in joined:
+            violations.append(
+                f"denied a time the calendar HOLDS: {thursday_reply[:140]!r}"
+            )
+            break
+    check_booked(convo, violations)
+
+
 def check_day_probe(convo: Conversation, violations: list[str]) -> None:
     """A named day must be ANSWERED from the calendar, both ways round."""
     check_booked(convo, violations)
@@ -800,6 +862,28 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r".", ["Okay."]),
         ],
         "final": check_offers_a_held_day,
+    },
+    "time_deep_in_a_full_week": {
+        # The new failure mode the caps coming off creates. Fifty-one slots is a
+        # long block; the risk stops being "we thinned it away" and becomes "the
+        # model skimmed it". The time asked for is real, on the calendar, and
+        # nowhere near the two the agent opened with.
+        "slots": full_week_slots,
+        "rules": [
+            (r"okay time|caught you|good time|got a sec|got a minute", ["Yeah, go on."]),
+            (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
+                "Rooftop resi mostly."
+            ]),
+            (r"states|areas|cover", ["Arizona and Nevada."]),
+            (OFFER_PATTERN, [
+                "Can you do Thursday afternoon?",
+                "Thursday at half past one in the afternoon.",
+                "Yeah, Thursday at half past one.",
+            ]),
+            (r"you're set|invite|anything else|booked", ["Great, cheers, bye."]),
+            (r".", ["Okay."]),
+        ],
+        "final": check_takes_a_time_from_deep_in_the_menu,
     },
     "wednesday_probe": {
         # Rules-mode: the caller answers whatever the agent actually asked, so
