@@ -1,6 +1,7 @@
 """CRM tools for voice agents - bookings, contacts, appointments."""
 
 import asyncio
+import contextlib
 import json
 import math
 import re
@@ -52,18 +53,43 @@ AvailabilityInvalidator = Callable[[str], Awaitable[None]]
 _CALENDAR_WRITES: set[asyncio.Task[None]] = set()
 
 
-async def wait_for_calendar_writes(timeout: float = 10.0) -> int:  # noqa: ASYNC109
+async def wait_for_calendar_writes(
+    timeout: float = 10.0,  # noqa: ASYNC109
+    tasks: set[asyncio.Task[None]] | None = None,
+) -> int:
     """Let in-flight calendar writes finish. Returns how many were still running.
 
-    Called at call teardown. The writes are already durable and already alert on
-    failure, so this is not correctness - it is the difference between the booking
-    landing before the call record is written and landing just after it.
+    `tasks` scopes the wait to one call's own writes. Waiting on the module-global
+    set instead makes a call that is trying to hang up sit through some OTHER
+    prospect's slow Cal.com request ([Codex]).
+
+    At call teardown this is not correctness — the writes are durable and alert on
+    failure either way — it is the difference between the booking id landing ON the
+    call record and landing just after it. At SHUTDOWN it is correctness, because a
+    cancelled write is a booking the caller was promised and did not get.
     """
-    pending = {task for task in _CALENDAR_WRITES if not task.done()}
+    pending = {task for task in (tasks or _CALENDAR_WRITES) if not task.done()}
     if pending:
         logger.info("waiting_for_calendar_writes", count=len(pending))
         await asyncio.wait(pending, timeout=timeout)
     return len(pending)
+
+
+async def drain_calendar_writes_for_shutdown(timeout: float = 25.0) -> int:  # noqa: ASYNC109
+    """Finish every outstanding calendar write before the process exits.
+
+    Railway sends SIGTERM on redeploy. Without this, a write that had already
+    dispatched its booking lease got cancelled part-way: the caller had been told
+    they were booked, the durable record said a write was in flight, and the
+    booking did not exist. Found by [Codex] on 2026-08-09; the window is small but
+    it is open on every single deploy, and deploys happen far more often than
+    Cal.com fails.
+    """
+    outstanding = len({task for task in _CALENDAR_WRITES if not task.done()})
+    if outstanding:
+        logger.warning("draining_calendar_writes_before_shutdown", count=outstanding)
+        await wait_for_calendar_writes(timeout=timeout)
+    return outstanding
 
 
 def _normalize_fulfilment_icp(value: dict[str, Any] | str) -> dict[str, Any]:
@@ -176,11 +202,10 @@ class CRMTools:
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
-        # What the caller was actually told, kept for the operator alert that fires
-        # if the calendar write behind it fails. "A booking failed" is not
-        # actionable; "Peter was told Wednesday at midday" is.
-        self._pending_booking_label: str | None = None
-        self._pending_booking_email: str | None = None
+        # Calendar writes THIS session started. Draining the module-global set at
+        # teardown made one call wait on another prospect's slow Cal.com request
+        # ([Codex]); a call only ever waits for its own.
+        self._calendar_writes: set[asyncio.Task[None]] = set()
         # Fit answers (what they install, areas they cover), captured the moment
         # they're given - independent of booking, so a call that ends before
         # book_appointment ever runs still hands the team something real. See
@@ -192,6 +217,11 @@ class CRMTools:
         self._live_availability_loader: AvailabilityLoader | None = None
         self._live_availability_invalidator: AvailabilityInvalidator | None = None
         self._timezone_clarification_required = False
+
+    @property
+    def calendar_writes(self) -> set[asyncio.Task[None]]:
+        """Detached calendar writes THIS call started."""
+        return self._calendar_writes
 
     def set_live_availability_loader(self, loader: AvailabilityLoader) -> None:
         """Delegate live calendar publication to the owning Realtime session."""
@@ -1371,7 +1401,13 @@ class CRMTools:
             return {"success": False, "error": str(e)}
 
     async def _alert_operator_about_booking(
-        self, *, intent_key: str, reason: str, detail: str = ""
+        self,
+        *,
+        intent_key: str,
+        prospect: str,
+        when: str,
+        reason: str,
+        detail: str = "",
     ) -> None:
         """Tell a human, because the agent already promised this time out loud.
 
@@ -1381,13 +1417,19 @@ class CRMTools:
         conversation to Sami. The alert names the prospect and the exact time,
         because "a booking failed" is not actionable and this is the only signal
         anyone gets.
+
+        `prospect` and `when` are PASSED IN, never read off the session. [Codex]
+        found the earlier version reading `self._pending_booking_*`, which two
+        overlapping bookings on one session would overwrite - so the alert could
+        name the wrong person and the wrong time, sending the operator to fix a
+        booking that was never broken. The detached write already receives both
+        values as arguments; there was never a reason to consult shared state.
         """
-        when = self._describe_selected(self._pending_booking_label)
         message = (
-            f"{self._pending_booking_email or 'a prospect'} was told on the phone that "
-            f"{when} was booked, and the calendar write did not go through "
-            f"({reason}). They are expecting an invite that does not exist - this "
-            f"needs booking by hand and an email to them."
+            f"{prospect or 'a prospect'} was told on the phone that "
+            f"{when or 'the time they chose'} was booked, and the calendar write did "
+            f"not go through ({reason}). They are expecting an invite that does not "
+            f"exist - this needs booking by hand and an email to them."
         )
         if detail:
             message = f"{message} {detail}"
@@ -1398,16 +1440,13 @@ class CRMTools:
             dedup_key=f"voice-booking-unconfirmed:{intent_key}", message=message
         )
 
-    @staticmethod
-    def _describe_selected(label: str | None) -> str:
-        return label or "the time they chose"
-
     async def _write_booking_to_calendar(  # noqa: PLR0911, PLR0912, PLR0915
         self,
         *,
         intent_key: str,
         booking_claim_token: uuid.UUID | None,
         selected_start: str,
+        when_spoken: str,
         name: str,
         attendee_email: str,
         lead_tz: str,
@@ -1424,6 +1463,10 @@ class CRMTools:
         reconcile before the first POST, at most one create, reconcile again after
         a transient. A repeat call after a reconnect or a redeploy must never
         produce a second booking for the same attendee and start.
+
+        Everything it needs is an ARGUMENT. Nothing is read off the session, so a
+        second booking on the same session cannot make this one alert about the
+        wrong prospect.
         """
         booking_dispatched = False
         log = self.logger.bind(intent_key=intent_key, selected_start=selected_start)
@@ -1442,7 +1485,10 @@ class CRMTools:
                 last_category = selected_attempts[-1].get("category")
                 if last_category == "rejected":
                     await self._alert_operator_about_booking(
-                        intent_key=intent_key, reason="the calendar rejected it earlier"
+                        intent_key=intent_key,
+                        prospect=attendee_email,
+                        when=when_spoken,
+                        reason="the calendar rejected it earlier",
                     )
                     return
                 if last_category == "transient":
@@ -1457,12 +1503,17 @@ class CRMTools:
                     elif booking_result.get("category") == "reconcile_unavailable":
                         await self._alert_operator_about_booking(
                             intent_key=intent_key,
+                            prospect=attendee_email,
+                            when=when_spoken,
                             reason="the calendar could not be checked safely",
                         )
                         return
                     elif prior_count >= MAX_BOOKING_ATTEMPTS:
                         await self._alert_operator_about_booking(
-                            intent_key=intent_key, reason="the calendar kept failing"
+                            intent_key=intent_key,
+                            prospect=attendee_email,
+                            when=when_spoken,
+                            reason="the calendar kept failing",
                         )
                         return
 
@@ -1482,6 +1533,8 @@ class CRMTools:
                 elif booking_result.get("category") == "reconcile_unavailable":
                     await self._alert_operator_about_booking(
                         intent_key=intent_key,
+                        prospect=attendee_email,
+                        when=when_spoken,
                         reason="the calendar could not be checked safely",
                     )
                     return
@@ -1490,6 +1543,8 @@ class CRMTools:
                 if booking_claim_token is None:
                     await self._alert_operator_about_booking(
                         intent_key=intent_key,
+                        prospect=attendee_email,
+                        when=when_spoken,
                         reason="another attempt already held the booking lease",
                     )
                     return
@@ -1499,6 +1554,8 @@ class CRMTools:
                 if not booking_dispatched:
                     await self._alert_operator_about_booking(
                         intent_key=intent_key,
+                        prospect=attendee_email,
+                        when=when_spoken,
                         reason="the booking lease changed mid-write",
                     )
                     return
@@ -1532,10 +1589,30 @@ class CRMTools:
                     break
                 if local_attempt < remaining_attempts - 1:
                     await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            # A Railway redeploy sends SIGTERM, which cancels this task. [Codex]
+            # found that CancelledError is a BaseException, so `except Exception`
+            # below let it straight through: the caller had been told they were
+            # booked, the lease said a write was dispatched, and NOTHING alerted.
+            # The prospect would have found out by not receiving an invite.
+            log.warning("calendar_write_cancelled_mid_flight")
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    self._alert_operator_about_booking(
+                        intent_key=intent_key,
+                        prospect=attendee_email,
+                        when=when_spoken,
+                        reason="the server restarted part-way through the write",
+                    )
+                )
+            raise
         except Exception as exc:
             log.exception("calcom_book_failed", error_type=type(exc).__name__)
             await self._alert_operator_about_booking(
-                intent_key=intent_key, reason="the calendar call raised an error"
+                intent_key=intent_key,
+                prospect=attendee_email,
+                when=when_spoken,
+                reason="the calendar call raised an error",
             )
             return
 
@@ -1570,6 +1647,8 @@ class CRMTools:
         category = str(booking_result.get("category") or "")
         await self._alert_operator_about_booking(
             intent_key=intent_key,
+            prospect=attendee_email,
+            when=when_spoken,
             reason=reasons.get(category, "the calendar write did not complete"),
         )
 
@@ -1691,15 +1770,14 @@ class CRMTools:
             # write must book the time the caller actually chose, not whatever the
             # session state has become by the time it runs.
             selected_start_iso = self._selected_start
-            self._pending_booking_label = next(
+            when_spoken = next(
                 (
-                    slot.get("label")
+                    str(slot.get("label") or "")
                     for slot in self._offered_slots
                     if slot.get("slot_id") == self._selected_slot_id
                 ),
-                None,
+                "",
             )
-            self._pending_booking_email = attendee_email
 
             icp_str = json.dumps(fulfilment_icp, ensure_ascii=False)
             full_notes = notes or ""
@@ -1781,6 +1859,7 @@ class CRMTools:
                     intent_key=intent_key,
                     booking_claim_token=booking_claim_token,
                     selected_start=selected_start_iso,
+                    when_spoken=when_spoken,
                     name=name,
                     attendee_email=attendee_email,
                     lead_tz=lead_tz,
@@ -1788,8 +1867,13 @@ class CRMTools:
                 )
             )
             # A task with no strong reference can be garbage-collected mid-flight.
-            _CALENDAR_WRITES.add(task)
+            # The module-global set is what keeps it alive and lets shutdown find
+            # it; the per-session set is what teardown waits on, so one call never
+            # blocks on another prospect's write.
+            for registry in (_CALENDAR_WRITES, self._calendar_writes):
+                registry.add(task)
             task.add_done_callback(_CALENDAR_WRITES.discard)
+            task.add_done_callback(self._calendar_writes.discard)
             return deepcopy(self._booking_completed)
         if self._requires_calcom:
             return {"success": False, "error": "calendar_unavailable"}

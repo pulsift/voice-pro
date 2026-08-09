@@ -131,9 +131,52 @@ def _thin(day_slots: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     """
     if len(day_slots) <= limit:
         return day_slots
-    step = (len(day_slots) - 1) / (limit - 1) if limit > 1 else 0
+    if limit <= 1:
+        # One slot from a whole day: take the MIDDLE one, not the first. [Codex]
+        # found that the old `step = 0` path always kept index zero, so a day
+        # thinned to one became the earliest opening on it — eight in the morning
+        # across the board, and a caller asking for the afternoon was told there
+        # was none while every afternoon was free.
+        return [day_slots[len(day_slots) // 2]]
+    step = (len(day_slots) - 1) / (limit - 1)
     picked_indexes = sorted({round(index * step) for index in range(limit)})
     return [day_slots[index] for index in picked_indexes]
+
+
+def _apply_ceiling(
+    by_day: dict[str, list[dict[str, Any]]],
+    max_days: int,
+    max_per_day: int,
+    max_slots: int,
+) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
+    """Fit the calendar under the prompt-size rails without losing whole days.
+
+    The rails are safety, not curation — at the shipped settings none of them
+    bind on a normal week. What matters is HOW they degrade when they do:
+
+      - The original code filled up day by day and stopped at the ceiling, which
+        deleted Friday off the end of a Monday-to-Friday calendar. The agent then
+        told callers we hold nothing on Friday while Friday was wide open.
+      - Sharing the ceiling out evenly fixes that, but `max(1, ...)` quietly
+        chose to break the ceiling instead when it was smaller than the number of
+        days: five days under a ceiling of two returned five slots ([Codex]).
+        Below one-per-day the two goals genuinely conflict, so the nearest days
+        are kept whole and the far ones dropped — a caller is far likelier to
+        want this week than the end of next.
+    """
+    day_keys = sorted(by_day)[:max_days]
+    kept: dict[str, list[dict[str, Any]]] = {
+        key: _thin(sorted(by_day[key], key=lambda item: item["local"]), max_per_day)
+        for key in day_keys
+    }
+    if not day_keys or sum(len(day) for day in kept.values()) <= max_slots:
+        return day_keys, kept
+
+    if max_slots < len(day_keys):
+        day_keys = day_keys[:max_slots]
+        kept = {key: kept[key] for key in day_keys}
+    share = max(1, max_slots // len(day_keys))
+    return day_keys, {key: _thin(day, share) for key, day in kept.items()}
 
 
 def _is_morning(local: datetime) -> bool:
@@ -263,18 +306,7 @@ def build_menu(
             {"start": str(iso), "local": local}
         )
 
-    day_keys = sorted(by_day)[:max_days]
-    kept: dict[str, list[dict[str, Any]]] = {
-        key: _thin(sorted(by_day[key], key=lambda item: item["local"]), max_per_day)
-        for key in day_keys
-    }
-    # Share the global ceiling out across the days instead of filling up on Monday
-    # and running out before Friday. The old code broke out of the loop at the
-    # ceiling, which deleted whole days off the end of the week — the agent then
-    # said "we don't hold Friday" about a Friday that was wide open.
-    if day_keys and sum(len(day) for day in kept.values()) > max_slots:
-        share = max(1, max_slots // len(day_keys))
-        kept = {key: _thin(day, share) for key, day in kept.items()}
+    day_keys, kept = _apply_ceiling(by_day, max_days, max_per_day, max_slots)
 
     slots: list[dict[str, str]] = []
     slot_locals: list[tuple[dict[str, str], datetime]] = []

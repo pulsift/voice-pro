@@ -54,12 +54,16 @@ OWN_NUMBERS = {
 DEFAULT_TO = "+46700171894"
 
 RING_VARIABLES = {
-    "agentName": "Dave",
+    "agentName": "Adam",
     "leadName": "Sami",
     "company": "Pulsift",
     "leadEmail": "sami@pulsift.com",
     "brief": "Ring test of the rebuilt opening, pre-loaded calendar and booking flow.",
-    "offer_name": "the free list of a hundred solar leads",
+    # Said out loud in the opener, so it has to be words a person uses. The
+    # catalogue name ("the free list of a hundred solar leads") read as a product
+    # SKU, and "free" out of a stranger's mouth is the strongest telemarketer
+    # marker there is - the email already established it costs nothing.
+    "offer_name": "that list of solar leads",
     "offer_value_line": (
         "it's a hundred solar businesses matched to who you actually sell to"
     ),

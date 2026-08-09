@@ -55,7 +55,7 @@ INTER_TURN_SLEEP_SECONDS = 3.0
 MIN_CALLER_TURNS_FOR_EARLY_JUMP_CHECK = 3
 
 VARS = {
-    "agentName": "Dave",
+    "agentName": "Adam",
     "leadName": "Sami",
     "company": "Pulsift",
     "leadEmail": "seeded@example.com",
@@ -63,7 +63,11 @@ VARS = {
     "phone": "+963998183191",
     "tzName": "Asia/Damascus",
     "brief": "Voice Pro booking test for Pulsift's solar lead-list offer.",
-    "offer_name": "the free list of a hundred solar leads",
+    # Said out loud in the opener, so it has to be words a person uses. The
+    # catalogue name ("the free list of a hundred solar leads") read as a product
+    # SKU, and "free" out of a stranger's mouth is the strongest telemarketer
+    # marker there is - the email already established it costs nothing.
+    "offer_name": "that list of solar leads",
     "offer_value_line": "it's a hundred solar businesses matched to who you actually sell to",
     "bonus_line": "you're also set for an expert's audit of how you're currently getting clients",
     "book_reason_audit_no": (
@@ -119,7 +123,16 @@ OFFER_PATTERN = (
 BOOKED_CLAIMS = ("booked", "you're set", "you are set", "locked in")
 
 # The opener must reach its closing time-check inside the SAME turn.
-OPENER_END_MARKERS = ("okay time", "ok time", "good time", "bad time", "caught you")
+# The opener must reach its closing time-check inside the SAME turn. Kept as a
+# list rather than one phrase because the closing beat is the part most likely
+# to be reworded by ear, and a rig that only knows the current wording fails on
+# the next good change rather than on a real regression.
+OPENER_END_MARKERS = (
+    "got a sec", "got a second", "got a minute", "catch you at a bad time",
+    "okay time", "ok time", "good time", "bad time", "caught you",
+)
+# The same beat, as a regex, for the scenario rules that answer it.
+OPENER_PATTERN = "|".join(re.escape(marker) for marker in OPENER_END_MARKERS)
 
 # Questions the agent can always answer from its own pre-loaded calendar. Asking
 # them back is the exact behaviour Sami heard and called out.
@@ -572,12 +585,25 @@ def check_common(convo: Conversation, violations: list[str]) -> None:
     if not texts:
         violations.append("agent never spoke")
         return
-    if not texts[0].startswith("heyy sami"):
-        violations.append(f"first line is not the greeting: {texts[0][:80]!r}")
+    # What the opener must DO, not the words it happens to use today. The literal
+    # "heyy sami" that used to be here failed the 2026-08-09 rewrite on all five
+    # scenarios while every one of them was correct — a check that knows only one
+    # phrasing reports the next good change as a regression, and a check that
+    # cries wolf stops being read.
+    opener = texts[0]
+    if not re.match(r"^(hey|hi|hello|good (morning|afternoon|evening))\b", opener):
+        violations.append(f"opener does not greet them: {opener[:80]!r}")
+    for label, needle in (
+        ("their name", str(VARS["leadName"]).lower()),
+        ("its own name", str(VARS["agentName"]).lower()),
+        ("who is calling", "pulsift"),
+    ):
+        if needle not in opener:
+            violations.append(f"opener never says {label}: {opener[:80]!r}")
     # Sami's ask: the opener keeps going past the name, all the way to the
     # time-check. Splitting it across turns is the failure this pins.
-    if not any(marker in texts[0] for marker in OPENER_END_MARKERS):
-        violations.append(f"opener stopped before the time check: {texts[0][:160]!r}")
+    if not any(marker in opener for marker in OPENER_END_MARKERS):
+        violations.append(f"opener stopped before the time check: {opener[:160]!r}")
     # The calendar is already in hand, so bouncing "what day works for you?" back
     # at the caller is never the right move.
     for text in texts:
@@ -825,7 +851,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
     },
     "vague_then_first": {
         "rules": [
-            (r"okay time|caught you|good time", ["Hey. Sure, I have a minute."]),
+            (OPENER_PATTERN, ["Hey. Sure, I have a minute."]),
             (r"solar work|smallest|mainly|kind of work|installs", [
                 "Commercial solar, hundred kilowatts minimum."
             ]),
@@ -848,7 +874,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # asked for. This is the scenario that would have caught it.
         "slots": four_day_slots,
         "rules": [
-            (r"okay time|caught you|good time", ["Yeah, go ahead."]),
+            (OPENER_PATTERN, ["Yeah, go ahead."]),
             (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
                 "Mostly rooftop."
             ]),
@@ -870,7 +896,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # nowhere near the two the agent opened with.
         "slots": full_week_slots,
         "rules": [
-            (r"okay time|caught you|good time|got a sec|got a minute", ["Yeah, go on."]),
+            (OPENER_PATTERN, ["Yeah, go on."]),
             (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
                 "Rooftop resi mostly."
             ]),
@@ -890,7 +916,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # legitimate question re-ordering between prompt versions can't desync the
         # conversation. Rules are checked in order; each reply is used once.
         "rules": [
-            (r"okay time|caught you|good time", ["Yes, fine."]),
+            (OPENER_PATTERN, ["Yes, fine."]),
             (r"solar work|smallest|mainly|kind of work|installs|ground.mount", [
                 "Ground mount, fifty kilowatts and up."
             ]),
@@ -952,7 +978,7 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         # Wednesday ask must get an honest "nothing Wednesday" plus real
         # alternatives - never the question bounced back.
         "rules": [
-            (r"okay time|caught you|good time", ["Yeah, go ahead."]),
+            (OPENER_PATTERN, ["Yeah, go ahead."]),
             (r"solar work|smallest|mainly|kind of work|installs|carports|rooftop", [
                 "Carports, hundred kilowatts up."
             ]),

@@ -32,7 +32,7 @@ from safety_status import list_campaigns, seeded_lead_phone
 
 DIRECT_FROM_NUMBER = "+16693694746"  # Pulsift Twilio number (outbound caller ID)
 DIRECT_TEST_VARIABLES: dict[str, str] = {
-    "agentName": "Dave",
+    "agentName": "Adam",
     "leadName": "Sami",
     "company": "Pulsift",
     "leadEmail": "sami@pulsift.com",
@@ -40,7 +40,11 @@ DIRECT_TEST_VARIABLES: dict[str, str] = {
     "phone": SEEDED_PHONE,
     "tzName": "Asia/Damascus",
     "brief": "Seeded Voice Pro booking test for Pulsift's solar lead-list offer.",
-    "offer_name": "the free list of a hundred solar leads",
+    # Said out loud in the opener, so it has to be words a person uses. The
+    # catalogue name ("the free list of a hundred solar leads") read as a product
+    # SKU, and "free" out of a stranger's mouth is the strongest telemarketer
+    # marker there is - the email already established it costs nothing.
+    "offer_name": "that list of solar leads",
     "offer_value_line": (
         "it's a hundred solar businesses matched to who you actually sell to"
     ),

@@ -29,7 +29,6 @@ from app.services.amd import MACHINE_VERDICTS, classify_greeting
 from app.services.call_events import stage_media_finalized_call_event
 from app.services.gpt_realtime import GPTRealtimeSession
 from app.services.telephony.media_grant import consume_twilio_media_grant
-from app.services.tools.crm_tools import wait_for_calendar_writes
 
 router = APIRouter(prefix="/ws/telephony", tags=["telephony-ws"])
 logger = structlog.get_logger()
@@ -716,7 +715,7 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
             # already durable and already alerts on failure — this is only the
             # difference between the booking id landing ON the record and landing
             # just after it.
-            await wait_for_calendar_writes()
+            await realtime_session.wait_for_calendar_writes()
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_sid:
@@ -741,6 +740,12 @@ async def twilio_media_stream(  # noqa: PLR0912, PLR0915
     except Exception as e:
         log.exception("twilio_websocket_error", error=str(e))
     finally:
+        # An abrupt disconnect is the MOST likely way a call ends, and it jumps
+        # straight past the drain above ([Codex]). Repeating it here is cheap —
+        # it returns immediately when nothing is in flight — and it is the only
+        # thing standing between a promised booking and a torn-down event loop.
+        with contextlib.suppress(Exception):
+            await realtime_session.wait_for_calendar_writes()
         log.info("twilio_websocket_closed", stream_sid=stream_sid, call_sid=call_sid)
 
 
@@ -1209,7 +1214,7 @@ async def telnyx_media_stream(  # noqa: PLR0915
             # already durable and already alerts on failure — this is only the
             # difference between the booking id landing ON the record and landing
             # just after it.
-            await wait_for_calendar_writes()
+            await realtime_session.wait_for_calendar_writes()
 
             # Persist booking diagnostics on every call; transcript text remains opt-in.
             if call_control_id:
@@ -1235,6 +1240,10 @@ async def telnyx_media_stream(  # noqa: PLR0915
     except Exception as e:
         log.exception("telnyx_websocket_error", error=str(e))
     finally:
+        # Same reason as the Twilio path: an abrupt disconnect skips the drain
+        # above, and that is the common case rather than the exceptional one.
+        with contextlib.suppress(Exception):
+            await realtime_session.wait_for_calendar_writes()
         log.info("telnyx_websocket_closed", stream_id=stream_id, call_control_id=call_control_id)
 
 

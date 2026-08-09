@@ -1136,6 +1136,17 @@ class GPTRealtimeSession:
             return {}
         return self.tool_registry.get_fit_answers()
 
+    async def wait_for_calendar_writes(self) -> int:
+        """Let this call's own detached calendar writes land before teardown.
+
+        Scoped to THIS call: waiting on every write in the process made a call
+        that had already said goodbye sit through another prospect's slow Cal.com
+        request, for up to ten seconds of dead air.
+        """
+        if not self.tool_registry:
+            return 0
+        return await self.tool_registry.wait_for_calendar_writes()
+
     async def cleanup(self) -> None:
         """Cleanup resources."""
         self.logger.info("gpt_realtime_session_cleanup_started")

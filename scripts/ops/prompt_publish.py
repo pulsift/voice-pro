@@ -47,17 +47,26 @@ REQUIRED = (
     "{{availability_block}}",  # the pre-loaded calendar must actually be rendered
     "answer that first",  # their words come before the agent's running order
     "Leave settled things settled",  # the anti-re-asking principle
-    "Caught you at an okay time?",  # the opener runs to the end
+    "got a sec?",  # the opener runs to the end
     "select_slot",  # selection gate before booking
     "I'm Pulsift's AI assistant",  # never deny being AI
-    "It's free",  # consistent answer on the magnet
+    "costs you nothing",  # consistent answer on the magnet
     "manufacture urgency",  # no fake scarcity — a halal standard, not a preference
     "Never deny being an AI",
     # Added 2026-08-08. Each is a fault Sami heard on a real call:
     "Never end a call in silence",  # it booked him in, then dropped the line
     "Never apologise",  # it apologised for OUR transcription lag
     "NOT all you have",  # it treated its two opening times as the whole calendar
-    "THEIR words",  # "San Jose" must not come back as "Santa Clara County"
+    # Added 2026-08-09. The three tells that made it read as a machine:
+    "Acknowledge only when they hand you something",  # every turn had the same shape
+    "Spend their name on friction, not rhythm",  # "Got it, Sami" on a question
+    "two or three of their own words",  # it read whole answers back like a menu
+    "is a different question and gets your name",  # "who's this?" != "are you an AI?"
+    "No second greeting",  # the second line was another opener
+    # The earned-acknowledgement rule has one edge that must not be lost: a time
+    # named early IS something handed to you, and answering it with only a
+    # question reads as not having heard them.
+    "never answer a named time with only a question",
 )
 # Phrases that must NOT come back: each one caused a bad call.
 FORBIDDEN = (
@@ -68,6 +77,14 @@ FORBIDDEN = (
     # into the agent's "Santa Clara County" — a normalisation the prompt asked
     # for, not a fabrication, and the reason the rule is now "THEIR words".
     "in your own words",
+    # Added 2026-08-09, all three from the same finding: the prompt's own examples
+    # taught the tic that its rules forbade. Every example turn opened with an
+    # affirmative, so whatever the rule said, the few-shot data said otherwise.
+    "start most turns with a short affirmative",  # replaced by earned acknowledgement
+    "Give their answers back in THEIR words",  # read as echo-wholesale
+    "the free list",  # "free" from a stranger is the telemarketer marker
+    "put your hand up for",  # direct-response jargon, not speech
+    "Heyy",  # a text affectation; TTS either flattens it or drags the vowel
 )
 # NOT forbidden, deliberately: "let me capture that" and "then we'll continue".
 # The prompt names those phrases in order to BAN them, and a substring check

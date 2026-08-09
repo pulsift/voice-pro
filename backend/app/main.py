@@ -66,6 +66,7 @@ from app.services.operator_alerts import (
     start_operator_alert_worker,
     stop_operator_alert_worker,
 )
+from app.services.tools.crm_tools import drain_calendar_writes_for_shutdown
 
 # Configure structured logging with async processors
 structlog.configure(
@@ -192,6 +193,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0912
         logger.info("Campaign worker stopped")
     except Exception:
         logger.exception("Error stopping campaign worker")
+
+    # Finish any calendar write the agent has already promised out loud, BEFORE
+    # anything it depends on is torn down. Cancelling one here leaves a prospect
+    # who was told they were booked and is not, with no invite and no alert.
+    try:
+        await drain_calendar_writes_for_shutdown()
+    except Exception:
+        logger.exception("Error draining calendar writes")
 
     # Stop durable promised-list delivery before disposing the database engine.
     try:

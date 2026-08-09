@@ -222,6 +222,12 @@ class ToolRegistry:
         """Return the fit answers captured so far, independent of booking."""
         return self.crm_tools.get_fit_answers()
 
+    async def wait_for_calendar_writes(self) -> int:
+        """Let THIS call's detached calendar writes finish before teardown."""
+        from app.services.tools.crm_tools import wait_for_calendar_writes
+
+        return await wait_for_calendar_writes(tasks=self.crm_tools.calendar_writes)
+
     async def execute_tool(  # noqa: PLR0911
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
