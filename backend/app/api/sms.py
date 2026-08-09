@@ -27,7 +27,7 @@ from app.core.auth import CurrentUser, user_id_to_uuid
 from app.core.config import settings
 from app.core.webhook_security import verify_telnyx_webhook
 from app.db.session import get_db
-from app.models.phone_number import PhoneNumber
+from app.models.phone_number import PhoneNumber, PhoneNumberStatus
 from app.models.sms_contact import SmsContact
 from app.models.sms_message import SmsMessage
 from app.services.tools.sms_tools import TelnyxSMSTools
@@ -417,9 +417,26 @@ async def list_our_numbers(
     approved, and a rejected send (carrier error 30034) is indistinguishable from
     a delivered one unless you already know which number you used.
     """
-    rows = (await db.scalars(select(SmsMessage))).all()
-
     numbers: dict[str, dict[str, Any]] = {}
+
+    # Start from the numbers we OWN, not from the ones that happen to have
+    # history. A number with no messages yet is exactly the one that needs
+    # finding in a picker — on 2026-08-09 the newly-configured Twilio line was
+    # invisible here for precisely that reason.
+    owned = (
+        await db.scalars(
+            select(PhoneNumber).where(PhoneNumber.status == PhoneNumberStatus.ACTIVE.value)
+        )
+    ).all()
+    for line in owned:
+        numbers[line.phone_number] = {
+            "number": line.phone_number,
+            "provider": line.provider,
+            "message_count": 0,
+            "last_at": None,
+        }
+
+    rows = (await db.scalars(select(SmsMessage))).all()
     for message in rows:
         our_number = message.to_number if message.direction == "inbound" else message.from_number
         if not our_number:
@@ -447,7 +464,8 @@ async def list_our_numbers(
             ),
         )
         for entry in sorted(
-            numbers.values(), key=lambda item: item["message_count"], reverse=True
+            numbers.values(),
+            key=lambda item: (-item["message_count"], item["number"]),
         )
     ]
 
