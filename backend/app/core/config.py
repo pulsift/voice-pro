@@ -153,6 +153,11 @@ class Settings(BaseSettings):
     # model does both itself. The fork's Deepgram and ElevenLabs keys and
     # timeouts were read by nothing and were removed on 2026-08-08.
 
+    # The reply router, which owns the kill switch. voice-pro proxies the
+    # dashboard's button to it so the shared token never reaches a browser.
+    ROUTER_BASE_URL: str | None = None
+    ROUTER_KILL_TOKEN: str | None = None
+
     # Telephony
     TELNYX_API_KEY: str | None = None
     TELNYX_PUBLIC_KEY: str | None = None

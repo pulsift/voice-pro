@@ -30,6 +30,7 @@ from app.api import (
     embed,
     health,
     integrations,
+    killswitch,
     phone_numbers,
     realtime,
     sms,
@@ -266,6 +267,7 @@ app.include_router(phone_numbers.router)  # Phone numbers API
 app.include_router(auth.router)  # Authentication API
 app.include_router(compliance.router)  # Compliance API (GDPR/CCPA)
 app.include_router(integrations.router)  # Integrations API (external tools)
+app.include_router(killswitch.router)  # The stop-dialling control
 app.include_router(embed.router)  # Public embed API (unauthenticated)
 app.include_router(embed.ws_router)  # Public embed WebSocket
 app.include_router(transcripts.router)  # Public transcript share pages (unauthenticated)

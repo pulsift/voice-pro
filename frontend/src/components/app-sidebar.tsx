@@ -32,6 +32,7 @@ import {
   Key,
 } from "lucide-react";
 import { useSidebarStore } from "@/lib/sidebar-store";
+import { KillSwitch } from "@/components/kill-switch";
 import { useAuth } from "@/hooks/use-auth";
 
 const navigation = [
@@ -138,6 +139,10 @@ export function AppSidebar() {
           </motion.span>
         </Link>
       </div>
+
+      {/* Stop-dialling control. Above the nav on purpose: it must be in the
+          same place on every page and must never scroll away. */}
+      <KillSwitch collapsed={!sidebarOpen} />
 
       {/* Navigation */}
       <nav className="flex-1 overflow-y-auto px-2 py-2">
