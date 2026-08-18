@@ -8,7 +8,6 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 from typing import Any
 
 try:
@@ -40,9 +39,7 @@ SEEDED_LEAD_ID = "6a50eacf757679d541f20728"
 SEEDED_EMAIL = "sami@pulsift.com"
 SEEDED_PHONE = "+963998183191"
 
-MIGRATION_NOTE = Path(
-    r"C:\SecondBrain\Projects\vapi-voice-agent\migration-to-selfhosted.md"
-)
+ADMIN_EMAIL = "pulsift@gmail.com"
 POSTGRES_CREDENTIAL_ID = "4J6a1UYOsHcDVNoo"
 POSTGRES_CREDENTIAL_NAME = "Railway Postgres (voiceagent)"
 
@@ -116,15 +113,14 @@ def require_status(status: int, expected: set[int], label: str) -> None:
 
 
 def admin_credentials() -> tuple[str, str]:
-    """Read Voice Pro admin credentials from the canonical migration note."""
-    text = MIGRATION_NOTE.read_text(encoding="utf-8")
-    match = re.search(
-        r"Admin dashboard login:\*\*\s*`([^`]+)`\s*/\s*`([^`]+)`",
-        text,
-    )
-    if not match:
-        raise OpsError("admin credential location was not found in the migration note")
-    return match.group(1), match.group(2)
+    """Read Voice Pro admin credentials without ever printing the password.
+
+    This used to regex the password out of the migration note. The 2026-08-15
+    security sweep rotated it and - correctly - stopped storing it in a tracked
+    file, which silently broke every ops script that logs in. The password now
+    lives only in the Windows user environment, read in-process by `user_env`.
+    """
+    return ADMIN_EMAIL, user_env("VOICEPRO_ADMIN_PASSWORD")
 
 
 def admin_token() -> str:
