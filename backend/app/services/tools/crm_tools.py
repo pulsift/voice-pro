@@ -455,24 +455,28 @@ class CRMTools:
     @staticmethod
     def _spoken_minute_matches(
         text: str, word_hours: dict[str, int]
-    ) -> tuple[set[tuple[int, int]], set[int], str]:
+    ) -> tuple[set[tuple[int, int]], str]:
         """Parse spoken part-hours: "half past four", "quarter to five", "four thirty".
 
-        Returns `(time_matches, hours_consumed)`. Both halves of the day are produced
-        for each phrase, exactly like bare spoken hours: the caller says no am/pm, and
+        Returns `(time_matches, residual)`. Both halves of the day are produced for
+        each phrase, exactly like bare spoken hours: the caller says no am/pm, and
         the offered-slot set is what must reduce it to one. A "to" phrase counts back
         from the named hour ("quarter to five" is 4:45).
 
-        `hours_consumed` is the 12-hour values this phrase already accounts for, so
-        the bare-hour pass does NOT also read "half past four" as four o'clock — that
-        would match two slots at once and make a clear answer look ambiguous.
+        `residual` is the text with every matched phrase blanked out, and it is the
+        ONLY thing the bare-hour pass may consult. "half past five" is blanked, so a
+        sentence containing only that never yields five o'clock — while "five in the
+        evening, half past five" still yields both, because the standalone "five"
+        survives in the residual.
 
-        `residual` is the text with every matched phrase blanked out. Without it,
-        "twenty five past nine" would also be read as "five past nine" and as a bare
-        "five", inventing two times the caller never said.
+        An earlier version ALSO suppressed by hour value: any hour seen in a
+        "half past" was banned from the bare pass for the whole sentence. That is how
+        the 2026-08-18 ring test failed to book. Reading its own menu aloud —
+        "five, half past five, six, half past six" — the agent concluded it had
+        offered only the half-past times, so the caller answering "six in the
+        evening" matched nothing and was re-asked until he gave up.
         """
         matches: set[tuple[int, int]] = set()
-        consumed: set[int] = set()
         hour_word = "|".join(word_hours)
         past_minutes = {
             "five past": 5, "ten past": 10, "quarter past": 15, "twenty past": 20,
@@ -513,10 +517,8 @@ class CRMTools:
                 named = named_hour(match.group(1))
                 if named is None:
                     continue
-                consumed.add(named % MAX_12_HOUR)
                 # "quarter to five" = 4:45 — the hour BEFORE the one named.
                 hour = (named - 1 or MAX_12_HOUR) if phrase in to_minutes else named
-                consumed.add(hour % MAX_12_HOUR)
                 add(hour, minute)
                 consume(match.span())
 
@@ -526,10 +528,9 @@ class CRMTools:
             ):
                 named = named_hour(match.group(1))
                 if named is not None:
-                    consumed.add(named % MAX_12_HOUR)
                     add(named, minute)
                     consume(match.span())
-        return matches, consumed, residual
+        return matches, residual
 
     @staticmethod
     def _extract_time_matches(text: str) -> set[tuple[int, int]]:
@@ -561,7 +562,7 @@ class CRMTools:
         # past four", "quarter to five"), so the caller repeats them back that way -
         # and a parser that only understood bare hours refused the very phrasing we
         # had just used. Found by the conversational eval, 2026-07-30.
-        spoken, spoken_hours, residual = CRMTools._spoken_minute_matches(text, word_hours)
+        spoken, residual = CRMTools._spoken_minute_matches(text, word_hours)
         time_matches.update(spoken)
         # "one" doubles as a pronoun ("the morning one") - only count it as an
         # hour in a time context. Other number words are safe bare.
@@ -571,8 +572,6 @@ class CRMTools:
             r"|\bone\s+(?:in|at|pm|am)\b"
         )
         for word, hour in word_hours.items():
-            if hour % MAX_12_HOUR in spoken_hours:
-                continue  # already read as "half past four" / "quarter to five"
             if word == "one":
                 if not re.search(one_as_hour, residual):
                     continue
@@ -588,8 +587,6 @@ class CRMTools:
             r"\b(?:at|around|about|for)\s+(\d{1,2})\b(?!\s*(?::|am|pm))", residual
         ):
             hour = int(match.group(1))
-            if hour % MAX_12_HOUR in spoken_hours:
-                continue
             if 1 <= hour <= MAX_12_HOUR:
                 time_matches.add((hour % MAX_12_HOUR, 0))
                 time_matches.add((hour % MAX_12_HOUR + MAX_12_HOUR, 0))
@@ -985,12 +982,12 @@ class CRMTools:
                         },
                         "min_kw": {
                             "type": "number",
-                            "description": "Minimum project size in kW they'll take on, only if volunteered.",
+                            "description": "The commercial system size they take on, in kW. Asked every call.",
                         },
                         "states": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "The areas or states they cover, in their own words.",
+                            "description": "The exact counties they sell into, in their own words. Counties, not states, whenever they give them.",
                         },
                     },
                     "required": [],
