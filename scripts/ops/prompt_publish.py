@@ -47,9 +47,9 @@ REQUIRED = (
     "{{availability_block}}",  # the pre-loaded calendar must actually be rendered
     "answer that first",  # their words come before the agent's running order
     "Leave settled things settled",  # the anti-re-asking principle
-    "got a sec?",  # the opener runs to the end
+    "if you don't mind",  # the opener runs to the end
     "select_slot",  # selection gate before booking
-    "I'm Pulsift's AI assistant",  # never deny being AI
+    "Pulsift's AI assistant",  # stated in the FIRST line, every call
     "costs you nothing",  # consistent answer on the magnet
     "manufacture urgency",  # no fake scarcity — a halal standard, not a preference
     "Never deny being an AI",
