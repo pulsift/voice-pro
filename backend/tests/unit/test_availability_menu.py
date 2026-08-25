@@ -337,13 +337,18 @@ async def test_a_bare_time_resolves_against_the_day_just_named() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_bare_time_with_no_context_is_still_ambiguous() -> None:
-    """Four middays and nothing offered aloud: refusing and re-asking is correct."""
+async def test_a_bare_time_with_no_context_takes_the_soonest_match() -> None:
+    """Four middays, nothing offered aloud, "midday works for me".
+
+    This used to refuse. Under Sami's 2026-08-25 ruling it books, and booking the
+    SOONEST midday is also how a person hears that sentence - "midday works" means
+    the next midday, not an invitation to pick a week from Thursday.
+    """
     tools = make_tools()
     tools.seed_offered_slots(four_day_menu()["slots"], "UTC")
 
     tools.observe_user_utterance("midday works for me")
-    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+    assert (await tools.select_slot("slot_1"))["success"] is True
 
 
 @pytest.mark.asyncio

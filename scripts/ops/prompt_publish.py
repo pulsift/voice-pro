@@ -47,7 +47,7 @@ REQUIRED = (
     "{{availability_block}}",  # the pre-loaded calendar must actually be rendered
     "answer that first",  # their words come before the agent's running order
     "Leave settled things settled",  # the anti-re-asking principle
-    "if you don't mind",  # the opener runs to the end
+    "That alright?",  # the opener runs to the end, agenda included
     "select_slot",  # selection gate before booking
     "Pulsift's AI assistant",  # stated in the FIRST line, every call
     "costs you nothing",  # consistent answer on the magnet

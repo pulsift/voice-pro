@@ -197,54 +197,58 @@ def _choose_offer_slots(
     ordered: list[tuple[dict[str, str], datetime]],
 ) -> list[dict[str, str]]:
     """Pick exactly two slots to lead with, so the agent reads a finished choice
-    instead of computing a spread live on the call (see module docstring header
-    on this file's fix commit for why that computation must never happen aloud).
+    instead of computing a spread live on the call.
 
-    `ordered` is the flat slot list paired with its local datetime, already sorted
-    day-major then time-minor (build_menu's construction order). Fallback order,
-    most-preferred first:
-      1. one morning slot + one midday/early-afternoon slot, on two different
-         days, earliest suitable days first.
-      2. the same two bands on the only available day, when there is only one.
-      3. the two earliest slots that land on different days.
-      4. the two earliest slots outright (may share a day).
-      5. one slot.
-      6. none.
+    The rule is about DAYS first, times second: lead with the two soonest days the
+    calendar actually offers, never today. On a Wednesday that is Thursday and
+    Friday; on a Friday it is Monday and Tuesday.
+
+    Weekends are not computed here. Cal.com already knows the working week from
+    Sami's own schedule, so a weekend never reaches this list - re-deriving it would
+    be a second opinion about something the calendar has already decided, and the
+    two would eventually disagree.
+
+    Today is excluded because the lead list has to be BUILT before that call. The
+    full menu still holds today, so a caller who asks for it can have it; we simply
+    never propose it. If today is all there is, we propose it anyway - leaving them
+    with nothing is worse.
+
+    Within the two chosen days the old preference survives: a morning slot for the
+    first, a midday/early-afternoon one for the second, so the pair sounds like a
+    real spread. But the DAY always wins - a sooner day with only afternoons still
+    beats a later day that happens to have a morning (an earlier version searched
+    for the earliest morning ANYWHERE, which is how today kept becoming option one).
     """
     if not ordered:
         return []
     if len(ordered) == 1:
         return [ordered[0][0]]
 
-    distinct_days = {_day_key(local) for _, local in ordered}
+    today = _day_key(datetime.now(ordered[0][1].tzinfo))
+    pool = [pair for pair in ordered if _day_key(pair[1]) != today] or ordered
 
-    if len(distinct_days) > 1:
-        morning = next((pair for pair in ordered if _is_morning(pair[1])), None)
-        if morning is not None:
-            midday = next(
-                (
-                    pair
-                    for pair in ordered
-                    if _is_midday_band(pair[1]) and _day_key(pair[1]) != _day_key(morning[1])
-                ),
-                None,
-            )
-            if midday is not None:
-                chosen = sorted((morning, midday), key=lambda pair: pair[1])
-                return [chosen[0][0], chosen[1][0]]
-    else:
-        morning = next((pair for pair in ordered if _is_morning(pair[1])), None)
-        midday = next((pair for pair in ordered if _is_midday_band(pair[1])), None)
+    day_order: list[str] = []
+    by_day: dict[str, list[tuple[dict[str, str], datetime]]] = {}
+    for pair in pool:
+        key = _day_key(pair[1])
+        if key not in by_day:
+            by_day[key] = []
+            day_order.append(key)
+        by_day[key].append(pair)
+
+    if len(day_order) == 1:
+        only = by_day[day_order[0]]
+        morning = next((pair for pair in only if _is_morning(pair[1])), None)
+        midday = next((pair for pair in only if _is_midday_band(pair[1])), None)
         if morning is not None and midday is not None:
             chosen = sorted((morning, midday), key=lambda pair: pair[1])
             return [chosen[0][0], chosen[1][0]]
+        return [pair[0] for pair in only[:2]]
 
-    for index, (_entry, local) in enumerate(ordered):
-        for later_entry, later_local in ordered[index + 1 :]:
-            if _day_key(local) != _day_key(later_local):
-                return [ordered[index][0], later_entry]
-
-    return [ordered[0][0], ordered[1][0]]
+    first, second = by_day[day_order[0]], by_day[day_order[1]]
+    lead = next((pair for pair in first if _is_morning(pair[1])), first[0])
+    follow = next((pair for pair in second if _is_midday_band(pair[1])), second[0])
+    return [lead[0], follow[0]]
 
 
 def _render_offer_first_line(offer_slots: list[dict[str, str]]) -> str | None:

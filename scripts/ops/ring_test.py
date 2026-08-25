@@ -12,10 +12,15 @@ survives a real interruption over a real carrier.
 What to listen for, in order:
   1. a bare "Hello?" almost immediately after you pick up
   2. then SILENCE — it waits for you, however long you take
-  3. the opener in one unbroken run, all the way to "caught you at an okay time?",
-     even if you talk over it
-  4. real times offered with no pause to "check the calendar"
-  5. no "what timezone are you in?" — it already knows
+  3. the opener in one unbroken run, all the way to "That alright?", even if you
+     talk over it — it now states it is an AI and lays out the whole call up front
+  4. three questions: what they install, which COUNTIES, what system sizes
+  5. one follow-up at most on any question, then it takes what you said
+  6. the hand-off line before any times are named
+  7. the two days offered are TOMORROW and the next day, never today
+  8. a rough answer ("evening", "midday") gets booked, never queried
+  9. real times offered with no pause to "check the calendar", and no "let me..."
+ 10. no "what timezone are you in?" — it already knows
 
 Two safety properties, both deliberate:
   - `--to` is restricted to OUR OWN handsets. This script can never dial a prospect,

@@ -274,7 +274,13 @@ async def test_selection_requires_new_unambiguous_post_offer_utterance() -> None
 
 
 @pytest.mark.asyncio
-async def test_day_or_time_selection_must_identify_exactly_one_slot() -> None:
+async def test_naming_only_the_day_lets_the_agent_pick_the_time() -> None:
+    """Changed by Sami's ruling 2026-08-25: a rough answer is an answer.
+
+    "Monday" used to be refused because two Monday slots matched. Being asked to
+    narrow down a day you just named is the behaviour that made the ring test
+    unbearable, so the agent now picks a Monday time and books it.
+    """
     tools = make_tools()
     with patch(
         "app.services.calcom_client.get_open_slots", AsyncMock(return_value=[SLOT_1, SLOT_2])
@@ -282,7 +288,7 @@ async def test_day_or_time_selection_must_identify_exactly_one_slot() -> None:
         await tools.check_availability(time_zone="Europe/Stockholm")
 
     tools.observe_user_utterance("Monday")
-    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+    assert (await tools.select_slot("slot_1"))["success"] is True
     tools.observe_user_utterance("3 pm")
     assert (await tools.select_slot("slot_2"))["success"] is True
 
@@ -357,23 +363,39 @@ async def test_day_part_answers_select_the_matching_slot() -> None:
         "app.services.calcom_client.get_open_slots", AsyncMock(return_value=morning_slots)
     ):
         await tools.check_availability(time_zone="Asia/Damascus")
+    # Two morning slots and "the morning one": the agent now picks one rather
+    # than asking which morning they meant (Sami's ruling 2026-08-25).
     tools.observe_user_utterance("the morning one")
-    assert (await tools.select_slot("slot_1"))["error"] == "ambiguous_slot_selection"
+    assert (await tools.select_slot("slot_1"))["success"] is True
 
 
 @pytest.mark.asyncio
-async def test_bare_digit_still_ambiguous_when_it_matches_both_slots() -> None:
+async def test_a_bare_digit_picks_one_but_only_from_what_they_said() -> None:
+    """The AM/PM pair is the sharpest edge of Sami's 2026-08-25 ruling.
+
+    "Tuesday at 1" genuinely could mean either 1 AM or 1 PM, so there is no way to
+    be right without asking - and asking is the thing we removed. The agent picks.
+    This is safe in production because the menu comes from Cal.com business hours,
+    which never offers 1 AM; the pair below only exists inside this test.
+
+    What the gate still guarantees is the half that matters: it can only pick from
+    times the caller's own words could have meant. A slot at some other hour is
+    refused however confident the model is.
+    """
     tools = make_tools()
     slots = [
         {"start": "2026-07-14T01:00:00Z", "label": "Tuesday 1:00 AM"},
         {"start": "2026-07-14T13:00:00Z", "label": "Tuesday 1:00 PM"},
+        {"start": "2026-07-14T15:00:00Z", "label": "Tuesday 3:00 PM"},
     ]
     with patch("app.services.calcom_client.get_open_slots", AsyncMock(return_value=slots)):
         await tools.check_availability(time_zone="UTC")
 
     tools.observe_user_utterance("Tuesday at 1 works")
-    result = await tools.select_slot("slot_2")
-    assert result["error"] == "ambiguous_slot_selection"
+    assert (await tools.select_slot("slot_2"))["success"] is True
+
+    tools.observe_user_utterance("Tuesday at 1 works")
+    assert (await tools.select_slot("slot_3"))["error"] == "ambiguous_slot_selection"
 
 
 @pytest.mark.asyncio

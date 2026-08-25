@@ -826,16 +826,24 @@ class CRMTools:
             }
         offered = {slot["slot_id"]: slot for slot in self._offered_slots}
         candidates = self._utterance_slot_candidates()
-        if slot_id not in offered or candidates != {slot_id}:
+        # The transcript CONSTRAINS the choice; it no longer dictates it. Demanding
+        # that the words reduce to exactly one slot meant a caller who said
+        # "evening" when we held five evening times was refused and asked to narrow
+        # it down - over and over, on the 2026-08-18 ring test, until he gave up.
+        # A rough answer is still an answer, so the model picks and this gate only
+        # checks that the pick is something their words could have meant. Saying
+        # nothing about a time still names nothing, and _refuses_or_defers above
+        # still empties the set outright when the words carry a no.
+        if slot_id not in offered or slot_id not in candidates:
             return {
                 "success": False,
                 "error": "ambiguous_slot_selection",
                 "message": (
-                    "They have not landed on one time yet. Never apologise and never "
-                    "say you did not catch it - just name the two times again the way "
-                    "a person would ('was that the Tuesday at ten, or the one in the "
-                    "afternoon?'). Never say 'first or second', never mention formats, "
-                    "systems, or tools."
+                    "They have not named a time yet. Never apologise and never say "
+                    "you did not catch it - just name two of your times again the "
+                    "way a person would ('was that the Tuesday at ten, or the one in "
+                    "the afternoon?'). Never say 'first or second', never mention "
+                    "formats, systems, or tools."
                 ),
             }
         selected = offered[slot_id]
