@@ -8,9 +8,11 @@ Weekends are NOT computed here. Cal.com already knows the working week from Sami
 own schedule, so a weekend never reaches this list; re-deriving it would be a second
 opinion about a thing the calendar already decided.
 
-Today is excluded for a real reason: the lead list has to be BUILT before that call.
-The full menu still holds today, so a caller who insists on it can have it - we just
-never propose it.
+Today is excluded from the MENU, not merely from the pair: the lead list has to be
+BUILT before that call, so a same-day booking is a promise we cannot keep. Sami,
+2026-08-26: "today should not be on the table, they should not be able to take in a
+call on the same day." So the agent cannot offer it, cannot be talked into it, and
+does not hold it at all.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -71,8 +73,21 @@ def test_a_day_with_no_morning_still_leads_with_that_day() -> None:
     assert offered_days(raw) == [day_name(1), day_name(2)]
 
 
-def test_when_today_is_all_there_is_we_still_offer_it() -> None:
-    """Never leave them with nothing - that is worse than proposing today."""
-    raw = [{"start": at(0, 9)}, {"start": at(0, 13)}]
+def test_today_is_not_in_the_menu_at_all() -> None:
+    """Not just unofferd - unbookable. It must not reach the agent's list."""
+    raw = [
+        {"start": at(0, 9)}, {"start": at(0, 13)},
+        {"start": at(1, 9)},
+    ]
+    menu = availability.build_menu(raw, TZ)
 
-    assert offered_days(raw) == [day_name(0), day_name(0)]
+    assert [slot["day"] for slot in menu["slots"]] == [day_name(1)]
+
+
+def test_a_calendar_with_only_today_reads_as_empty() -> None:
+    """Honest emptiness beats a time we cannot deliver against."""
+    menu = availability.build_menu([{"start": at(0, 9)}, {"start": at(0, 13)}], TZ)
+
+    assert menu["status"] == "empty"
+    assert menu["slots"] == []
+    assert menu["offer_slots"] == []

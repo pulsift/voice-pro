@@ -208,10 +208,9 @@ def _choose_offer_slots(
     be a second opinion about something the calendar has already decided, and the
     two would eventually disagree.
 
-    Today is excluded because the lead list has to be BUILT before that call. The
-    full menu still holds today, so a caller who asks for it can have it; we simply
-    never propose it. If today is all there is, we propose it anyway - leaving them
-    with nothing is worse.
+    Today never reaches this function - build_menu drops same-day slots before the
+    menu exists, because the list has to be BUILT before that call. Do not re-check
+    it here; one owner for that rule is the reason it cannot drift.
 
     Within the two chosen days the old preference survives: a morning slot for the
     first, a midday/early-afternoon one for the second, so the pair sounds like a
@@ -224,12 +223,9 @@ def _choose_offer_slots(
     if len(ordered) == 1:
         return [ordered[0][0]]
 
-    today = _day_key(datetime.now(ordered[0][1].tzinfo))
-    pool = [pair for pair in ordered if _day_key(pair[1]) != today] or ordered
-
     day_order: list[str] = []
     by_day: dict[str, list[tuple[dict[str, str], datetime]]] = {}
-    for pair in pool:
+    for pair in ordered:
         key = _day_key(pair[1])
         if key not in by_day:
             by_day[key] = []
@@ -285,6 +281,7 @@ def build_menu(
         logger.warning("availability_menu_bad_timezone", lead_tz=lead_tz)
         return empty_menu(lead_tz)
 
+    today_local = datetime.now(zone).date()
     by_day: dict[str, list[dict[str, Any]]] = {}
     seen_starts: set[datetime] = set()
     for slot in raw_slots:
@@ -306,6 +303,14 @@ def build_menu(
             continue
         seen_starts.add(start)
         local = start.astimezone(zone)
+        # Same-day is unbookable, not merely unoffered. The lead list has to be
+        # BUILT before that call, so a time today is a promise we cannot keep -
+        # and a menu that holds one can always be talked into it (Sami,
+        # 2026-08-26: "they should not be able to take in a call on the same
+        # day"). Dropping it here is the only place that makes it true
+        # everywhere; filtering later would leave the tools still holding it.
+        if local.date() == today_local:
+            continue
         by_day.setdefault(local.strftime("%Y-%m-%d"), []).append(
             {"start": str(iso), "local": local}
         )
