@@ -100,12 +100,17 @@ def file_prompt() -> str:
 
 
 def assert_prompt(text: str) -> None:
-    lowered = text.lower()
+    # Match on the WORDS, not the line layout. A required phrase that happened to
+    # straddle a line wrap failed this gate three times running (2026-08-21 twice,
+    # 2026-08-28), each time sending someone to re-wrap a paragraph to please a
+    # substring search. The gate cares whether the behaviour is in the prompt; how
+    # the markdown is folded is none of its business.
+    lowered = " ".join(text.lower().split())
     for phrase in REQUIRED:
-        if phrase.lower() not in lowered:
+        if " ".join(phrase.lower().split()) not in lowered:
             raise OpsError(f"prompt is missing required behaviour: {phrase}")
     for phrase in FORBIDDEN:
-        if phrase.lower() in lowered:
+        if " ".join(phrase.lower().split()) in lowered:
             raise OpsError(f"prompt contains a forbidden phrase: {phrase}")
 
 

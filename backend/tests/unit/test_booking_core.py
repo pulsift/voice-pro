@@ -265,12 +265,10 @@ async def test_selection_requires_new_unambiguous_post_offer_utterance() -> None
     selected = await tools.select_slot("slot_2")
     # The spoken label is generated from the slot itself (13:00Z = 16:00 in Damascus),
     # so what the agent says is always the lead's own clock, in words.
-    assert selected == {
-        "success": True,
-        "slot_id": "slot_2",
-        "start": SLOT_2["start"],
-        "when": "Monday at four in the afternoon",
-    }
+    assert selected["success"] is True
+    assert selected["slot_id"] == "slot_2"
+    assert selected["start"] == SLOT_2["start"]
+    assert selected["when"] == "Monday at four in the afternoon"
 
 
 @pytest.mark.asyncio

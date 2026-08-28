@@ -867,6 +867,16 @@ class CRMTools:
             "slot_id": slot_id,
             "start": selected["start"],
             "when": selected["label"],
+            # Every other tool tells the agent what to do next; this one used to
+            # hand back a bare success, and the model filled the resulting silence
+            # with "let me lock that in" / "let me line up that Friday time" -
+            # twice, through two different prompt bans. A model will always find a
+            # new phrase for a gap, so the fix is to leave no gap.
+            "message": (
+                "Pinned, not booked. Do NOT speak yet - say nothing at all about "
+                "checking, lining up or confirming. Call book_appointment now, and "
+                "let its result be the first thing you say."
+            ),
         }
 
     @staticmethod
