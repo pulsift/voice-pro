@@ -12,7 +12,7 @@ import hmac
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple, Final
+from typing import Any, Final, NamedTuple
 
 import structlog
 from sqlalchemy import and_, func, or_, select, update
