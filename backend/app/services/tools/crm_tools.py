@@ -30,6 +30,7 @@ from app.services.fulfilment_webhook import (
     authorize_fulfilment_booking,
     claim_fulfilment_booking,
     finalize_fulfilment_intent,
+    is_test_conversation,
     stage_fulfilment_intent,
 )
 from app.services.operator_alerts import raise_operator_alert
@@ -1831,28 +1832,40 @@ class CRMTools:
             promise_key = _fulfilment_promise_key(conversation_id, conversation_generation)
             if promise_key is not None:
                 fulfilment_payload["promise_key"] = promise_key
-            try:
-                intent_key = await stage_fulfilment_intent(
-                    start_iso=selected_start_iso,
-                    email=attendee_email,
-                    payload=fulfilment_payload,
-                    workspace_id=self.workspace_id,
-                    user_id=self.user_id,
+
+            if is_test_conversation(conversation_id):
+                # Our own test call. Book it - that is the whole point of a ring
+                # test - but never stage paid work. A null intent key is already
+                # understood downstream as "there is nothing to ship".
+                self.logger.warning(
+                    "fulfilment_skipped_test_conversation",
+                    conversation_id=str(conversation_id),
                 )
-                booking_claim_token = await claim_fulfilment_booking(intent_key)
-            except Exception as exc:
-                self.logger.exception(
-                    "fulfilment_intent_stage_failed",
-                    error_type=type(exc).__name__,
-                )
-                return {
-                    "success": False,
-                    "error": "fulfilment_unavailable",
-                    "message": (
-                        "The booking system is unavailable. Do not retry this time; "
-                        "tell them the team will confirm by email."
-                    ),
-                }
+                intent_key = None
+                booking_claim_token = None
+            else:
+                try:
+                    intent_key = await stage_fulfilment_intent(
+                        start_iso=selected_start_iso,
+                        email=attendee_email,
+                        payload=fulfilment_payload,
+                        workspace_id=self.workspace_id,
+                        user_id=self.user_id,
+                    )
+                    booking_claim_token = await claim_fulfilment_booking(intent_key)
+                except Exception as exc:
+                    self.logger.exception(
+                        "fulfilment_intent_stage_failed",
+                        error_type=type(exc).__name__,
+                    )
+                    return {
+                        "success": False,
+                        "error": "fulfilment_unavailable",
+                        "message": (
+                            "The booking system is unavailable. Do not retry this "
+                            "time; tell them the team will confirm by email."
+                        ),
+                    }
 
             # THE HANDOVER. Everything above this line was local: the slot was
             # already validated against the loaded menu by select_slot, and

@@ -12,7 +12,7 @@ import hmac
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Final
 
 import structlog
 from sqlalchemy import and_, func, or_, select, update
@@ -158,6 +158,29 @@ def _intent_insert(db: AsyncSession, values: dict[str, Any]) -> Any:
     return statement.on_conflict_do_nothing(
         index_elements=[FulfilmentOutbox.intent_key]
     )
+
+
+# Conversation ids that mean "this is us testing, not a customer". Kept in step
+# with reply_router/factory.py's TEST_SEED_PREFIXES — the router has its own copy
+# because it has its own sender, and on 2026-08-27 that split cost real money: a
+# ring test drove voice-pro directly, missed the router entirely, and started a
+# live lead-list build. If a prefix is added on either side, add it on both.
+TEST_CONVERSATION_PREFIXES: Final = (
+    "ringtest", "e2e-", "e2e_", "proof-", "watchdog", "verify-", "postb-",
+    "seed-", "smoke-",
+)
+
+
+def is_test_conversation(conversation_id: Any) -> bool:
+    """True when this call is ours and must never buy anything.
+
+    Deliberately placed beside the paid work rather than at a call site: a second
+    sender that forgets to ask is exactly how this failed the first time.
+    """
+    if not isinstance(conversation_id, str):
+        return False
+    normalized = conversation_id.strip().lower()
+    return normalized.startswith(TEST_CONVERSATION_PREFIXES)
 
 
 async def stage_fulfilment_intent(
