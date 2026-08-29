@@ -1459,8 +1459,9 @@ class CRMTools:
     async def _write_booking_to_calendar(  # noqa: PLR0911, PLR0912, PLR0915
         self,
         *,
-        intent_key: str,
+        intent_key: str | None,
         booking_claim_token: uuid.UUID | None,
+        fulfilment_skipped: bool = False,
         selected_start: str,
         when_spoken: str,
         name: str,
@@ -1556,7 +1557,13 @@ class CRMTools:
                     return
 
             if not booking_result.get("success"):
-                if booking_claim_token is None:
+                # A null claim token used to mean one thing: we lost the race for
+                # the booking lease, so stop. Since 2026-08-27 it can also mean we
+                # deliberately took no lease because this is our own test call —
+                # and reading the second as the first made the agent promise Sami
+                # "Thursday at six is set" while the write silently gave up. Two
+                # meanings, one null. They have separate names now.
+                if booking_claim_token is None and not fulfilment_skipped:
                     await self._alert_operator_about_booking(
                         intent_key=intent_key,
                         prospect=attendee_email,
@@ -1564,8 +1571,8 @@ class CRMTools:
                         reason="another attempt already held the booking lease",
                     )
                     return
-                booking_dispatched = await authorize_fulfilment_booking(
-                    intent_key, booking_claim_token
+                booking_dispatched = fulfilment_skipped or (
+                    await authorize_fulfilment_booking(intent_key, booking_claim_token)
                 )
                 if not booking_dispatched:
                     await self._alert_operator_about_booking(
@@ -1833,6 +1840,7 @@ class CRMTools:
             if promise_key is not None:
                 fulfilment_payload["promise_key"] = promise_key
 
+            fulfilment_skipped = False
             if is_test_conversation(conversation_id):
                 # Our own test call. Book it - that is the whole point of a ring
                 # test - but never stage paid work. A null intent key is already
@@ -1843,6 +1851,7 @@ class CRMTools:
                 )
                 intent_key = None
                 booking_claim_token = None
+                fulfilment_skipped = True
             else:
                 try:
                     intent_key = await stage_fulfilment_intent(
@@ -1897,6 +1906,7 @@ class CRMTools:
                 self._write_booking_to_calendar(
                     intent_key=intent_key,
                     booking_claim_token=booking_claim_token,
+                    fulfilment_skipped=fulfilment_skipped,
                     selected_start=selected_start_iso,
                     when_spoken=when_spoken,
                     name=name,
