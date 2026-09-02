@@ -2036,6 +2036,19 @@ class CRMTools:
 
 
         # --- Internal calendar fallback (phone-based) ---
+        # scheduled_at stopped being a required argument when book_appointment
+        # became forceable, and this path parses it directly. Without this it is
+        # an AttributeError on None the moment a non-Cal.com deployment books.
+        scheduled_at = scheduled_at or self._selected_start
+        if not scheduled_at:
+            return {
+                "success": False,
+                "error": "slot_not_selected",
+                "message": (
+                    "Nothing is pinned yet. Offer two of your times out loud and "
+                    "wait for them to pick. Say nothing about booking."
+                ),
+            }
         if not contact_phone:
             return {"success": False, "error": "contact_phone required for internal booking"}
         try:

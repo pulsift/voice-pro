@@ -168,3 +168,25 @@ async def test_waiting_for_the_caller_is_still_silence_not_a_forced_turn() -> No
     await session.handle_function_call_event(call_event("wait_for_user"))
 
     assert recorder.created == []
+
+
+@pytest.mark.asyncio
+async def test_the_internal_calendar_path_survives_the_argument_being_gone() -> None:
+    """The path the diff did not touch, whose signature it changed anyway.
+
+    Cal.com off, nothing pinned, no arguments: this used to parse `scheduled_at`
+    straight into fromisoformat, so the day book_appointment became forceable it
+    became an AttributeError on None instead of an answer.
+    """
+    from app.core.config import settings
+
+    tools = CRMTools(db=MagicMock(), user_id=1, variables={"leadName": "Sami"})
+    original = settings.CALCOM_API_KEY
+    settings.CALCOM_API_KEY = ""
+    try:
+        result = await tools.book_appointment()
+    finally:
+        settings.CALCOM_API_KEY = original
+
+    assert result["success"] is False
+    assert result["error"] == "slot_not_selected"

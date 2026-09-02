@@ -917,7 +917,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r"solar work|smallest|mainly|kind of work|installs", [
                 "Commercial solar, hundred kilowatts minimum."
             ]),
-            (r"states|areas|cover", ["Just Texas."]),
+            (r"states|areas|cover|counties|county|regions", ["Just Texas."]),
+            (r"system size|sizes|how big|what size|kw|kilowatt",
+             ["Anything from a hundred kilowatts up."]),
             (OFFER_PATTERN, [
                 "Yeah.",  # a vague yes is NOT a pick - the agent must ask which
                 "The later one on Friday then.",
@@ -940,7 +942,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
                 "Mostly rooftop."
             ]),
-            (r"states|areas|cover", ["Northern California."]),
+            (r"states|areas|cover|counties|county|regions", ["Northern California."]),
+            (r"system size|sizes|how big|what size|kw|kilowatt",
+             ["Anything from a hundred kilowatts up."]),
             (OFFER_PATTERN, [
                 "What about Wednesday?",
                 "Wednesday at three then.",
@@ -962,7 +966,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r"solar work|smallest|mainly|kind of work|installs|rooftop", [
                 "Rooftop resi mostly."
             ]),
-            (r"states|areas|cover", ["Arizona and Nevada."]),
+            (r"states|areas|cover|counties|county|regions", ["Arizona and Nevada."]),
+            (r"system size|sizes|how big|what size|kw|kilowatt",
+             ["Anything from a hundred kilowatts up."]),
             (OFFER_PATTERN, [
                 "Can you do Thursday afternoon?",
                 "Thursday at half past one in the afternoon.",
@@ -982,7 +988,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r"solar work|smallest|mainly|kind of work|installs|ground.mount", [
                 "Ground mount, fifty kilowatts and up."
             ]),
-            (r"states|areas|cover", ["Nevada."]),
+            (r"states|areas|cover|counties|county|regions", ["Nevada."]),
+            (r"system size|sizes|how big|what size|kw|kilowatt",
+             ["Anything from a hundred kilowatts up."]),
             (OFFER_PATTERN, [
                 "Have you got anything on Wednesday instead?",
                 "Alright then, Friday at half past four in the afternoon.",
@@ -1044,7 +1052,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
             (r"solar work|smallest|mainly|kind of work|installs|carports|rooftop", [
                 "Carports, hundred kilowatts up."
             ]),
-            (r"states|areas|cover", ["California."]),
+            (r"states|areas|cover|counties|county|regions", ["California."]),
+            (r"system size|sizes|how big|what size|kw|kilowatt",
+             ["Anything from a hundred kilowatts up."]),
             (r"tuesday|friday|which (suits|works|one)|got", [
                 "What have you got on Friday?",
                 "Hmm, what about Wednesday?",
