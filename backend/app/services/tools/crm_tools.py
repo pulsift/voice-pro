@@ -203,6 +203,10 @@ class CRMTools:
         self._selection_user_turn = 0
         self._booking_attempts: list[dict[str, Any]] = []
         self._booking_completed: dict[str, Any] | None = None
+        # Kept OUTSIDE _booking_completed, which is deepcopied straight back to the
+        # model: these two are for the operator alert, not for the agent to read.
+        self._booked_when: str = ""
+        self._booked_intent_key: str = ""
         # Calendar writes THIS session started. Draining the module-global set at
         # teardown made one call wait on another prospect's slow Cal.com request
         # ([Codex]); a call only ever waits for its own.
@@ -595,6 +599,73 @@ class CRMTools:
             time_matches.add((12, 0))
         return time_matches
 
+    _DAY_NAMES = (
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    )
+
+    def _time_signals(
+        self, text: str
+    ) -> tuple[set[tuple[int, int]], set[str], list[tuple[int, int]]]:
+        """Everything a sentence says about WHEN, with one owner.
+
+        Split out of `_slots_named_in` because two callers now need it: matching a
+        sentence to slots, and answering the different question "did they name a
+        time at all?". A second copy of this parse would drift, and the drift shows
+        up on a call as the agent telling somebody a time is gone when they never
+        named one.
+        """
+        time_matches = self._extract_time_matches(text)
+        day_names = {
+            name for name in self._DAY_NAMES if re.search(rf"\b{name}\b", text)
+        }
+        # Day-part references ("the morning one", "the afternoon slot") are how
+        # people naturally answer when the two times are re-offered by name.
+        periods: list[tuple[int, int]] = []
+        if re.search(r"\bmorning\b", text):
+            periods.append((0, 12))
+        if re.search(r"\bafternoon\b", text):
+            periods.append((12, 18))
+        if re.search(r"\bevening\b|\btonight\b", text):
+            periods.append((17, 24))
+        return time_matches, day_names, periods
+
+    def _named_a_time(self, utterance: str) -> tuple[bool, set[str]]:
+        """Did they name a WHEN, and which day did they name?
+
+        Used only to tell two very different refusals apart: "they have not chosen
+        yet" and "they chose something we do not hold". Getting that wrong in
+        either direction puts a lie in the agent's mouth, so it reuses the same
+        parse as matching rather than a second opinion about it.
+        """
+        text = " ".join((utterance or "").lower().split())
+        text = re.sub(r"\b([ap])\.\s?m\.?", r"\1m", text)
+        time_matches, day_names, periods = self._time_signals(text)
+        return bool(time_matches or day_names or periods), day_names
+
+    def _two_alternatives(self, day_names: set[str]) -> str:
+        """Two real times to offer instead, same day first.
+
+        Never invented: every one comes from the slots already offered, so a
+        walk-back can only ever name something we actually hold.
+        """
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo(self._normalized_timezone or "UTC")
+        ordered = sorted(self._offered_slots, key=lambda slot: str(slot["start"]))
+        same_day = []
+        if day_names:
+            for slot in ordered:
+                start = self._canonical_start(slot["start"])
+                if start is None:
+                    continue
+                if start.astimezone(zone).strftime("%A").lower() in day_names:
+                    same_day.append(slot)
+        pool = same_day or ordered
+        labels = [str(slot.get("label") or "") for slot in pool[:2] if slot.get("label")]
+        if len(labels) >= MIN_SLOTS_FOR_SECOND_SELECTION:
+            return f"{labels[0]}, or {labels[1]}"
+        return labels[0] if labels else ""
+
     def _slots_named_in(self, utterance: str, *, shortlist: list[str] | None = None) -> set[str]:
         """Which offered slots this sentence could be naming.
 
@@ -631,29 +702,7 @@ class CRMTools:
         if ordinal_candidates:
             return ordinal_candidates
 
-        time_matches = self._extract_time_matches(text)
-        day_names = {
-            name
-            for name in (
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday",
-                "saturday",
-                "sunday",
-            )
-            if re.search(rf"\b{name}\b", text)
-        }
-        # Day-part references ("the morning one", "the afternoon slot") are how
-        # people naturally answer when the two times are re-offered by name.
-        periods: list[tuple[int, int]] = []
-        if re.search(r"\bmorning\b", text):
-            periods.append((0, 12))
-        if re.search(r"\bafternoon\b", text):
-            periods.append((12, 18))
-        if re.search(r"\bevening\b|\btonight\b", text):
-            periods.append((17, 24))
+        time_matches, day_names, periods = self._time_signals(text)
         if not time_matches and not day_names and not periods:
             return set()
 
@@ -797,7 +846,37 @@ class CRMTools:
     async def select_slot(self, slot_id: str) -> dict[str, Any]:
         """Pin one offered slot only when the latest post-offer transcript agrees."""
         if not self._offered_slots:
-            return {"success": False, "error": "slots_not_offered"}
+            return {
+                "success": False,
+                "error": "slots_not_offered",
+                "message": (
+                    "You have no calendar to pick from. Do not invent a time. Say "
+                    "you will email them today to get them set, then end_call."
+                ),
+            }
+        if self._booking_completed is not None:
+            # The booking is already written (or in flight) and the caller has
+            # already HEARD the time. Affirmative-by-default would answer "sure,
+            # Wednesday" here, and Cal.com would still say Tuesday - the caller
+            # walks away believing something untrue and nothing alerts. So this is
+            # the one place the agent must not agree, and a human has to move it.
+            await self._alert_operator_about_booking(
+                intent_key=self._booked_intent_key,
+                prospect=str(self.variables.get("leadName") or "the lead"),
+                when=self._booked_when,
+                reason="they asked to change the time after it was already booked",
+                detail="Reschedule by hand: the call ended with the ORIGINAL time booked.",
+            )
+            return {
+                "success": False,
+                "error": "already_booked",
+                "message": (
+                    "That time is already through and cannot be changed from here. "
+                    "Never agree to a swap. Say it plainly and warmly: 'that one's "
+                    "already gone through - I'll get the team to move it and email "
+                    "you the new time today.' Then one goodbye and end_call."
+                ),
+            }
         # A menu the caller was never read needs an unambiguous time of their own —
         # UNLESS the agent has now actually said some of those times out loud, which
         # is the moment it stops being a private list and becomes a real offer.
@@ -836,6 +915,30 @@ class CRMTools:
         # nothing about a time still names nothing, and _refuses_or_defers above
         # still empties the set outright when the words carry a no.
         if slot_id not in offered or slot_id not in candidates:
+            named, named_days = self._named_a_time(self._latest_user_utterance)
+            # Three refusals wear one error today, and they need three different
+            # sentences. This is the "they named something real and we do not hold
+            # it" one - and it is the ONLY one where the agent may say a time is
+            # gone. It sits after _refuses_or_defers (inside _utterance_slot_
+            # candidates) and after selection_not_heard on purpose: "no, Tuesday at
+            # ten doesn't work" parses a time and matches nothing, and rendering
+            # THAT as "that one's gone" would be a lie about a time they had just
+            # turned down. Do not reorder these.
+            alternatives = self._two_alternatives(named_days)
+            refused = self._refuses_or_defers(self._latest_user_utterance)
+            if named and not refused and not candidates and alternatives:
+                return {
+                    "success": False,
+                    "error": "slot_unavailable",
+                    "message": (
+                        "They named a time we do not hold. Say so plainly and give "
+                        f"them what we DO have, in one line: 'that one's actually "
+                        f"gone - I've got {alternatives}.' Never apologise for it, "
+                        "never blame them, and never mention systems or calendars. "
+                        "From here on you ARE looking things up, so 'let me check' "
+                        "is finally honest if you need it."
+                    ),
+                }
             return {
                 "success": False,
                 "error": "ambiguous_slot_selection",
@@ -937,7 +1040,7 @@ class CRMTools:
             {
                 "type": "function",
                 "name": "refresh_availability",
-                "description": "Re-read the calendar. You normally do NOT need this: the open times are already listed in your instructions. Call it ONLY if (a) the lead's timezone turns out to be different from the one your listed times are in, or (b) a time you tried was already taken.",
+                "description": "Re-read the calendar. You normally do NOT need this: the open times are already listed in your instructions, and they are the whole week. Call it ONLY if the lead's timezone turns out to be different from the one your listed times are in. A time you asked for and could not have is NOT a reason to call this - you were already told what to offer instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1753,11 +1856,25 @@ class CRMTools:
             if not self._offered_slots:
                 return {"success": False, "error": "slots_not_offered"}
             if not self._selected_start or not self._selected_slot_id:
-                return {"success": False, "error": "slot_not_selected"}
+                return {
+                    "success": False,
+                    "error": "slot_not_selected",
+                    "message": (
+                        "Nothing is pinned yet. Offer two of your times out loud and "
+                        "wait for them to pick. Say nothing about booking."
+                    ),
+                }
             supplied_start = self._canonical_start(scheduled_at)
             selected_start = self._canonical_start(self._selected_start)
             if supplied_start is None or selected_start is None or supplied_start != selected_start:
-                return {"success": False, "error": "slot_mismatch"}
+                return {
+                    "success": False,
+                    "error": "slot_mismatch",
+                    "message": (
+                        "That is not the time that was pinned. Call select_slot for "
+                        "the time they actually said, then book. Say nothing yet."
+                    ),
+                }
 
             name = (self.variables.get("leadName") or "").strip() or "Guest"
             attendee_email = (email or "").strip() or str(
@@ -1895,6 +2012,8 @@ class CRMTools:
             # exact time promised.
             self._selected_slot_id = None
             self._selected_start = None
+            self._booked_when = when_spoken
+            self._booked_intent_key = intent_key or ""
             self._booking_completed = {
                 "success": True,
                 "message": (

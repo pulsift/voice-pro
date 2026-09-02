@@ -730,7 +730,13 @@ async def test_a_conflict_alerts_instead_of_re_offering(
     assert create_booking.await_count == 1
     # No second calendar read: there is nothing left to re-offer to.
     assert get_slots.await_args_list == [call(lead_tz="UTC", days=LOOKAHEAD_DAYS)]
-    assert (await tools.select_slot("slot_1"))["error"] == "selection_not_heard"
+    # Once the write is dispatched the caller has HEARD their time, so a later
+    # pick is not a fresh selection to re-run - it is a reschedule only a human
+    # can do. The refusal changed words (2026-09-02) from "I did not hear you" to
+    # "that one is already through", because the second one is the true sentence.
+    late = await tools.select_slot("slot_1")
+    assert late["error"] == "already_booked"
+    assert "already gone through" in late["message"]
 
 
 @pytest.mark.asyncio

@@ -261,6 +261,48 @@ def _render_offer_first_line(offer_slots: list[dict[str, str]]) -> str | None:
     return f"OFFER FIRST: {offer_slots[0]['label']}, or {offer_slots[1]['label']}."
 
 
+def _render_span_lines(
+    ordered: list[tuple[dict[str, str], datetime]],
+) -> list[str]:
+    """One spoken SPAN per day, so "what have you got?" is answered in a sentence.
+
+    A span says where a day STARTS and where it ENDS. It never claims everything
+    between the two is free: the calendar has gaps and `_thin` narrows the menu
+    further, so a coverage claim would be a small lie the caller discovers on
+    their very next sentence. Anything inside the span we do not actually hold is
+    caught by select_slot, which walks it back honestly.
+
+    The full list stays in the block underneath. Available and spoken aloud are
+    different things - the agent keeps every slot, it just stops reciting them.
+    """
+    if not ordered:
+        return []
+    by_day: dict[str, list[datetime]] = {}
+    day_names: dict[str, str] = {}
+    for entry, local in ordered:
+        key = _day_key(local)
+        by_day.setdefault(key, []).append(local)
+        day_names.setdefault(key, entry["day"])
+
+    spans: list[str] = []
+    for key, moments in by_day.items():
+        first, last = min(moments), max(moments)
+        name = day_names[key]
+        if first == last:
+            spans.append(f"{name}, {spoken_time(first)} only")
+        else:
+            spans.append(
+                f"{name}, from {spoken_time(first)} through to {spoken_time(last)}"
+            )
+    return [
+        "SPANS - say one of these, never a list of times: " + "; ".join(spans) + ".",
+        "When they ask what you have - a single day or your availability in general "
+        "- answer with the span in ONE sentence and stop. Never read individual "
+        "times out loud. The calendar below is what you MATCH their words against; "
+        "it is not a script to read from.",
+    ]
+
+
 def build_menu(
     raw_slots: list[dict[str, str]],
     lead_tz: str,
@@ -366,7 +408,9 @@ def build_menu(
         "timezone": lead_tz,
         "generated_at": datetime.now(UTC).isoformat(),
         "slots": slots,
-        "block": render_block(days, lead_tz, offer_slots=offer_slots),
+        "block": render_block(
+            days, lead_tz, offer_slots=offer_slots, spans=_render_span_lines(slot_locals)
+        ),
         "offer_slots": offer_slots,
     }
 
@@ -402,6 +446,7 @@ def render_block(
     lead_tz: str,
     *,
     offer_slots: list[dict[str, str]] | None = None,
+    spans: list[str] | None = None,
 ) -> str:
     """Render the menu as the prompt block the agent reads its times from.
 
@@ -421,6 +466,7 @@ def render_block(
     offer_line = _render_offer_first_line(offer_slots or [])
     if offer_line:
         lines.append(offer_line)
+    lines.extend(spans or [])
     lines.append(
         f"This is the WHOLE calendar for the coming week - every time we hold, in the "
         f"lead's own clock ({spoken_zone_name(lead_tz)}). If a day or a time is on this "
