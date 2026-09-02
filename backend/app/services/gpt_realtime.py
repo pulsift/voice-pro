@@ -1,6 +1,7 @@
 """GPT Realtime API service for Premium tier voice agents."""
 
 import asyncio
+import contextlib
 import json
 import re
 import types
@@ -643,9 +644,25 @@ class GPTRealtimeSession:
                 # "let me lock that in" while the caller waits. This is the only
                 # per-turn lever we own: the caller's OWN turns are created by
                 # server VAD, not by us, so they cannot be scoped this way.
-                await self.connection.response.create(
-                    response={"tool_choice": {"type": "function", "name": forced_next}}
-                )
+                #
+                # If the scoped request is refused - a response already in
+                # flight, a dropped socket - the caller is mid-call with a slot
+                # pinned and nothing happening. Silence is the worse failure, so
+                # fall back to an ordinary turn and let the agent speak. [Codex]
+                try:
+                    await self.connection.response.create(
+                        response={
+                            "tool_choice": {"type": "function", "name": forced_next}
+                        }
+                    )
+                except Exception:
+                    self.logger.warning(
+                        "forced_tool_response_refused",
+                        tool_name=forced_next,
+                        call_id=call_id,
+                    )
+                    with contextlib.suppress(Exception):
+                        await self.connection.response.create()
             elif name != "wait_for_user" or result.get("dead_air_limit_reached"):
                 await self.connection.response.create()
 

@@ -381,6 +381,23 @@ class CRMTools:
         """
         return deepcopy(self._fit_answers)
 
+    _FIT_FIELDS = ("offer_types", "states", "min_kw")
+
+    def _ready_to_book(self) -> bool:
+        """A time is pinned, all three answers are in, and nothing is booked yet.
+
+        Deliberately strict about the answers. Forcing the booking the moment
+        SOMETHING was recorded would cut the third question off mid-call and
+        hand the team a list built on half an answer. When it is not satisfied
+        nothing is forced and the agent books the way it always did - so this
+        can only ever remove a gap, never create one.
+        """
+        if self._booking_completed is not None:
+            return False
+        if not (self._selected_start and self._selected_slot_id):
+            return False
+        return all(field in self._fit_answers for field in self._FIT_FIELDS)
+
     async def record_fit_answers(
         self,
         offer_types: list[str] | None = None,
@@ -417,7 +434,10 @@ class CRMTools:
                 ),
             }
         self._fit_answers.update(normalized)
-        return {"success": True, "recorded": True}
+        result: dict[str, Any] = {"success": True, "recorded": True}
+        if self._ready_to_book():
+            result["next_tool"] = "book_appointment"
+        return result
 
     def _replace_offered_slots(self, slots: list[dict[str, str]], timezone: str) -> None:
         self._offered_slots = [
@@ -773,7 +793,26 @@ class CRMTools:
     # A no, in any of the shapes a person actually says one.
     _NEGATION = re.compile(
         r"\b(no|nope|nah|not|never|cant|cannot|wont|dont|doesnt|isnt|aint)\b"
-        r"|\bn'?t\b|\b(can|do|does|is|was|will|would)n'?t\b",
+        # ANY "...n't" contraction, straight and curly. Spelling them out as
+        # stem + "n't" is what let can't and won't through: that alternation
+        # was asking for "cann't" and "willn't", so a caller saying "I can't do
+        # Monday at nine" had Monday at nine booked for them. [Codex]
+        # The apostrophe is REQUIRED and the stem must be non-empty.
+        # Without that this matched any word ending in "nt": "I want the
+        # Tuesday at one" was read as a refusal and the caller got re-asked.
+        r"|\b\w+n['\u2019]t\b",
+        re.IGNORECASE,
+    )
+    # Asking what we hold is not choosing it. Kept narrow on purpose: "what
+    # about Tuesday?" and "could you do Tuesday?" ARE proposals and still
+    # select. These forms only ever enquire, and a wrong booking can no longer
+    # be undone on the call, so the cost is not symmetric. [Codex]
+    _AVAILABILITY_QUESTION = re.compile(
+        r"\b(do|did) you have\b|\bhave you got\b|\bdo you do\b"
+        r"|\bis there (anything|any)\b|\bare there any\b"
+        r"|\bany (availability|slots|times|openings)\b"
+        r"|\b(is|are) [^.?!]{0,40}\b(free|available|open)\b"
+        r"|\bwhat (do you have|have you got|times)\b",
         re.IGNORECASE,
     )
     # Not a no, but not a yes either: they want to think, check, or be called back.
@@ -860,13 +899,15 @@ class CRMTools:
             # Wednesday" here, and Cal.com would still say Tuesday - the caller
             # walks away believing something untrue and nothing alerts. So this is
             # the one place the agent must not agree, and a human has to move it.
-            await self._alert_operator_about_booking(
-                intent_key=self._booked_intent_key,
-                prospect=str(self.variables.get("leadName") or "the lead"),
-                when=self._booked_when,
-                reason="they asked to change the time after it was already booked",
-                detail="Reschedule by hand: the call ended with the ORIGINAL time booked.",
-            )
+            #
+            # Only a real change gets a human, though. A bare "yes, thanks" after
+            # the booking used to raise a reschedule alert saying the write had
+            # failed - untrue - under the SAME dedup key the genuine
+            # write-failure alert uses, so a real failure arriving second was
+            # dropped as a duplicate. [Codex]
+            asked_to_move, _ = self._named_a_time(self._latest_user_utterance)
+            if asked_to_move:
+                await self._alert_operator_about_reschedule()
             return {
                 "success": False,
                 "error": "already_booked",
@@ -904,6 +945,17 @@ class CRMTools:
                     "mention formats, systems, or tools."
                 ),
             }
+        if self._AVAILABILITY_QUESTION.search(self._latest_user_utterance or ""):
+            return {
+                "success": False,
+                "error": "question_not_selection",
+                "message": (
+                    "That was a question about what we hold, not a pick. Answer it "
+                    "warmly and shortly - 'yeah, we've got that one' - and stop. "
+                    "Never ask them to confirm: if they want it they will say so, "
+                    "and you take it then."
+                ),
+            }
         offered = {slot["slot_id"]: slot for slot in self._offered_slots}
         candidates = self._utterance_slot_candidates()
         # The transcript CONSTRAINS the choice; it no longer dictates it. Demanding
@@ -939,6 +991,20 @@ class CRMTools:
                         "is finally honest if you need it."
                     ),
                 }
+            if named and not refused and not candidates:
+                # Named something real, and the menu has no label to offer back.
+                # The old fall-through said "they have not named a time yet",
+                # which is simply untrue and reads as not having listened. [Codex]
+                return {
+                    "success": False,
+                    "error": "slot_unavailable",
+                    "message": (
+                        "They named a time we do not hold, and there is nothing "
+                        "close to offer them. Say so plainly - 'that one's actually "
+                        "gone' - then give them the span of a day you DO have. "
+                        "Never invent a time."
+                    ),
+                }
             return {
                 "success": False,
                 "error": "ambiguous_slot_selection",
@@ -972,7 +1038,7 @@ class CRMTools:
             "start": selected["start"],
             "when": selected["label"],
         }
-        if self._fit_answers:
+        if self._ready_to_book():
             # Everything book_appointment needs is already held here, so the
             # session forces it as the very next thing and the model is never
             # handed a turn to narrate into. Three attempts to ASK for this
@@ -1539,6 +1605,29 @@ class CRMTools:
         )
         await raise_operator_alert(
             dedup_key=f"voice-booking-unconfirmed:{intent_key}", message=message
+        )
+
+    async def _alert_operator_about_reschedule(self) -> None:
+        """A caller asked to move a time that is already booked.
+
+        Deliberately NOT _alert_operator_about_booking: that one says the write
+        did not go through, which is false here, and it keys on
+        "voice-booking-unconfirmed:<intent>" - so raising it here could swallow
+        the real write-failure alert for the same booking as a duplicate. [Codex]
+        """
+        prospect = str(self.variables.get("leadName") or "a prospect")
+        when = self._booked_when or "the time they chose"
+        self.logger.warning(
+            "booking_change_requested_after_write",
+            intent_key=self._booked_intent_key,
+        )
+        await raise_operator_alert(
+            dedup_key=f"voice-booking-reschedule:{self._booked_intent_key}",
+            message=(
+                f"{prospect} asked to move their call after {when} had already "
+                f"been booked. The booking itself is fine - the agent told them "
+                f"the team would email a new time. Move it by hand and email them."
+            ),
         )
 
     async def _write_booking_to_calendar(  # noqa: PLR0911, PLR0912, PLR0915

@@ -165,7 +165,11 @@ async def test_after_it_is_booked_a_change_of_mind_is_refused_and_alerted(
 
     assert late["error"] == "already_booked"
     assert "already gone through" in late["message"]
-    assert any(
-        "change the time after it was already booked" in alert["message"]
-        for alert in raised_alerts
-    )
+    # Its OWN alert, and its own dedup key: the write-failure alert says the
+    # booking does not exist, which is false here, and sharing its key would
+    # let a real failure arriving second be dropped as a duplicate. [Codex]
+    assert len(raised_alerts) == 1
+    alert = raised_alerts[0]
+    assert "asked to move their call" in alert["message"]
+    assert "did not go through" not in alert["message"]
+    assert alert["dedup_key"].startswith("voice-booking-reschedule:")
