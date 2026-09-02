@@ -130,6 +130,8 @@ BOOKED_CLAIMS = ("booked", "you're set", "you are set", "locked in")
 OPENER_END_MARKERS = (
     "got a sec", "got a second", "got a minute", "catch you at a bad time",
     "okay time", "ok time", "good time", "bad time", "caught you",
+    # The agenda opener ends on this beat, and prompt_publish.py REQUIRES it.
+    "that alright", "sound good", "that okay", "that ok",
 )
 # The same beat, as a regex, for the scenario rules that answer it.
 OPENER_PATTERN = "|".join(re.escape(marker) for marker in OPENER_END_MARKERS)
@@ -379,6 +381,10 @@ class Conversation:
         self.events: list[tuple[str, ...]] = []  # ("assistant"|"caller"|"tool", ...)
         self.ended = False
         self._rate_limit_retries = 0
+        # An instance, not the class: execute_tool holds per-call goodbye state,
+        # so calling it on the class raised on every single end_call and killed
+        # every scenario before its final check ran.
+        self.call_control = CallControlTools()
         # Item order inside each model response. A response holding BOTH a
         # spoken message and a function call is where "I'll check that time and
         # then..." comes from: the model speaks, calls the tool, and we then ask
@@ -411,7 +417,7 @@ class Conversation:
 
     async def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = (
-            await CallControlTools.execute_tool(name, arguments)
+            await self.call_control.execute_tool(name, arguments)
             if name in CALL_CONTROL_NAMES
             else await self.crm.execute_tool(name, arguments)
         )
@@ -645,9 +651,12 @@ def check_common(convo: Conversation, violations: list[str]) -> None:
     opener = texts[0]
     if not re.match(r"^(hey|hi|hello|good (morning|afternoon|evening))\b", opener):
         violations.append(f"opener does not greet them: {opener[:80]!r}")
+    # The agent's own name is deliberately NOT here. Since 2026-08-25 the opener
+    # is "this is Pulsift's AI assistant", and the name is spent on "who's this?"
+    # instead - the prompt has a rule for exactly that. Requiring it here was
+    # marking the approved opener as broken on every run.
     for label, needle in (
         ("their name", str(VARS["leadName"]).lower()),
-        ("its own name", str(VARS["agentName"]).lower()),
         ("who is calling", "pulsift"),
     ):
         if needle not in opener:
