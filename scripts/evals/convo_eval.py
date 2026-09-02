@@ -893,7 +893,12 @@ def check_early_time_jump(convo: Conversation, violations: list[str]) -> None:
         word in asked_after for word in ("install", "rooftop", "ground", "carport", "kind of work")
     ):
         violations.append("never came back to ask about the kind of installs after locking the time")
-    if not any(word in asked_after for word in ("area", "cover", "state")):
+    # "counties" and "regions" are how the agent has asked this since 2026-08-29.
+    # The check was still listening for the wording it replaced.
+    if not any(
+        word in asked_after
+        for word in ("area", "cover", "state", "count", "region")
+    ):
         violations.append("never came back to ask about the areas covered after locking the time")
 
 
