@@ -448,6 +448,11 @@ class Conversation:
                 except json.JSONDecodeError:
                     arguments = {}
                 result = await self._execute_tool(name, arguments)
+                # Same contract as app/services/gpt_realtime.py: a tool may name
+                # the tool that must run next, and the model never sees the key.
+                forced_next = (
+                    result.pop("next_tool", None) if isinstance(result, dict) else None
+                )
                 self.events.append(("tool", name, bool(result.get("success")), result))
                 await self.connection.conversation.item.create(
                     item={
@@ -458,7 +463,14 @@ class Conversation:
                 )
                 if name == "end_call":
                     self.ended = True
-                if name != "wait_for_user":
+                if forced_next:
+                    await self.connection.response.create(
+                        response={
+                            "tool_choice": {"type": "function", "name": forced_next}
+                        }
+                    )
+                    open_responses += 1
+                elif name != "wait_for_user":
                     await self.connection.response.create()
                     open_responses += 1
             elif event_type == "response.done":
@@ -560,24 +572,64 @@ SILENT_TOOLS = {
 }
 
 
+MAX_AFFIRMATION_WORDS = 8
+
+
 def check_no_narrated_tool_calls(convo: Conversation, violations: list[str]) -> None:
     """No speaking before a tool the caller is waiting on.
 
     Read off the model's own response items rather than off the words, because
     the tell is structural: one response holding a message AND a function call
     always becomes two spoken turns once we feed the result back.
+
+    One exception, added 2026-09-02 on Sami's ruling: a named time is answered
+    "Sure" immediately, because the tool does the judging and the agent never
+    has to. That affirmation IS the wanted behaviour, so a short leading message
+    with no intent marker in it is allowed ahead of select_slot only. Anything
+    that promises what happens next ("I'll pick that time and finish setting
+    things up") still carries an intent marker and still fails.
     """
-    for shape in convo.response_shapes:
+    for index, shape in enumerate(convo.response_shapes):
         spoke_first = False
         for kind, name in shape:
             if kind == "message":
                 spoke_first = True
             elif kind == "function_call" and spoke_first and name in SILENT_TOOLS:
+                if name == "select_slot" and _is_bare_affirmation(convo, index):
+                    continue
                 violations.append(
                     f"narrated {name} before calling it (response items: "
                     f"{[f'{k}:{n}' if n else k for k, n in shape]})"
                 )
                 break
+
+
+def _is_bare_affirmation(convo: Conversation, index: int) -> bool:
+    """Short, and promising nothing about what happens next."""
+    texts = convo.assistant_texts
+    if index >= len(texts):
+        return False
+    spoken = normalize_spoken(texts[index])
+    if any(marker in spoken for marker in INTENT_MARKERS):
+        return False
+    return len(spoken.split()) <= MAX_AFFIRMATION_WORDS
+
+
+def check_booking_turn_is_silent(convo: Conversation, violations: list[str]) -> None:
+    """book_appointment must arrive alone, with nothing spoken alongside it.
+
+    This is the deterministic half of the 2026-09-02 filler fix: the response
+    that books is scoped to one named function, so it can only ever hold that
+    function call. A message item sitting in the same response means the forced
+    turn did not happen and the agent is narrating into the gap again.
+    """
+    for shape in convo.response_shapes:
+        names = [name for kind, name in shape if kind == "function_call"]
+        if "book_appointment" not in names:
+            continue
+        if len(shape) > 1:
+            readable = [f"{k}:{n}" if n else k for k, n in shape]
+            violations.append(f"booking turn was not silent (response items: {readable})")
 
 
 def check_common(convo: Conversation, violations: list[str]) -> None:
@@ -615,6 +667,7 @@ def check_common(convo: Conversation, violations: list[str]) -> None:
             if phrase in low:
                 violations.append(f"tech leakage {phrase!r} in: {text[:100]!r}")
     check_no_narrated_tool_calls(convo, violations)
+    check_booking_turn_is_silent(convo, violations)
     # "booked"-style claims must come only after a successful create tool event.
     create_seen = False
     for e in convo.events:

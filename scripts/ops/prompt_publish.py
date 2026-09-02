@@ -67,10 +67,15 @@ REQUIRED = (
     # named early IS something handed to you, and answering it with only a
     # question reads as not having heard them.
     "never answer a named time with only a question",
+    # Added 2026-09-02. The agent recited ten times at Sami on a live call; the
+    # menu now renders a spoken SPAN per day and the prompt reads that instead.
+    "SPAN in one",
 )
 # Phrases that must NOT come back: each one caused a bad call.
 FORBIDDEN = (
     "the first time or the second",  # nobody talks like that
+    # This single line PRODUCED the recital. It must not come back in a rewrite.
+    "name every time you hold",
     "check_availability",  # superseded by the pre-loaded calendar
     "read it back",  # reading an email address aloud on a phone call
     # Added 2026-08-08: this instruction is what turned the caller's "San Jose"

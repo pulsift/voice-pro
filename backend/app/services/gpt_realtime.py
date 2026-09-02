@@ -618,6 +618,10 @@ class GPTRealtimeSession:
         # Execute tool via internal tool registry
         result = await self.handle_tool_call({"name": name, "arguments": arguments})
         result = self._apply_dead_air_limit(name, result)
+        # A tool may name the tool that must run next. Popped before the result
+        # is handed back, so the model never reads it: this is an instruction to
+        # the SESSION, and the entire point is that the model is not asked.
+        forced_next = result.pop("next_tool", None) if isinstance(result, dict) else None
 
         # Send result back using SDK
         if self.connection:
@@ -633,7 +637,16 @@ class GPTRealtimeSession:
             # response here would defeat it, so stay silent instead — UNLESS the
             # line has now been unusable too many turns running, in which case
             # staying silent IS the failure and the agent has to close the call.
-            if name != "wait_for_user" or result.get("dead_air_limit_reached"):
+            if forced_next:
+                # A response scoped to one named function returns that function
+                # call and nothing else - no message item, so no audio, so no
+                # "let me lock that in" while the caller waits. This is the only
+                # per-turn lever we own: the caller's OWN turns are created by
+                # server VAD, not by us, so they cannot be scoped this way.
+                await self.connection.response.create(
+                    response={"tool_choice": {"type": "function", "name": forced_next}}
+                )
+            elif name != "wait_for_user" or result.get("dead_air_limit_reached"):
                 await self.connection.response.create()
 
         self.logger.info(

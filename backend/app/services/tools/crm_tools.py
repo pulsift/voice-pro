@@ -966,22 +966,31 @@ class CRMTools:
                 "selected_start": selected["start"],
             }
         )
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "slot_id": slot_id,
             "start": selected["start"],
             "when": selected["label"],
-            # Every other tool tells the agent what to do next; this one used to
-            # hand back a bare success, and the model filled the resulting silence
-            # with "let me lock that in" / "let me line up that Friday time" -
-            # twice, through two different prompt bans. A model will always find a
-            # new phrase for a gap, so the fix is to leave no gap.
-            "message": (
-                "Pinned, not booked. Do NOT speak yet - say nothing at all about "
-                "checking, lining up or confirming. Call book_appointment now, and "
-                "let its result be the first thing you say."
-            ),
         }
+        if self._fit_answers:
+            # Everything book_appointment needs is already held here, so the
+            # session forces it as the very next thing and the model is never
+            # handed a turn to narrate into. Three attempts to ASK for this
+            # silence failed - two prompt bans and a plea in this very return -
+            # because a model always finds a new phrase for a gap. The gap is
+            # gone now instead. `next_tool` is stripped before the model sees
+            # the result: it is an instruction to the session, not to the agent.
+            result["next_tool"] = "book_appointment"
+        else:
+            # The caller jumped straight to a time before the fit questions. Here
+            # speaking IS the right move - say the time back and bridge into the
+            # question in one turn - so nothing is forced.
+            result["message"] = (
+                "Pinned, not booked, and you still owe them a fit question. Say "
+                "the time back and go straight into the question you have not "
+                "asked, in ONE turn. Nothing about booking yet."
+            )
+        return result
 
     @staticmethod
     def get_tool_definitions() -> list[dict[str, Any]]:
@@ -1119,44 +1128,17 @@ class CRMTools:
                 "type": "function",
                 "name": "book_appointment",
                 "description": (
-                    "Book the selected appointment after select_slot succeeds and the ICP fit check "
-                    "is captured. The attendee name and email on file are filled automatically; pass "
-                    "email only if the lead volunteers a correction. Pass the exact selected start. "
-                    "Call it as the FIRST thing you do on that turn, with nothing spoken before it: "
-                    "it answers instantly and you speak the moment it does, so the lead hears no "
-                    "gap and needs no warning. Nothing about the booking is true until it returns."
+                    "Book the time select_slot pinned. Takes no arguments: the time, the fit "
+                    "answers, the attendee name and the email on file are all filled in for you "
+                    "- pass email only if the lead volunteers a correction. Nothing about the "
+                    "booking is true until this returns."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "scheduled_at": {
-                            "type": "string",
-                            "description": "Chosen appointment start time in ISO 8601 format - use the exact 'start' value select_slot returned.",
-                        },
                         "email": {
                             "type": "string",
                             "description": "Optional corrected email volunteered by the lead. Otherwise the email on file is used silently.",
-                        },
-                        "icp": {
-                            "type": "object",
-                            "description": "REQUIRED. The two fit answers captured on the call: the kind of installs they take on, and the areas they cover.",
-                            "additionalProperties": False,
-                            "properties": {
-                                "offer_types": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "What they install/sell, e.g. ['rooftop C&I', 'carport', 'storage', 'resi-expanding', 'finance-PPA'].",
-                                },
-                                "min_kw": {
-                                    "type": "number",
-                                    "description": "Minimum project size in kW they'll take on.",
-                                },
-                                "states": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Target states / service area.",
-                                },
-                            },
                         },
                         "time_zone": {
                             "type": "string",
@@ -1179,7 +1161,7 @@ class CRMTools:
                             "description": "Type of service/appointment",
                         },
                     },
-                    "required": ["scheduled_at", "icp"],
+                    "required": [],
                 },
             },
             {
@@ -1806,7 +1788,7 @@ class CRMTools:
 
     async def book_appointment(  # noqa: PLR0911, PLR0912, PLR0915
         self,
-        scheduled_at: str,
+        scheduled_at: str | None = None,
         email: str | None = None,
         icp: dict[str, Any] | str | None = None,
         contact_phone: str | None = None,
@@ -1823,9 +1805,10 @@ class CRMTools:
         Otherwise falls back to the internal calendar (phone-based).
 
         Args:
-            scheduled_at: ISO 8601 datetime (use the 'start' from check_availability)
+            scheduled_at: Optional. Defaults to the slot select_slot pinned, which
+                is the only time this may ever book. Older callers still pass it.
             email: Optional corrected email volunteered on the call
-            icp: Quick ICP fit-check captured on the call (Cal.com path: required)
+            icp: Optional. Defaults to whatever record_fit_answers already saved.
             contact_phone: Customer phone (internal fallback only)
             duration_minutes: Duration
             service_type: Service type
@@ -1864,7 +1847,12 @@ class CRMTools:
                         "wait for them to pick. Say nothing about booking."
                     ),
                 }
-            supplied_start = self._canonical_start(scheduled_at)
+            # Both arguments are now derived, not asked for. A tool the model
+            # cannot fill in wrongly is a tool that can be FORCED, and forcing it
+            # is what finally removes the gap it used to narrate into.
+            if not icp:
+                icp = deepcopy(self._fit_answers)
+            supplied_start = self._canonical_start(scheduled_at or self._selected_start)
             selected_start = self._canonical_start(self._selected_start)
             if supplied_start is None or selected_start is None or supplied_start != selected_start:
                 return {
