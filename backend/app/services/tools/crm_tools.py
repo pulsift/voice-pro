@@ -381,22 +381,34 @@ class CRMTools:
         """
         return deepcopy(self._fit_answers)
 
-    _FIT_FIELDS = ("offer_types", "states", "min_kw")
+    # What the team cannot build a list without. min_kw is asked every call and
+    # is genuinely wanted, but a lead who will not give it still gets booked.
+    _FIT_FIELDS_NEEDED = ("offer_types", "states")
+    _FIT_FIELDS_ALL = ("offer_types", "states", "min_kw")
 
-    def _ready_to_book(self) -> bool:
-        """A time is pinned, all three answers are in, and nothing is booked yet.
+    def _ready_to_book(self, *, nothing_left_to_ask: bool = False) -> bool:
+        """A time is pinned, the answers we need are in, and nothing is booked.
 
-        Deliberately strict about the answers. Forcing the booking the moment
-        SOMETHING was recorded would cut the third question off mid-call and
-        hand the team a list built on half an answer. When it is not satisfied
-        nothing is forced and the agent books the way it always did - so this
-        can only ever remove a gap, never create one.
+        The bar moves depending on WHO is asking, and that is the whole point.
+
+        select_slot asking means they have just named a time, so the questions
+        are over whether or not the third one was answered - a terse lead who
+        gave two answers and a time must not lose the silent booking, because
+        losing it is exactly when the filler comes back.
+
+        record_fit_answers asking means we are still mid-questions, so it waits
+        for all three. Otherwise the second answer would fire the booking and
+        the system-size question would never be asked at all.
+
+        When this is false nothing is forced and the agent books the way it
+        always did, so it can only ever remove a gap, never create one.
         """
         if self._booking_completed is not None:
             return False
         if not (self._selected_start and self._selected_slot_id):
             return False
-        return all(field in self._fit_answers for field in self._FIT_FIELDS)
+        wanted = self._FIT_FIELDS_ALL if nothing_left_to_ask else self._FIT_FIELDS_NEEDED
+        return all(field in self._fit_answers for field in wanted)
 
     async def record_fit_answers(
         self,
@@ -435,7 +447,7 @@ class CRMTools:
             }
         self._fit_answers.update(normalized)
         result: dict[str, Any] = {"success": True, "recorded": True}
-        if self._ready_to_book():
+        if self._ready_to_book(nothing_left_to_ask=True):
             result["next_tool"] = "book_appointment"
         return result
 

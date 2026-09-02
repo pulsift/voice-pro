@@ -190,3 +190,38 @@ async def test_the_internal_calendar_path_survives_the_argument_being_gone() -> 
 
     assert result["success"] is False
     assert result["error"] == "slot_not_selected"
+
+
+@pytest.mark.asyncio
+async def test_a_terse_lead_still_gets_the_silent_booking() -> None:
+    """Two answers and a time is a complete call, and must stay silent.
+
+    Requiring all three before forcing meant a lead who never answered the size
+    question brought the filler straight back - "I'm setting that up, then I'll
+    share the time and ask one more thing", caught on a live rig run. The
+    questions are over the moment they name a time.
+    """
+    tools = make_tools()
+    await tools.record_fit_answers(offer_types=["rooftop"], states=["Texas"])
+
+    result = await tools.select_slot("slot_2")
+
+    assert result["next_tool"] == "book_appointment"
+
+
+@pytest.mark.asyncio
+async def test_mid_questions_the_booking_waits_for_all_three() -> None:
+    """The other side of the same bar.
+
+    A time pinned early means record_fit_answers is the trigger, and firing it
+    on the second answer would book the call before the system-size question
+    was ever asked.
+    """
+    tools = make_tools()
+    await tools.select_slot("slot_2")
+
+    two = await tools.record_fit_answers(offer_types=["rooftop"], states=["Texas"])
+    assert "next_tool" not in two
+
+    three = await tools.record_fit_answers(min_kw=50)
+    assert three["next_tool"] == "book_appointment"

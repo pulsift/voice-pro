@@ -470,6 +470,7 @@ class Conversation:
                 if name == "end_call":
                     self.ended = True
                 if forced_next:
+                    print(f"  [debug] forcing {forced_next}", flush=True)
                     await self.connection.response.create(
                         response={
                             "tool_choice": {"type": "function", "name": forced_next}
